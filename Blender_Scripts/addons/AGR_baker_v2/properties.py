@@ -83,15 +83,12 @@ class AGR_BakerSettings(PropertyGroup):
         default=False
     )
     
-    normal_type: EnumProperty(
-        name="Normal Type",
-        description="Normal map format",
-        items=[
-            ('OPENGL', "OpenGL", "OpenGL normal map"),
-            ('DIRECTX', "DirectX", "DirectX normal map (inverted green)"),
-        ],
-        default='OPENGL'
+    bake_normal_enabled: BoolProperty(
+        name="Bake Normal from High-Poly",
+        description="Bake normal map from high-poly objects (if disabled, creates flat normal)",
+        default=True
     )
+    
     
     max_ray_distance: bpy.props.FloatProperty(
         name="Max Ray Distance",

@@ -6,36 +6,12 @@ import bpy
 import os
 
 
-def connect_normal_map(nodes, links, tex_normal, bsdf, normal_type, location):
-    """Connect normal map with OpenGL/DirectX support"""
-    if normal_type == 'OPENGL':
-        normal_map = nodes.new(type='ShaderNodeNormalMap')
-        normal_map.location = location
-        links.new(tex_normal.outputs['Color'], normal_map.inputs['Color'])
-        links.new(normal_map.outputs['Normal'], bsdf.inputs['Normal'])
-    
-    elif normal_type == 'DIRECTX':
-        separate_color = nodes.new(type='ShaderNodeSeparateColor')
-        separate_color.location = (location[0] + 100, location[1] + 100)
-        
-        math_subtract = nodes.new(type='ShaderNodeMath')
-        math_subtract.operation = 'SUBTRACT'
-        math_subtract.location = (location[0] + 200, location[1] + 50)
-        math_subtract.inputs[0].default_value = 1.0
-        
-        combine_color = nodes.new(type='ShaderNodeCombineColor')
-        combine_color.location = (location[0] + 300, location[1])
-        
-        normal_map = nodes.new(type='ShaderNodeNormalMap')
-        normal_map.location = (location[0] + 400, location[1])
-        
-        links.new(tex_normal.outputs['Color'], separate_color.inputs['Color'])
-        links.new(separate_color.outputs['Green'], math_subtract.inputs[1])
-        links.new(separate_color.outputs['Red'], combine_color.inputs['Red'])
-        links.new(math_subtract.outputs['Value'], combine_color.inputs['Green'])
-        links.new(separate_color.outputs['Blue'], combine_color.inputs['Blue'])
-        links.new(combine_color.outputs['Color'], normal_map.inputs['Color'])
-        links.new(normal_map.outputs['Normal'], bsdf.inputs['Normal'])
+def connect_normal_map(nodes, links, tex_normal, bsdf, location):
+    """Connect normal map (OpenGL only)"""
+    normal_map = nodes.new(type='ShaderNodeNormalMap')
+    normal_map.location = location
+    links.new(tex_normal.outputs['Color'], normal_map.inputs['Color'])
+    links.new(normal_map.outputs['Normal'], bsdf.inputs['Normal'])
 
 
 def load_texture_from_disk(nodes, texture_path, texture_name, label, location, colorspace='sRGB'):
@@ -75,7 +51,7 @@ def load_texture_from_disk(nodes, texture_path, texture_name, label, location, c
         return None
 
 
-def connect_texture_set_to_material(material, texture_set_path, material_name, normal_type='OPENGL'):
+def connect_texture_set_to_material(material, texture_set_path, material_name):
     """
     Connect texture set to material
     
@@ -83,7 +59,6 @@ def connect_texture_set_to_material(material, texture_set_path, material_name, n
         material: Blender material
         texture_set_path: Path to texture set folder (S_material_name)
         material_name: Material name for texture naming
-        normal_type: 'OPENGL' or 'DIRECTX'
     """
     material.use_nodes = True
     nodes = material.node_tree.nodes
@@ -135,7 +110,7 @@ def connect_texture_set_to_material(material, texture_set_path, material_name, n
             "Normal", (-700, 0), 'Non-Color'
         )
         if tex_normal:
-            connect_normal_map(nodes, links, tex_normal, bsdf, normal_type, (-400, 0))
+            connect_normal_map(nodes, links, tex_normal, bsdf, (-400, 0))
         
         # ERM
         tex_erm = load_texture_from_disk(
@@ -204,11 +179,10 @@ def connect_texture_set_to_material(material, texture_set_path, material_name, n
                 "Normal", (-700, -400), 'Non-Color'
             )
             if tex_normal:
-                connect_normal_map(nodes, links, tex_normal, bsdf, normal_type, (-400, -400))
+                connect_normal_map(nodes, links, tex_normal, bsdf, (-400, -400))
     
     # Configure material settings
     material.blend_method = 'HASHED'
-    material.shadow_method = 'HASHED'
     material.use_backface_culling = False
     
     # Set default BSDF values

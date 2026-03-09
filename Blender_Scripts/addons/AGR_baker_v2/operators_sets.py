@@ -46,12 +46,10 @@ class AGR_OT_ConnectSetToMaterial(Operator):
             material = bpy.data.materials.new(name=material_name)
         
         # Connect texture set
-        settings = context.scene.agr_baker_settings
         materials.connect_texture_set_to_material(
             material,
             tex_set.folder_path,
-            material_name,
-            normal_type=settings.normal_type
+            material_name
         )
         
         # Update assignment flag
@@ -91,12 +89,10 @@ class AGR_OT_AssignSetToActiveObject(Operator):
             material = bpy.data.materials.new(name=material_name)
             
         # Connect texture set
-        settings = context.scene.agr_baker_settings
         materials.connect_texture_set_to_material(
             material,
             tex_set.folder_path,
-            material_name,
-            normal_type=settings.normal_type
+            material_name
         )
         
         # Assign to object
@@ -140,8 +136,7 @@ class AGR_OT_LoadSetsFromFolder(Operator):
                 materials.connect_texture_set_to_material(
                     material,
                     tex_set.folder_path,
-                    material_name,
-                    normal_type=settings.normal_type
+                    material_name
                 )
                 
                 tex_set.is_assigned = True

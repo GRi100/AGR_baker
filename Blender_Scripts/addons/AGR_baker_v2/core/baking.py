@@ -107,8 +107,8 @@ def setup_bake_node(material):
     return bake_node
 
 
-def bake_texture(context, target_obj, source_objects, image, bake_type, 
-                 material_index, use_alpha=False, normal_type='OPENGL',
+def bake_texture(context, target_obj, source_objects, image, bake_type,
+                 material_index, use_alpha=False,
                  max_ray_distance=0.0, extrusion=0.5):
     """
     Bake texture from source objects to target object
@@ -121,7 +121,6 @@ def bake_texture(context, target_obj, source_objects, image, bake_type,
         bake_type: 'DIFFUSE', 'ROUGHNESS', 'NORMAL'
         material_index: Material slot index
         use_alpha: Bake with alpha channel
-        normal_type: 'OPENGL' or 'DIRECTX'
         max_ray_distance: Max ray distance for baking
         extrusion: Cage extrusion value
     """
@@ -195,10 +194,6 @@ def bake_texture(context, target_obj, source_objects, image, bake_type,
     try:
         bpy.ops.object.bake(type=context.scene.cycles.bake_type)
         print(f"✅ Baked {bake_type} for {material.name}")
-        
-        if bake_type == 'NORMAL' and normal_type == 'DIRECTX':
-            convert_normal_to_directx(image)
-            print(f"✅ Converted to DirectX normal")
     
     except Exception as e:
         print(f"❌ Baking error {bake_type}: {e}")
@@ -206,30 +201,10 @@ def bake_texture(context, target_obj, source_objects, image, bake_type,
         try:
             bpy.ops.object.bake(type=context.scene.cycles.bake_type)
             print(f"✅ Baked {bake_type} on retry")
-            
-            if bake_type == 'NORMAL' and normal_type == 'DIRECTX':
-                convert_normal_to_directx(image)
         except Exception as e2:
             print(f"❌ Retry failed {bake_type}: {e2}")
     
     context.scene.render.film_transparent = original_film_transparent
-
-
-def convert_normal_to_directx(image):
-    """Invert green channel for DirectX normal map"""
-    try:
-        width, height = image.size
-        image.update()
-        
-        pixels = np.array(image.pixels[:]).reshape(height, width, 4)
-        pixels[:, :, 1] = 1.0 - pixels[:, :, 1]  # Invert green
-        
-        image.pixels = pixels.flatten().tolist()
-        image.update()
-        print(f"✅ Green channel inverted for {image.name}")
-    
-    except Exception as e:
-        print(f"❌ DirectX conversion error: {e}")
 
 
 def save_texture(image, filepath):
@@ -250,7 +225,8 @@ def save_texture(image, filepath):
     scene.render.image_settings.file_format = 'PNG'
     scene.render.image_settings.compression = 15
     
-    if "DIFFUSE_OPACITY" in image.name:
+    # Check for DiffuseOpacity in any case variation
+    if "DIFFUSE_OPACITY" in image.name.upper() or "DIFFUSEOPACITY" in image.name.upper():
         scene.render.image_settings.color_mode = 'RGBA'
     else:
         scene.render.image_settings.color_mode = 'RGB'

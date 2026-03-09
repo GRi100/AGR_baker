@@ -119,20 +119,27 @@ def scan_texture_set_folder(folder_path, material_name):
         'has_metallic': f"T_{material_name}_Metallic.png",
     }
     
+    max_resolution = 0
+    
     for key, filename in texture_types.items():
         filepath = os.path.join(folder_path, filename)
         if os.path.exists(filepath):
             texture_info[key] = True
             texture_info['has_any'] = True
             
-            # Try to get resolution from first found texture
-            if texture_info['resolution'] == 1024:
-                try:
-                    img = bpy.data.images.load(filepath)
-                    texture_info['resolution'] = img.size[0]
-                    bpy.data.images.remove(img)
-                except:
-                    pass
+            # Get resolution from each texture and find maximum
+            try:
+                img = bpy.data.images.load(filepath)
+                current_resolution = img.size[0]
+                if current_resolution > max_resolution:
+                    max_resolution = current_resolution
+                bpy.data.images.remove(img)
+            except:
+                pass
+    
+    # Set resolution to maximum found, or keep default 1024
+    if max_resolution > 0:
+        texture_info['resolution'] = max_resolution
     
     return texture_info
 

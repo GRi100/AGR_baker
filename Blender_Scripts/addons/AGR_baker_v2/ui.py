@@ -59,7 +59,7 @@ class AGR_PT_MainPanel(Panel):
         col = box.column(align=True)
         col.prop(settings, "resolution")
         col.prop(settings, "bake_with_alpha")
-        col.prop(settings, "normal_type")
+        col.prop(settings, "bake_normal_enabled")
         
         row = col.row(align=True)
         row.prop(settings, "max_ray_distance")
