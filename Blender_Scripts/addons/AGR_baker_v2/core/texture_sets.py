@@ -130,16 +130,20 @@ def scan_texture_set_folder(folder_path, material_name):
             # Get resolution from each texture and find maximum
             try:
                 img = bpy.data.images.load(filepath)
-                current_resolution = img.size[0]
+                current_resolution = max(img.size[0], img.size[1])  # Use max of width/height
                 if current_resolution > max_resolution:
                     max_resolution = current_resolution
+                    print(f"  📏 {filename}: {current_resolution}px (new max)")
                 bpy.data.images.remove(img)
-            except:
-                pass
+            except Exception as e:
+                print(f"  ⚠️ Could not read resolution from {filename}: {e}")
     
     # Set resolution to maximum found, or keep default 1024
     if max_resolution > 0:
         texture_info['resolution'] = max_resolution
+        print(f"  ✅ Set resolution determined: {max_resolution}px")
+    else:
+        print(f"  ⚠️ No textures found, using default 1024px")
     
     return texture_info
 
@@ -147,12 +151,57 @@ def scan_texture_set_folder(folder_path, material_name):
 def refresh_texture_sets_list(context):
     """Refresh texture sets list in scene properties"""
     texture_sets_collection = context.scene.agr_texture_sets
+    settings = context.scene.agr_baker_settings
     
     # Clear existing
     texture_sets_collection.clear()
     
     # Scan and add
     found_sets = scan_texture_sets(context)
+    
+    # Check alpha on all sets BEFORE sorting (to preserve alpha info)
+    import struct
+    for set_data in found_sets:
+        set_data['textures']['has_alpha'] = False
+        
+        if set_data['textures']['has_diffuse_opacity']:
+            material_name = set_data['material_name']
+            folder_path = set_data['folder_path']
+            do_path = os.path.join(folder_path, f"T_{material_name}_DiffuseOpacity.png")
+            
+            if os.path.exists(do_path):
+                try:
+                    with open(do_path, 'rb') as f:
+                        signature = f.read(8)
+                        if signature == b'\x89PNG\r\n\x1a\n':
+                            chunk_length_bytes = f.read(4)
+                            if len(chunk_length_bytes) == 4:
+                                chunk_type = f.read(4)
+                                if chunk_type == b'IHDR':
+                                    ihdr_data = f.read(13)
+                                    if len(ihdr_data) == 13:
+                                        # IHDR structure: width(4) + height(4) + bit_depth(1) + color_type(1) + ...
+                                        color_type = ihdr_data[9]  # Color type is at byte 9, not 8
+                                        print(f"  🔍 {material_name}: PNG color_type = {color_type}")
+                                        if color_type in (4, 6):  # Grayscale+Alpha or RGBA
+                                            set_data['textures']['has_alpha'] = True
+                                            print(f"  ✅ {material_name}: Has alpha channel!")
+                                        else:
+                                            print(f"  ⚠️ {material_name}: No alpha (color_type {color_type})")
+                except Exception as e:
+                    print(f"  ❌ {material_name}: Error checking alpha: {e}")
+    
+    # Sort based on settings
+    if settings.sets_sort_mode == 'NAME':
+        found_sets.sort(key=lambda x: x['name'])
+        print(f"  📋 Sorted by name (alphabetically)")
+    elif settings.sets_sort_mode == 'RESOLUTION':
+        found_sets.sort(key=lambda x: x['textures']['resolution'], reverse=True)
+        print(f"  📋 Sorted by resolution (high to low)")
+    elif settings.sets_sort_mode == 'ALPHA':
+        # Sort by alpha presence (with alpha first), then by name
+        found_sets.sort(key=lambda x: (not x['textures'].get('has_alpha', False), x['name']))
+        print(f"  📋 Sorted by alpha presence (with alpha first)")
     
     for set_data in found_sets:
         tex_set = texture_sets_collection.add()
@@ -171,6 +220,10 @@ def refresh_texture_sets_list(context):
         tex_set.has_erm = textures['has_erm']
         tex_set.has_metallic = textures['has_metallic']
         tex_set.resolution = textures['resolution']
+        
+        # Copy alpha flag (already checked above)
+        tex_set.has_alpha = textures.get('has_alpha', False)
+        tex_set.is_selected = False
         
         # Check if assigned to material
         tex_set.is_assigned = check_if_set_assigned(context, set_data['material_name'])
@@ -215,9 +268,8 @@ def save_texture_set_info(context, material_name, resolution, folder_path):
     tex_set.name = f"S_{material_name}"
     tex_set.material_name = material_name
     tex_set.folder_path = folder_path
-    tex_set.resolution = resolution
     
-    # Scan folder for available textures
+    # Scan folder for available textures and get actual resolution
     texture_info = scan_texture_set_folder(folder_path, material_name)
     tex_set.has_diffuse = texture_info['has_diffuse']
     tex_set.has_diffuse_opacity = texture_info['has_diffuse_opacity']
@@ -227,6 +279,9 @@ def save_texture_set_info(context, material_name, resolution, folder_path):
     tex_set.has_normal = texture_info['has_normal']
     tex_set.has_erm = texture_info['has_erm']
     tex_set.has_metallic = texture_info['has_metallic']
+    
+    # Use scanned resolution (max from all textures) instead of parameter
+    tex_set.resolution = texture_info['resolution']
     
     print(f"💾 Saved texture set info: S_{material_name}")
     

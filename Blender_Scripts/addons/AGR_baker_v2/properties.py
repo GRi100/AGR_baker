@@ -54,9 +54,21 @@ class AGR_TextureSet(PropertyGroup):
     has_erm: BoolProperty(name="ERM", default=False)
     has_metallic: BoolProperty(name="Metallic", default=False)
     
+    has_alpha: BoolProperty(
+        name="Has Alpha",
+        description="DiffuseOpacity texture has alpha channel",
+        default=False
+    )
+    
     is_assigned: BoolProperty(
         name="Assigned",
         description="Set is assigned to a material",
+        default=False
+    )
+    
+    is_selected: BoolProperty(
+        name="Selected",
+        description="Set is selected for batch operations",
         default=False
     )
 
@@ -69,6 +81,9 @@ class AGR_BakerSettings(PropertyGroup):
         name="Resolution",
         description="Texture resolution for baking",
         items=[
+            ('64', "64", "64x64"),
+            ('128', "128", "128x128"),
+            ('256', "256", "256x256"),
             ('512', "512", "512x512"),
             ('1024', "1024", "1024x1024"),
             ('2048', "2048", "2048x2048"),
@@ -106,6 +121,31 @@ class AGR_BakerSettings(PropertyGroup):
         max=10.0
     )
     
+    # Render settings for baking
+    bake_samples: IntProperty(
+        name="Samples",
+        description="Number of samples for baking",
+        default=1,
+        min=1,
+        max=4096
+    )
+    
+    bake_device: EnumProperty(
+        name="Device",
+        description="Device to use for baking",
+        items=[
+            ('CPU', "CPU", "Use CPU for baking"),
+            ('GPU', "GPU", "Use GPU for baking (if available)"),
+        ],
+        default='CPU'
+    )
+    
+    bake_use_denoising: BoolProperty(
+        name="Denoise",
+        description="Use denoising during baking",
+        default=False
+    )
+    
     # Photoshop integration
     photoshop_path: StringProperty(
         name="Photoshop Path",
@@ -125,6 +165,18 @@ class AGR_BakerSettings(PropertyGroup):
         name="Output Folder",
         description="Base output folder (AGR_BAKE)",
         default="AGR_BAKE"
+    )
+    
+    # Texture sets list settings
+    sets_sort_mode: EnumProperty(
+        name="Sort By",
+        description="Sort texture sets list",
+        items=[
+            ('NAME', "Name", "Sort alphabetically by name"),
+            ('RESOLUTION', "Resolution", "Sort by resolution (high to low)"),
+            ('ALPHA', "Alpha", "Sort by alpha presence (with alpha first)"),
+        ],
+        default='NAME'
     )
 
 
