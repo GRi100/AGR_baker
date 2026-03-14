@@ -57,7 +57,7 @@ def ensure_texture_set_folder(context, material_name):
 
 def scan_texture_sets(context):
     """
-    Scan AGR_BAKE folder for texture sets (S_material_name folders)
+    Scan AGR_BAKE folder for texture sets (S_material_name folders) and atlases (A_atlas_name folders)
     Returns list of found texture sets
     """
     agr_bake_path = get_agr_bake_folder(context)
@@ -67,7 +67,7 @@ def scan_texture_sets(context):
     
     texture_sets = []
     
-    # Scan for S_* folders
+    # Scan for S_* folders (regular texture sets)
     for item in os.listdir(agr_bake_path):
         item_path = os.path.join(agr_bake_path, item)
         
@@ -82,10 +82,29 @@ def scan_texture_sets(context):
                     'name': item,
                     'material_name': material_name,
                     'folder_path': item_path,
-                    'textures': texture_info
+                    'textures': texture_info,
+                    'is_atlas': False
+                })
+        
+        # Scan for A_* folders (atlases)
+        elif os.path.isdir(item_path) and item.startswith("A_"):
+            atlas_name = item[2:]  # Remove "A_" prefix
+            
+            # Check for atlas textures and mapping
+            atlas_info = scan_atlas_folder(item_path, atlas_name)
+            
+            if atlas_info['has_any']:
+                texture_sets.append({
+                    'name': item,
+                    'material_name': atlas_name,  # Use atlas name as material name
+                    'folder_path': item_path,
+                    'textures': atlas_info,
+                    'is_atlas': True,
+                    'atlas_type': atlas_info.get('atlas_type', 'HIGH'),
+                    'object_name': atlas_info.get('object_name', '')
                 })
     
-    print(f"🔍 Found {len(texture_sets)} texture sets in AGR_BAKE")
+    print(f"🔍 Found {len(texture_sets)} texture sets/atlases in AGR_BAKE")
     return texture_sets
 
 
@@ -144,6 +163,104 @@ def scan_texture_set_folder(folder_path, material_name):
         print(f"  ✅ Set resolution determined: {max_resolution}px")
     else:
         print(f"  ⚠️ No textures found, using default 1024px")
+    
+    return texture_info
+
+
+def scan_atlas_folder(folder_path, atlas_name):
+    """
+    Scan atlas folder for available textures and mapping info
+    Returns dict with texture availability flags and atlas metadata
+    """
+    import json
+    
+    texture_info = {
+        'has_diffuse': False,
+        'has_diffuse_opacity': False,
+        'has_emit': False,
+        'has_roughness': False,
+        'has_opacity': False,
+        'has_normal': False,
+        'has_erm': False,
+        'has_metallic': False,
+        'has_any': False,
+        'resolution': 1024,
+        'atlas_type': 'HIGH',
+        'object_name': ''
+    }
+    
+    # Try to load atlas_mapping.json to get metadata
+    mapping_path = os.path.join(folder_path, 'atlas_mapping.json')
+    if os.path.exists(mapping_path):
+        try:
+            with open(mapping_path, 'r', encoding='utf-8') as f:
+                mapping = json.load(f)
+                texture_info['atlas_type'] = mapping.get('atlas_type', 'HIGH')
+                texture_info['resolution'] = mapping.get('atlas_size', 1024)
+                print(f"  📋 Loaded atlas mapping: {mapping.get('atlas_name', atlas_name)}")
+        except Exception as e:
+            print(f"  ⚠️ Could not load atlas_mapping.json: {e}")
+    
+    # Check for atlas textures - try both naming schemes
+    # HIGH scheme: T_AtlasName_DO.png, T_AtlasName_ERM.png, T_AtlasName_N.png
+    # LOW scheme: T_Address_Type_d.png, T_Address_Type_r.png, etc.
+    
+    # First, scan all PNG files in the folder
+    texture_files = []
+    try:
+        for item in os.listdir(folder_path):
+            if item.endswith('.png') and item.startswith('T_'):
+                texture_files.append(item)
+    except Exception as e:
+        print(f"  ⚠️ Error scanning atlas folder: {e}")
+        return texture_info
+    
+    max_resolution = 0
+    
+    # Analyze found textures
+    for filename in texture_files:
+        filepath = os.path.join(folder_path, filename)
+        
+        # Determine texture type from filename
+        if '_DO.png' in filename or '_DiffuseOpacity.png' in filename:
+            texture_info['has_diffuse_opacity'] = True
+            texture_info['has_any'] = True
+        elif '_ERM.png' in filename:
+            texture_info['has_erm'] = True
+            texture_info['has_any'] = True
+        elif '_N.png' in filename or '_Normal.png' in filename:
+            texture_info['has_normal'] = True
+            texture_info['has_any'] = True
+        elif filename.endswith('_d.png'):
+            texture_info['has_diffuse'] = True
+            texture_info['has_any'] = True
+        elif filename.endswith('_r.png'):
+            texture_info['has_roughness'] = True
+            texture_info['has_any'] = True
+        elif filename.endswith('_m.png'):
+            texture_info['has_metallic'] = True
+            texture_info['has_any'] = True
+        elif filename.endswith('_o.png'):
+            texture_info['has_opacity'] = True
+            texture_info['has_any'] = True
+        elif filename.endswith('_n.png'):
+            texture_info['has_normal'] = True
+            texture_info['has_any'] = True
+        
+        # Get resolution
+        try:
+            img = bpy.data.images.load(filepath)
+            current_resolution = max(img.size[0], img.size[1])
+            if current_resolution > max_resolution:
+                max_resolution = current_resolution
+            bpy.data.images.remove(img)
+        except Exception as e:
+            print(f"  ⚠️ Could not read resolution from {filename}: {e}")
+    
+    # Update resolution if we found textures
+    if max_resolution > 0:
+        texture_info['resolution'] = max_resolution
+        print(f"  ✅ Atlas resolution: {max_resolution}px")
     
     return texture_info
 
@@ -225,11 +342,66 @@ def refresh_texture_sets_list(context):
         tex_set.has_alpha = textures.get('has_alpha', False)
         tex_set.is_selected = False
         
+        # Atlas-specific properties
+        tex_set.is_atlas = set_data.get('is_atlas', False)
+        if tex_set.is_atlas:
+            tex_set.atlas_type = set_data.get('atlas_type', 'HIGH')
+            tex_set.object_name = set_data.get('object_name', '')
+        
         # Check if assigned to material
         tex_set.is_assigned = check_if_set_assigned(context, set_data['material_name'])
     
     print(f"✅ Refreshed texture sets list: {len(found_sets)} sets")
     return len(found_sets)
+
+
+def sort_texture_sets_in_scene(context, sort_mode: str):
+    """Sort existing `Scene.agr_texture_sets` collection in-place.
+
+    This is a fast path used by the Sort UI buttons.
+    It MUST NOT rescan folders / load images / recompute alpha/resolution.
+    All required fields (`name`, `resolution`, `has_alpha`) are expected to be
+    already populated during earlier refresh/scan stages.
+    """
+
+    texture_sets_collection = context.scene.agr_texture_sets
+    if not texture_sets_collection or len(texture_sets_collection) < 2:
+        return
+
+    # Build desired order (store original indices to keep sort stable)
+    indexed = list(enumerate(texture_sets_collection))
+
+    if sort_mode == 'NAME':
+        indexed.sort(key=lambda it: (it[1].name.casefold(), it[0]))
+    elif sort_mode == 'RESOLUTION':
+        indexed.sort(key=lambda it: (-int(it[1].resolution), it[1].name.casefold(), it[0]))
+    elif sort_mode == 'ALPHA':
+        indexed.sort(key=lambda it: (not bool(getattr(it[1], 'has_alpha', False)), it[1].name.casefold(), it[0]))
+    else:
+        return
+
+    # Reorder collection using `move`.
+    target_names = [item.name for _, item in indexed]
+    name_to_current_index = {texture_sets_collection[i].name: i for i in range(len(texture_sets_collection))}
+
+    for target_index, name in enumerate(target_names):
+        current_index = name_to_current_index.get(name)
+        if current_index is None or current_index == target_index:
+            continue
+
+        texture_sets_collection.move(current_index, target_index)
+
+        # Update mapping for indices affected by the move.
+        if current_index > target_index:
+            for n, idx in list(name_to_current_index.items()):
+                if target_index <= idx < current_index:
+                    name_to_current_index[n] = idx + 1
+        else:
+            for n, idx in list(name_to_current_index.items()):
+                if current_index < idx <= target_index:
+                    name_to_current_index[n] = idx - 1
+
+        name_to_current_index[name] = target_index
 
 
 def check_if_set_assigned(context, material_name):

@@ -18,8 +18,11 @@ class AGR_UL_TextureSetsList(UIList):
             # Selection checkbox
             row.prop(tex_set, "is_selected", text="")
             
-            # Set name with icon
-            if tex_set.is_assigned:
+            # Set name with icon - different for atlases
+            if tex_set.is_atlas:
+                # Atlas icon
+                row.label(text=tex_set.name, icon='IMAGE_PLANE')
+            elif tex_set.is_assigned:
                 row.label(text=tex_set.name, icon='CHECKMARK')
             else:
                 row.label(text=tex_set.name, icon='TEXTURE')
@@ -27,13 +30,20 @@ class AGR_UL_TextureSetsList(UIList):
             # Resolution info
             row.label(text=f"{tex_set.resolution}px")
             
+            # Atlas type indicator
+            if tex_set.is_atlas:
+                row.label(text=tex_set.atlas_type, icon='UV')
+            
             # Alpha channel indicator
             if tex_set.has_alpha:
                 row.label(text="", icon='IMAGE_ALPHA')
         
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
-            layout.label(text="", icon='TEXTURE')
+            if item.is_atlas:
+                layout.label(text="", icon='IMAGE_PLANE')
+            else:
+                layout.label(text="", icon='TEXTURE')
 
 
 class AGR_PT_MainPanel(Panel):
@@ -87,6 +97,12 @@ class AGR_PT_MainPanel(Panel):
         row = box.row()
         row.scale_y = 1.3
         row.operator("agr.simple_bake_all", text="Simple Bake All Materials", icon='MATERIAL_DATA')
+        
+        # Convert materials to sets
+        box.separator()
+        row = box.row()
+        row.scale_y = 1.2
+        row.operator("agr.convert_materials_to_sets", text="Convert Materials to Sets", icon='IMPORT')
         
         # Pillow installation check
         try:
@@ -204,7 +220,109 @@ class AGR_PT_TextureSetsPanel(Panel):
             
             batch_box.separator()
             batch_box.operator("agr.delete_selected_sets", text="Delete Selected Sets", icon='TRASH')
+        
+        # Atlas Operations
+        layout.separator()
+        atlas_box = layout.box()
+        atlas_box.label(text="Atlas Operations:", icon='IMAGE_PLANE')
+        
+        settings = context.scene.agr_baker_settings
+        
+        # Atlas settings
+        atlas_box.prop(settings, "atlas_size", text="Atlas Size")
+        
+        # Count selected non-atlas sets
+        selected_non_atlas = sum(1 for ts in context.scene.agr_texture_sets if ts.is_selected and not ts.is_atlas)
+        
+        if selected_non_atlas > 0:
+            atlas_box.label(text=f"Selected: {selected_non_atlas} sets", icon='CHECKBOX_HLT')
+            
+            # Preview atlas layout
+            atlas_box.operator("agr.preview_atlas_layout", text="Preview Atlas Layout", icon='HIDE_OFF')
+            
+            # Create atlas from selected sets (only textures, no UV, no material)
+            op = atlas_box.operator("agr.create_atlas_only", text="Create Atlas Only", icon='IMAGE_PLANE')
+            op.atlas_type = 'AUTO'
+            
+            # Info about active object
+            if context.active_object:
+                try:
+                    from .operators_atlas import process_object_name
+                    address, obj_type = process_object_name(context.active_object.name)
+                    atlas_box.label(text=f"Active: {obj_type} ({address})", icon='OBJECT_DATA')
+                except:
+                    atlas_box.label(text=f"Active: {context.active_object.name}", icon='OBJECT_DATA')
         else:
+            atlas_box.label(text="Select texture sets to create atlas", icon='INFO')
+        
+        # Create atlas from active object materials
+        atlas_box.separator()
+        if context.active_object and context.active_object.type == 'MESH' and len(context.active_object.material_slots) > 0:
+            atlas_box.operator("agr.create_atlas_from_object", text="Create Atlas from Object", icon='OBJECT_DATA')
+        else:
+            row = atlas_box.row()
+            row.enabled = False
+            row.operator("agr.create_atlas_from_object", text="Create Atlas from Object", icon='OBJECT_DATA')
+        
+        # Apply atlas to object and preview
+        atlas_box.separator()
+        atlas_sets = [ts for ts in context.scene.agr_texture_sets if ts.is_atlas]
+        if atlas_sets:
+            atlas_box.label(text=f"Available Atlases: {len(atlas_sets)}", icon='IMAGE_DATA')
+            
+            if context.active_object and context.active_object.type == 'MESH':
+                atlas_box.operator("agr.apply_atlas_to_object", text="Apply Atlas to Object", icon='UV')
+            
+            # Preview buttons for each atlas
+            preview_box = atlas_box.box()
+            preview_box.label(text="Preview:", icon='HIDE_OFF')
+            for atlas in atlas_sets[:5]:  # Show max 5 atlases
+                op = preview_box.operator("agr.preview_atlas", text=atlas.name, icon='IMAGE_PLANE')
+                op.atlas_name = atlas.name
+            
+            if len(atlas_sets) > 5:
+                preview_box.label(text=f"... and {len(atlas_sets) - 5} more", icon='THREE_DOTS')
+        
+        # UDIM Operations (always visible)
+        layout.separator()
+        udim_box = layout.box()
+        udim_box.label(text="UDIM Operations:", icon='UV')
+        
+        # UDIM settings
+        settings = context.scene.agr_baker_settings
+        udim_box.prop(settings, "udim_use_main_directory", text="Use Main Directory")
+        
+        udim_box.separator()
+        
+        obj = context.active_object
+        if obj and obj.type == 'MESH' and obj.name.startswith("SM_"):
+            # Check if has UDIM
+            has_udim = False
+            for slot in obj.material_slots:
+                if slot.material and slot.material.use_nodes:
+                    for node in slot.material.node_tree.nodes:
+                        if node.type == 'TEX_IMAGE' and node.image:
+                            if node.image.source == 'TILED':
+                                has_udim = True
+                                break
+                if has_udim:
+                    break
+            
+            if has_udim:
+                udim_box.operator("agr.revert_udim", text="Disassemble UDIM", icon='LOOP_BACK')
+            else:
+                udim_box.operator("agr.create_udim", text="Create UDIM Set", icon='UV_DATA')
+        else:
+            udim_box.label(text="Select SM_* object for UDIM", icon='INFO')
+            # Show disabled buttons
+            row = udim_box.row()
+            row.enabled = False
+            row.operator("agr.create_udim", text="Create UDIM Set", icon='UV_DATA')
+            row = udim_box.row()
+            row.enabled = False
+            row.operator("agr.revert_udim", text="Disassemble UDIM", icon='LOOP_BACK')
+        
+        if len(context.scene.agr_texture_sets) == 0:
             box.label(text="No texture sets found", icon='INFO')
             box.label(text="Bake textures or refresh list")
 

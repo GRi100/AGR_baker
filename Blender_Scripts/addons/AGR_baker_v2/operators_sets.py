@@ -757,7 +757,8 @@ class AGR_OT_SortSetsByName(Operator):
     def execute(self, context):
         settings = context.scene.agr_baker_settings
         settings.sets_sort_mode = 'NAME'
-        texture_sets.refresh_texture_sets_list(context)
+        # Fast in-place sort: do NOT rescan/recompute anything here.
+        texture_sets.sort_texture_sets_in_scene(context, 'NAME')
         return {'FINISHED'}
 
 
@@ -770,7 +771,8 @@ class AGR_OT_SortSetsByResolution(Operator):
     def execute(self, context):
         settings = context.scene.agr_baker_settings
         settings.sets_sort_mode = 'RESOLUTION'
-        texture_sets.refresh_texture_sets_list(context)
+        # Fast in-place sort: do NOT rescan/recompute anything here.
+        texture_sets.sort_texture_sets_in_scene(context, 'RESOLUTION')
         return {'FINISHED'}
 
 
@@ -781,10 +783,10 @@ class AGR_OT_SortSetsByAlpha(Operator):
     bl_options = {'REGISTER'}
     
     def execute(self, context):
-        # Alpha check is now done automatically in refresh_texture_sets_list
         settings = context.scene.agr_baker_settings
         settings.sets_sort_mode = 'ALPHA'
-        texture_sets.refresh_texture_sets_list(context)
+        # Fast in-place sort: do NOT rescan/recompute anything here.
+        texture_sets.sort_texture_sets_in_scene(context, 'ALPHA')
         return {'FINISHED'}
 
 

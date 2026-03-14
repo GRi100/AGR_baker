@@ -15,11 +15,11 @@ from bpy.types import PropertyGroup
 
 
 class AGR_TextureSet(PropertyGroup):
-    """Texture set data (S_material_name)"""
+    """Texture set data (S_material_name or A_atlas_name)"""
     
     name: StringProperty(
         name="Set Name",
-        description="Texture set name (S_material_name)",
+        description="Texture set name (S_material_name or A_atlas_name)",
         default=""
     )
     
@@ -70,6 +70,29 @@ class AGR_TextureSet(PropertyGroup):
         name="Selected",
         description="Set is selected for batch operations",
         default=False
+    )
+    
+    # Atlas-specific properties
+    is_atlas: BoolProperty(
+        name="Is Atlas",
+        description="This set is an atlas (prefix A_)",
+        default=False
+    )
+    
+    atlas_type: EnumProperty(
+        name="Atlas Type",
+        description="Type of atlas (HIGH or LOW)",
+        items=[
+            ('HIGH', "HIGH", "Atlas with DO/ERM/N textures"),
+            ('LOW', "LOW", "Atlas with d/r/m/o/n separate textures")
+        ],
+        default='HIGH'
+    )
+    
+    object_name: StringProperty(
+        name="Object Name",
+        description="Name of the object this set was baked from",
+        default=""
     )
 
 
@@ -177,6 +200,27 @@ class AGR_BakerSettings(PropertyGroup):
             ('ALPHA', "Alpha", "Sort by alpha presence (with alpha first)"),
         ],
         default='NAME'
+    )
+    
+    # UDIM settings
+    udim_use_main_directory: BoolProperty(
+        name="Use Main Directory",
+        description="Create and search for UDIM textures in project root instead of AGR_BAKE folder",
+        default=False
+    )
+    
+    # Atlas settings
+    atlas_size: EnumProperty(
+        name="Atlas Size",
+        description="Size of the atlas texture",
+        items=[
+            ('512', "512", "512x512"),
+            ('1024', "1024", "1024x1024"),
+            ('2048', "2048", "2048x2048"),
+            ('4096', "4096", "4096x4096"),
+            ('8192', "8192", "8192x8192"),
+        ],
+        default='2048'
     )
 
 
