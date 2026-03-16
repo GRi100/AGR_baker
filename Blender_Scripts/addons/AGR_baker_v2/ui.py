@@ -201,6 +201,12 @@ class AGR_PT_TextureSetsPanel(Panel):
             
             batch_box.separator()
             
+            # Frame creation operations
+            batch_box.operator("agr.create_frame_on_sets", text="Create Frame on Selected", icon='IMAGE_PLANE')
+            batch_box.operator("agr.create_frame_on_files", text="Create Frame on Files...", icon='FILEBROWSER')
+            
+            batch_box.separator()
+            
             # Delete texture types
             batch_row = batch_box.row(align=True)
             op = batch_row.operator("agr.delete_textures_from_selected", text="Del DO", icon='X')
@@ -241,8 +247,7 @@ class AGR_PT_TextureSetsPanel(Panel):
             atlas_box.operator("agr.preview_atlas_layout", text="Preview Atlas Layout", icon='HIDE_OFF')
             
             # Create atlas from selected sets (only textures, no UV, no material)
-            op = atlas_box.operator("agr.create_atlas_only", text="Create Atlas Only", icon='IMAGE_PLANE')
-            op.atlas_type = 'AUTO'
+            atlas_box.operator("agr.create_atlas_only", text="Create Atlas Only", icon='IMAGE_PLANE')
             
             # Info about active object
             if context.active_object:
@@ -255,33 +260,32 @@ class AGR_PT_TextureSetsPanel(Panel):
         else:
             atlas_box.label(text="Select texture sets to create atlas", icon='INFO')
         
-        # Create atlas from active object materials
+        # Preview and create atlas from active object materials
         atlas_box.separator()
         if context.active_object and context.active_object.type == 'MESH' and len(context.active_object.material_slots) > 0:
+            atlas_box.operator("agr.preview_atlas_layout_from_object", text="Preview Atlas Layout from Object", icon='HIDE_OFF')
             atlas_box.operator("agr.create_atlas_from_object", text="Create Atlas from Object", icon='OBJECT_DATA')
         else:
             row = atlas_box.row()
             row.enabled = False
+            row.operator("agr.preview_atlas_layout_from_object", text="Preview Atlas Layout from Object", icon='HIDE_OFF')
+            row = atlas_box.row()
+            row.enabled = False
             row.operator("agr.create_atlas_from_object", text="Create Atlas from Object", icon='OBJECT_DATA')
         
-        # Apply atlas to object and preview
+        # Apply atlas to object
         atlas_box.separator()
-        atlas_sets = [ts for ts in context.scene.agr_texture_sets if ts.is_atlas]
-        if atlas_sets:
-            atlas_box.label(text=f"Available Atlases: {len(atlas_sets)}", icon='IMAGE_DATA')
-            
-            if context.active_object and context.active_object.type == 'MESH':
-                atlas_box.operator("agr.apply_atlas_to_object", text="Apply Atlas to Object", icon='UV')
-            
-            # Preview buttons for each atlas
-            preview_box = atlas_box.box()
-            preview_box.label(text="Preview:", icon='HIDE_OFF')
-            for atlas in atlas_sets[:5]:  # Show max 5 atlases
-                op = preview_box.operator("agr.preview_atlas", text=atlas.name, icon='IMAGE_PLANE')
-                op.atlas_name = atlas.name
-            
-            if len(atlas_sets) > 5:
-                preview_box.label(text=f"... and {len(atlas_sets) - 5} more", icon='THREE_DOTS')
+        if context.active_object and context.active_object.type == 'MESH':
+            atlas_box.operator("agr.apply_atlas_to_object", text="Apply Atlas to Object", icon='UV')
+        
+        # Unpack atlas to materials
+        atlas_box.separator()
+        if context.active_object and context.active_object.type == 'MESH' and context.active_object.active_material:
+            atlas_box.operator("agr.unpack_atlas_to_materials", text="Unpack Atlas to Materials", icon='LOOP_BACK')
+        else:
+            row = atlas_box.row()
+            row.enabled = False
+            row.operator("agr.unpack_atlas_to_materials", text="Unpack Atlas to Materials", icon='LOOP_BACK')
         
         # UDIM Operations (always visible)
         layout.separator()
@@ -309,6 +313,7 @@ class AGR_PT_TextureSetsPanel(Panel):
                     break
             
             if has_udim:
+                udim_box.operator("agr.add_to_udim", text="Add Sets to UDIM", icon='ADD')
                 udim_box.operator("agr.revert_udim", text="Disassemble UDIM", icon='LOOP_BACK')
             else:
                 udim_box.operator("agr.create_udim", text="Create UDIM Set", icon='UV_DATA')
@@ -318,6 +323,9 @@ class AGR_PT_TextureSetsPanel(Panel):
             row = udim_box.row()
             row.enabled = False
             row.operator("agr.create_udim", text="Create UDIM Set", icon='UV_DATA')
+            row = udim_box.row()
+            row.enabled = False
+            row.operator("agr.add_to_udim", text="Add Sets to UDIM", icon='ADD')
             row = udim_box.row()
             row.enabled = False
             row.operator("agr.revert_udim", text="Disassemble UDIM", icon='LOOP_BACK')
@@ -385,12 +393,181 @@ class AGR_PT_SettingsPanel(Panel):
             box.label(text="Save blend file to see path", icon='ERROR')
 
 
+class AGR_PT_RenamePanel(Panel):
+    """AGR Rename panel - with popup dialogs"""
+    bl_label = "AGR Rename"
+    bl_idname = "AGR_PT_rename_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'AGR Baker'
+    bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        
+        # Address input
+        box = layout.box()
+        box.label(text="Настройки", icon='SETTINGS')
+        box.prop(scene, "agr_rename_address", text="Address")
+        
+        layout.separator()
+        
+        # Rename Main Object
+        row = layout.row()
+        row.scale_y = 1.5
+        active_obj = context.active_object
+        if active_obj and active_obj.type == 'MESH' and scene.agr_rename_address:
+            row.operator("agr.rename_main_object", text="Переименовать основной объект", icon='OBJECT_DATA')
+        else:
+            row.enabled = False
+            if not scene.agr_rename_address:
+                row.operator("agr.rename_main_object", text="Введите Address")
+            else:
+                row.operator("agr.rename_main_object", text="Выберите MESH объект")
+        
+        layout.separator()
+        
+        # Rename Materials
+        row = layout.row()
+        row.scale_y = 1.5
+        if active_obj and active_obj.type == 'MESH':
+            import re
+            obj_name = re.sub(r'\.\d{3}$', '', active_obj.name)
+            if re.match(r'^SM_.+?(_\d{3})?_(Main|MainGlass|Ground|GroundGlass|GroundEl|GroundElGlass|Flora)', obj_name):
+                row.operator("agr.rename_materials", text="Переименовать материалы объекта", icon='MATERIAL')
+            else:
+                row.enabled = False
+                row.operator("agr.rename_materials", text="Объект не соответствует формату")
+        else:
+            row.enabled = False
+            row.operator("agr.rename_materials", text="Выберите MESH объект")
+        
+        layout.separator()
+        
+        # Rename Glass Materials
+        row = layout.row()
+        row.scale_y = 1.5
+        if active_obj and active_obj.type == 'MESH' and scene.agr_rename_address:
+            import re
+            obj_name = re.sub(r'\.\d{3}$', '', active_obj.name)
+            if re.match(r'^SM_.+?(_\d{3})?_(MainGlass|GroundGlass|GroundElGlass)', obj_name):
+                row.operator("agr.rename_glass_materials", text="Переименовать материалы стекла", icon='MATERIAL')
+            else:
+                row.enabled = False
+                row.operator("agr.rename_glass_materials", text="Только для Glass объектов")
+        else:
+            row.enabled = False
+            if not scene.agr_rename_address:
+                row.operator("agr.rename_glass_materials", text="Введите Address")
+            else:
+                row.operator("agr.rename_glass_materials", text="Выберите Glass объект")
+        
+        layout.separator()
+        
+        # Rename UCX
+        row = layout.row()
+        row.scale_y = 1.5
+        selected_count = len([obj for obj in context.selected_objects if obj.type == 'MESH'])
+        
+        if scene.agr_rename_address and selected_count > 0:
+            row.operator("agr.rename_ucx", text=f"Переименовать в UCX ({selected_count})", icon='MESH_CUBE')
+        else:
+            row.enabled = False
+            if not scene.agr_rename_address:
+                row.operator("agr.rename_ucx", text="Введите Address")
+            else:
+                row.operator("agr.rename_ucx", text="Выберите объекты для UCX")
+        
+        layout.separator()
+        
+        # Rename Textures
+        row = layout.row()
+        row.scale_y = 1.5
+        if active_obj and active_obj.type == 'MESH' and scene.agr_rename_address:
+            import re
+            obj_name = re.sub(r'\.\d{3}$', '', active_obj.name)
+            if re.match(r'^SM_.+?(_\d{3})?_(Main|Ground|GroundEl|GroundElGlass|Flora)', obj_name):
+                row.operator("agr.rename_textures", text="Переименовать текстуры", icon='TEXTURE')
+            else:
+                row.enabled = False
+                row.operator("agr.rename_textures", text="Только для Main/Ground/GroundEl/Flora")
+        else:
+            row.enabled = False
+            if not scene.agr_rename_address:
+                row.operator("agr.rename_textures", text="Введите Address")
+            else:
+                row.operator("agr.rename_textures", text="Выберите объект")
+        
+        layout.separator()
+        
+        # Rename GEOJSON
+        row = layout.row()
+        row.scale_y = 1.5
+        if active_obj and active_obj.type == 'MESH' and scene.agr_rename_address:
+            import re
+            obj_name = re.sub(r'\.\d{3}$', '', active_obj.name)
+            if re.match(r'^SM_.+?(_\d{3})?_(Main|Ground)', obj_name):
+                row.operator("agr.rename_geojson", text="Переименовать GEOJSON", icon='FILE_TEXT')
+            else:
+                row.enabled = False
+                row.operator("agr.rename_geojson", text="Только для Main/Ground")
+        else:
+            row.enabled = False
+            if not scene.agr_rename_address:
+                row.operator("agr.rename_geojson", text="Введите Address")
+            else:
+                row.operator("agr.rename_geojson", text="Выберите объект Main/Ground")
+        
+        layout.separator()
+        
+        # Rename Lights
+        row = layout.row()
+        row.scale_y = 1.5
+        if active_obj and active_obj.type == 'EMPTY' and scene.agr_rename_address:
+            # Check if has child lights
+            has_lights = False
+            for obj in context.scene.objects:
+                if obj.type == 'LIGHT' and obj.parent == active_obj:
+                    has_lights = True
+                    break
+            
+            if has_lights:
+                row.operator("agr.rename_lights", text="Переименовать свет", icon='LIGHT')
+            else:
+                row.enabled = False
+                row.operator("agr.rename_lights", text="Empty без источников света")
+        else:
+            row.enabled = False
+            if not scene.agr_rename_address:
+                row.operator("agr.rename_lights", text="Введите Address")
+            else:
+                row.operator("agr.rename_lights", text="Выберите Empty со светом")
+        
+        layout.separator()
+        layout.separator()
+        
+        # Rename Project
+        box = layout.box()
+        box.label(text="Переименование проекта", icon='FILE_FOLDER')
+        box.prop(scene, "agr_rp_project_lowpoly_number", text="Lowpoly Number (4 цифры)")
+        
+        row = box.row()
+        row.scale_y = 2.0
+        if scene.agr_rename_address:
+            row.operator("agr.rename_project", text="Переименовать ВЕСЬ ПРОЕКТ", icon='ERROR')
+        else:
+            row.enabled = False
+            row.operator("agr.rename_project", text="Введите Address")
+
+
 classes = (
     AGR_UL_TextureSetsList,
     AGR_PT_MainPanel,
     AGR_PT_TextureSetsPanel,
     AGR_PT_PhotoshopPanel,
     AGR_PT_SettingsPanel,
+    AGR_PT_RenamePanel,
 )
 
 

@@ -533,6 +533,296 @@ class AGR_OT_CreateUDIM(Operator):
         print(f"✅ UV coordinates moved to UDIM tiles")
 
 
+class AGR_OT_AddToUDIM(Operator):
+    """Add selected texture sets to existing UDIM"""
+    bl_idname = "agr.add_to_udim"
+    bl_label = "Add Sets to UDIM"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            return False
+        
+        if not obj.name.startswith("SM_"):
+            return False
+        
+        # Check for UDIM textures (must have UDIM to add to it)
+        has_udim = False
+        for slot in obj.material_slots:
+            if slot.material and slot.material.use_nodes:
+                for node in slot.material.node_tree.nodes:
+                    if node.type == 'TEX_IMAGE' and node.image:
+                        if node.image.source == 'TILED':
+                            has_udim = True
+                            break
+            if has_udim:
+                break
+        
+        return has_udim
+    
+    def execute(self, context):
+        try:
+            obj = context.active_object
+            
+            print(f"\n➕ === ADDING SETS TO UDIM ===")
+            print(f"Object: {obj.name}")
+            
+            # Parse object name
+            try:
+                address, obj_type = process_object_name(obj.name)
+                print(f"Address: {address}, Type: {obj_type}")
+            except Exception as e:
+                self.report({'ERROR'}, f"Invalid object name: {str(e)}")
+                return {'CANCELLED'}
+            
+            # Find UDIM directory
+            blend_path = bpy.data.filepath
+            if not blend_path:
+                self.report({'ERROR'}, "Save blend file first")
+                return {'CANCELLED'}
+            
+            base_dir = Path(blend_path).parent
+            use_main_dir = context.scene.agr_baker_settings.udim_use_main_directory
+            udim_dir = find_udim_directory(address, obj_type, base_dir, use_main_dir)
+            
+            if not udim_dir:
+                self.report({'ERROR'}, f"UDIM directory not found for {address}")
+                return {'CANCELLED'}
+            
+            # Load existing JSON mapping
+            mapping = load_udim_mapping_json(str(udim_dir))
+            
+            if not mapping:
+                self.report({'WARNING'}, "No JSON mapping found - sets will be added without JSON recording")
+                print("⚠️ No JSON mapping found - sets will be added without JSON recording")
+            
+            # Get existing UDIM tiles
+            existing_tiles = self.scan_existing_udim_tiles(udim_dir, mapping)
+            max_udim = max(existing_tiles) if existing_tiles else 1000
+            
+            print(f"Existing UDIM tiles: {sorted(existing_tiles)}")
+            print(f"Next available UDIM: {max_udim + 1}")
+            
+            # Get selected texture sets from the list
+            selected_sets = [ts for ts in context.scene.agr_texture_sets if ts.is_selected]
+            
+            if not selected_sets:
+                self.report({'ERROR'}, "No texture sets selected")
+                return {'CANCELLED'}
+            
+            print(f"Selected texture sets: {len(selected_sets)}")
+            
+            # Convert selected sets to texture info format
+            texture_sets = self.prepare_texture_sets(selected_sets, base_dir)
+            
+            if not texture_sets:
+                self.report({'ERROR'}, "No suitable texture sets found (need Diffuse, ERM, Normal)")
+                return {'CANCELLED'}
+            
+            # Filter out sets that are already in UDIM
+            existing_set_names = set()
+            if mapping:
+                for tile in mapping.get('udim_tiles', []):
+                    existing_set_names.add(tile.get('set_name', ''))
+            
+            new_sets = []
+            for tex_set in texture_sets:
+                set_name = f"S_{tex_set['material_name']}"
+                if set_name not in existing_set_names:
+                    new_sets.append(tex_set)
+                else:
+                    print(f"  ⚠️ Skipping {set_name} - already in UDIM")
+            
+            if not new_sets:
+                self.report({'INFO'}, "All selected texture sets are already in UDIM")
+                return {'CANCELLED'}
+            
+            print(f"Found {len(new_sets)} new texture sets to add")
+            
+            # Add new sets to UDIM
+            added_count = self.add_sets_to_udim(
+                new_sets, udim_dir, address, obj_type, max_udim + 1, mapping
+            )
+            
+            if added_count == 0:
+                self.report({'ERROR'}, "Failed to add texture sets")
+                return {'CANCELLED'}
+            
+            # Reload UDIM images
+            self.reload_udim_images(obj)
+            
+            self.report({'INFO'}, f"Added {added_count} texture sets to UDIM")
+            print(f"✅ Successfully added {added_count} sets to UDIM")
+            
+            return {'FINISHED'}
+            
+        except Exception as e:
+            print(f"❌ Error adding to UDIM: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Error: {str(e)}")
+            return {'CANCELLED'}
+    
+    def scan_existing_udim_tiles(self, udim_dir, mapping):
+        """Scan for existing UDIM tile numbers"""
+        tiles = set()
+        
+        # First, check JSON mapping
+        if mapping:
+            for tile in mapping.get('udim_tiles', []):
+                tiles.add(tile['udim_number'])
+        
+        # Also scan directory for actual files
+        for filename in os.listdir(udim_dir):
+            if not filename.lower().endswith('.png'):
+                continue
+            
+            match = re.search(r'\.(\d{4})\.png$', filename)
+            if match:
+                udim_number = int(match.group(1))
+                if 1001 <= udim_number <= 1999:
+                    tiles.add(udim_number)
+        
+        return tiles
+    
+    def prepare_texture_sets(self, selected_sets, base_dir):
+        """Convert selected texture sets to format needed for UDIM creation"""
+        texture_sets = []
+        agr_bake_dir = base_dir / "AGR_BAKE"
+        
+        if not agr_bake_dir.exists():
+            print(f"⚠️ AGR_BAKE folder not found: {agr_bake_dir}")
+            return texture_sets
+        
+        for idx, tex_set in enumerate(selected_sets):
+            # Skip atlas sets
+            if tex_set.is_atlas:
+                print(f"  ⚠️ Skipping atlas set: {tex_set.name}")
+                continue
+            
+            set_name = tex_set.name
+            set_folder = agr_bake_dir / set_name
+            
+            if not set_folder.exists():
+                print(f"  ⚠️ Set folder not found: {set_name}")
+                continue
+            
+            # Extract material name from set name (remove S_ prefix)
+            if set_name.startswith("S_"):
+                material_name = set_name[2:]
+            else:
+                material_name = set_name
+            
+            # Check for required textures
+            diffuse_opacity_path = set_folder / f"T_{material_name}_DiffuseOpacity.png"
+            diffuse_path = set_folder / f"T_{material_name}_Diffuse.png"
+            erm_path = set_folder / f"T_{material_name}_ERM.png"
+            normal_path = set_folder / f"T_{material_name}_Normal.png"
+            
+            # Use DiffuseOpacity if exists, otherwise Diffuse
+            if diffuse_opacity_path.exists():
+                final_diffuse_path = str(diffuse_opacity_path)
+            elif diffuse_path.exists():
+                final_diffuse_path = str(diffuse_path)
+            else:
+                final_diffuse_path = None
+            
+            # Check if we have all required textures
+            has_diffuse = final_diffuse_path is not None
+            has_erm = erm_path.exists()
+            has_normal = normal_path.exists()
+            
+            if has_diffuse and has_erm and has_normal:
+                texture_sets.append({
+                    'material_index': idx,
+                    'material_name': material_name,
+                    'diffuse_path': final_diffuse_path,
+                    'erm_path': str(erm_path),
+                    'normal_path': str(normal_path)
+                })
+                print(f"  ✅ {set_name}: Found complete texture set")
+            else:
+                missing = []
+                if not has_diffuse:
+                    missing.append("Diffuse/DiffuseOpacity")
+                if not has_erm:
+                    missing.append("ERM")
+                if not has_normal:
+                    missing.append("Normal")
+                print(f"  ⚠️ {set_name}: Missing textures: {', '.join(missing)}")
+        
+        return texture_sets
+
+    
+    def add_sets_to_udim(self, texture_sets, udim_dir, address, obj_type, start_udim, mapping):
+        """Add texture sets to UDIM folder and update JSON"""
+        added_count = 0
+        new_tiles = []
+        
+        for i, mat_info in enumerate(texture_sets):
+            udim_number = start_udim + i
+            print(f"  Adding material {mat_info['material_name']} -> UDIM {udim_number}")
+            
+            # Prepare tile info for JSON
+            tile_info = {
+                'udim_number': udim_number,
+                'material_index': mat_info['material_index'],
+                'material_name': mat_info['material_name'],
+                'set_name': f"S_{mat_info['material_name']}"
+            }
+            new_tiles.append(tile_info)
+            
+            # Copy each texture type
+            success = True
+            for tex_type in ['Diffuse', 'ERM', 'Normal']:
+                source_path = mat_info.get(f"{tex_type.lower()}_path")
+                
+                if source_path and os.path.exists(source_path):
+                    udim_filename = get_udim_texture_name(address, obj_type, tex_type, udim_number)
+                    target_path = udim_dir / udim_filename
+                    
+                    try:
+                        shutil.copy2(source_path, target_path)
+                        print(f"    {tex_type}: {os.path.basename(source_path)} -> {udim_filename}")
+                    except Exception as e:
+                        print(f"    ❌ Error copying {tex_type}: {e}")
+                        success = False
+            
+            if success:
+                added_count += 1
+        
+        # Update JSON mapping if it exists
+        if mapping and new_tiles:
+            mapping['udim_tiles'].extend(new_tiles)
+            save_udim_mapping_json(str(udim_dir), mapping)
+            print(f"✅ Updated JSON mapping with {len(new_tiles)} new tiles")
+        elif new_tiles:
+            print(f"⚠️ No JSON mapping to update (added {len(new_tiles)} tiles without JSON)")
+        
+        return added_count
+    
+    def reload_udim_images(self, obj):
+        """Reload UDIM images to show new tiles"""
+        print("🔄 Reloading UDIM images...")
+        
+        for slot in obj.material_slots:
+            if not slot.material or not slot.material.use_nodes:
+                continue
+            
+            for node in slot.material.node_tree.nodes:
+                if node.type == 'TEX_IMAGE' and node.image:
+                    if node.image.source == 'TILED':
+                        try:
+                            node.image.reload()
+                            print(f"  Reloaded: {node.image.name}")
+                        except Exception as e:
+                            print(f"  ⚠️ Error reloading {node.image.name}: {e}")
+        
+        print("✅ UDIM images reloaded")
+
+
 class AGR_OT_RevertUDIM(Operator):
     """Revert UDIM UVs back to 0-1 and restore original materials"""
     bl_idname = "agr.revert_udim"
@@ -680,6 +970,18 @@ class AGR_OT_RevertUDIM(Operator):
             print(f"\n🔄 === REVERTING UDIM ===")
             print(f"Object: {obj.name}")
             
+            # Store old UDIM material for cleanup
+            old_udim_material = None
+            for slot in obj.material_slots:
+                if slot.material and slot.material.use_nodes:
+                    for node in slot.material.node_tree.nodes:
+                        if node.type == 'TEX_IMAGE' and node.image:
+                            if node.image.source == 'TILED':
+                                old_udim_material = slot.material
+                                break
+                if old_udim_material:
+                    break
+            
             # Parse object name to get address
             try:
                 address, obj_type = process_object_name(obj.name)
@@ -711,24 +1013,32 @@ class AGR_OT_RevertUDIM(Operator):
             # Load JSON mapping
             mapping = load_udim_mapping_json(str(udim_dir))
             
+            result = {'CANCELLED'}
+            
             if not mapping:
                 # No JSON - use fallback for all tiles
                 print("⚠️ No JSON mapping found, using fallback method for all tiles")
-                return self.revert_without_json(obj, udim_dir, actual_tiles)
-            
-            # Check if JSON covers all tiles
-            json_tiles = {tile['udim_number']: tile for tile in mapping.get('udim_tiles', [])}
-            json_tile_numbers = set(json_tiles.keys())
-            missing_tiles = actual_tiles - json_tile_numbers
-            
-            if missing_tiles:
-                # Partial JSON - use JSON for covered tiles, fallback for missing
-                print(f"⚠️ JSON incomplete: {len(json_tile_numbers)} tiles in JSON, {len(missing_tiles)} missing")
-                return self.revert_with_partial_json(obj, mapping, udim_dir, actual_tiles, missing_tiles)
+                result = self.revert_without_json(obj, udim_dir, actual_tiles)
             else:
-                # Complete JSON - use it for all tiles
-                print(f"✅ Complete JSON mapping found for all {len(actual_tiles)} tiles")
-                return self.revert_with_json(obj, mapping, udim_dir)
+                # Check if JSON covers all tiles
+                json_tiles = {tile['udim_number']: tile for tile in mapping.get('udim_tiles', [])}
+                json_tile_numbers = set(json_tiles.keys())
+                missing_tiles = actual_tiles - json_tile_numbers
+                
+                if missing_tiles:
+                    # Partial JSON - use JSON for covered tiles, fallback for missing
+                    print(f"⚠️ JSON incomplete: {len(json_tile_numbers)} tiles in JSON, {len(missing_tiles)} missing")
+                    result = self.revert_with_partial_json(obj, mapping, udim_dir, actual_tiles, missing_tiles)
+                else:
+                    # Complete JSON - use it for all tiles
+                    print(f"✅ Complete JSON mapping found for all {len(actual_tiles)} tiles")
+                    result = self.revert_with_json(obj, mapping, udim_dir)
+            
+            # Clean up old UDIM material if revert was successful
+            if result == {'FINISHED'} and old_udim_material:
+                self.cleanup_udim_material(old_udim_material)
+            
+            return result
             
         except Exception as e:
             print(f"❌ Error reverting UDIM: {str(e)}")
@@ -786,7 +1096,7 @@ class AGR_OT_RevertUDIM(Operator):
             udim_to_material[udim_number] = mat
         
         # Process missing tiles with fallback method
-        sequence_num = self.get_next_sequence_number()
+        sequence_num = self.get_next_sequence_number(bpy.context)
         
         for udim_number in sorted(missing_tiles):
             mat_name = f"M_{sequence_num}_{udim_number}"
@@ -938,7 +1248,7 @@ class AGR_OT_RevertUDIM(Operator):
         
         # Create generic materials M_#_####
         udim_to_material = {}
-        sequence_num = self.get_next_sequence_number()
+        sequence_num = self.get_next_sequence_number(bpy.context)
         
         for udim_number in sorted(actual_tiles):
             mat_name = f"M_{sequence_num}_{udim_number}"
@@ -1118,20 +1428,68 @@ class AGR_OT_RevertUDIM(Operator):
         
         print(f"✅ UVs moved back to 0-1 and materials assigned")
     
-    def get_next_sequence_number(self):
-        """Get next available sequence number for generic materials"""
+    def get_next_sequence_number(self, context):
+        """Get next available sequence number for generic materials
+        Checks both scene materials and texture sets to avoid conflicts
+        """
         max_num = 0
+        
+        # Check materials in scene
         for mat in bpy.data.materials:
             match = re.match(r'M_(\d+)_\d{4}', mat.name)
             if match:
                 num = int(match.group(1))
                 if num > max_num:
                     max_num = num
+        
+        # Check texture sets
+        for tex_set in context.scene.agr_texture_sets:
+            # Texture sets have format S_M_#_#### 
+            set_name = tex_set.name
+            if set_name.startswith("S_"):
+                material_name = set_name[2:]  # Remove S_ prefix
+                match = re.match(r'M_(\d+)_\d{4}', material_name)
+                if match:
+                    num = int(match.group(1))
+                    if num > max_num:
+                        max_num = num
+        
+        print(f"  Next sequence number: {max_num + 1}")
         return max_num + 1
+    
+    def cleanup_udim_material(self, udim_material):
+        """Remove UDIM material and its images from the scene"""
+        print(f"🧹 Cleaning up UDIM material: {udim_material.name}")
+        
+        # Collect UDIM images used by this material
+        udim_images = []
+        if udim_material.use_nodes:
+            for node in udim_material.node_tree.nodes:
+                if node.type == 'TEX_IMAGE' and node.image:
+                    if node.image.source == 'TILED':
+                        udim_images.append(node.image)
+        
+        # Remove the material
+        try:
+            bpy.data.materials.remove(udim_material)
+            print(f"  ✅ Removed material: {udim_material.name}")
+        except Exception as e:
+            print(f"  ⚠️ Error removing material: {e}")
+        
+        # Remove UDIM images
+        for img in udim_images:
+            try:
+                bpy.data.images.remove(img)
+                print(f"  ✅ Removed UDIM image: {img.name}")
+            except Exception as e:
+                print(f"  ⚠️ Error removing image: {e}")
+        
+        print(f"✅ UDIM material cleanup complete")
 
 
 classes = (
     AGR_OT_CreateUDIM,
+    AGR_OT_AddToUDIM,
     AGR_OT_RevertUDIM,
 )
 

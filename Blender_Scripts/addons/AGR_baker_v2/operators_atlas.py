@@ -16,6 +16,9 @@ try:
 except ImportError:
     PILLOW_AVAILABLE = False
 
+# Import material utilities
+from .core.materials import connect_texture_set_to_material
+
 
 # ===== HELPER FUNCTIONS =====
 
@@ -462,6 +465,162 @@ class AGR_OT_PreviewAtlasLayout(Operator):
         print(f"⚠️ Image Editor не найден, изображение загружено в Data")
 
 
+# ===== PREVIEW ATLAS LAYOUT FROM OBJECT OPERATOR =====
+
+class AGR_OT_PreviewAtlasLayoutFromObject(Operator):
+    """Preview atlas packing layout for active object materials"""
+    bl_idname = "agr.preview_atlas_layout_from_object"
+    bl_label = "Preview Atlas Layout from Object"
+    bl_options = {'REGISTER'}
+    
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'MESH' and len(obj.material_slots) > 0
+    
+    def execute(self, context):
+        settings = context.scene.agr_baker_settings
+        texture_sets_list = context.scene.agr_texture_sets
+        obj = context.active_object
+        
+        # Собираем все материалы объекта
+        material_names = []
+        for slot in obj.material_slots:
+            if slot.material:
+                material_names.append(slot.material.name)
+        
+        if not material_names:
+            self.report({'WARNING'}, "У объекта нет материалов")
+            return {'CANCELLED'}
+        
+        # Ищем соответствующие texture sets
+        object_sets = []
+        missing_materials = []
+        
+        for mat_name in material_names:
+            found = False
+            for tex_set in texture_sets_list:
+                if tex_set.material_name == mat_name and not tex_set.is_atlas:
+                    object_sets.append(tex_set)
+                    found = True
+                    break
+            
+            if not found:
+                missing_materials.append(mat_name)
+        
+        if missing_materials:
+            self.report({'WARNING'}, f"Не найдены texture sets для материалов: {', '.join(missing_materials)}")
+        
+        if not object_sets:
+            self.report({'WARNING'}, "Не найдено ни одного texture set для материалов объекта")
+            return {'CANCELLED'}
+        
+        atlas_size = int(settings.atlas_size)
+        
+        # Проверяем, можно ли упаковать
+        total_area = sum(s.resolution * s.resolution for s in object_sets)
+        if total_area > atlas_size * atlas_size:
+            self.report({'ERROR'}, f"Текстуры не помещаются в атлас {atlas_size}x{atlas_size}")
+            return {'CANCELLED'}
+        
+        try:
+            # Рассчитываем упаковку
+            layout = calculate_atlas_packing_layout(object_sets, atlas_size)
+            
+            if not layout:
+                self.report({'ERROR'}, "Не удалось рассчитать упаковку")
+                return {'CANCELLED'}
+            
+            # Создаем превью изображение
+            preview_image = self.create_preview_image(layout, atlas_size, obj.name)
+            
+            if preview_image:
+                # Показываем в Image Editor
+                self.show_preview_in_editor(context, preview_image)
+                self.report({'INFO'}, f"Предпросмотр для {obj.name}: {len(layout)} текстур в атласе {atlas_size}x{atlas_size}")
+                return {'FINISHED'}
+            else:
+                self.report({'ERROR'}, "Не удалось создать превью")
+                return {'CANCELLED'}
+                
+        except Exception as e:
+            self.report({'ERROR'}, f"Ошибка: {str(e)}")
+            print(f"❌ Ошибка предпросмотра: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'CANCELLED'}
+    
+    def create_preview_image(self, layout, atlas_size, obj_name):
+        """Создает превью изображение с раскладкой"""
+        import random
+        
+        preview_name = f"Atlas_Preview_{obj_name}"
+        
+        # Удаляем старое превью если есть
+        if preview_name in bpy.data.images:
+            bpy.data.images.remove(bpy.data.images[preview_name])
+        
+        # Создаем новое изображение
+        preview_image = bpy.data.images.new(
+            preview_name,
+            width=atlas_size,
+            height=atlas_size,
+            alpha=False,
+            float_buffer=False
+        )
+        
+        # Заполняем черным цветом
+        pixels = [0.0, 0.0, 0.0, 1.0] * (atlas_size * atlas_size)
+        preview_image.pixels = pixels
+        
+        # Создаем numpy массив для работы
+        preview_array = np.array(preview_image.pixels[:]).reshape(atlas_size, atlas_size, 4)
+        
+        # Рисуем прямоугольники для каждой текстуры
+        for item in layout:
+            x = item['x']
+            y = item['y']
+            w = item['width']
+            h = item['height']
+            
+            # Генерируем случайный цвет для каждой текстуры
+            color = [random.random(), random.random(), random.random(), 1.0]
+            
+            # Заполняем область
+            preview_array[y:y+h, x:x+w, :] = color
+            
+            # Рисуем границу (белая рамка 2px)
+            border_width = max(2, atlas_size // 512)
+            preview_array[y:y+border_width, x:x+w, :] = [1.0, 1.0, 1.0, 1.0]  # Верх
+            preview_array[y+h-border_width:y+h, x:x+w, :] = [1.0, 1.0, 1.0, 1.0]  # Низ
+            preview_array[y:y+h, x:x+border_width, :] = [1.0, 1.0, 1.0, 1.0]  # Лево
+            preview_array[y:y+h, x+w-border_width:x+w, :] = [1.0, 1.0, 1.0, 1.0]  # Право
+        
+        # Записываем массив обратно в изображение
+        flat = preview_array.flatten().tolist()
+        preview_image.pixels = flat
+        preview_image.update()
+        
+        print(f"✅ Создано превью для {obj_name}: {len(layout)} текстур")
+        
+        return preview_image
+    
+    def show_preview_in_editor(self, context, image):
+        """Показывает изображение в Image Editor"""
+        for area in context.screen.areas:
+            if area.type == 'IMAGE_EDITOR':
+                for space in area.spaces:
+                    if space.type == 'IMAGE_EDITOR':
+                        space.image = image
+                        space.use_image_pin = True
+                        break
+                area.tag_redraw()
+                print(f"📷 Предпросмотр отображен в Image Editor")
+                return
+        
+        print(f"⚠️ Image Editor не найден, изображение загружено в Data")
+
+
 # ===== CREATE ATLAS ONLY OPERATOR =====
 
 class AGR_OT_CreateAtlasOnly(Operator):
@@ -474,11 +633,10 @@ class AGR_OT_CreateAtlasOnly(Operator):
         name="Atlas Type",
         description="Type of atlas to create",
         items=[
-            ('AUTO', "Auto", "Automatically determine based on active object"),
             ('HIGH', "HIGH", "HIGH atlas with DO/ERM/N textures"),
             ('LOW', "LOW", "LOW atlas with d/r/m/o/n separate textures"),
         ],
-        default='AUTO'
+        default='HIGH'
     )
     
     def execute(self, context):
@@ -500,22 +658,8 @@ class AGR_OT_CreateAtlasOnly(Operator):
             self.report({'ERROR'}, f"Текстуры не помещаются в атлас {atlas_size}x{atlas_size}")
             return {'CANCELLED'}
         
-        # Определяем тип атласа
-        if self.atlas_type == 'AUTO':
-            active_obj = context.active_object
-            if active_obj:
-                try:
-                    address, obj_type = process_object_name(active_obj.name)
-                    if obj_type in ['Main', 'Flora', 'Ground', 'GroundEl']:
-                        final_atlas_type = 'LOW'
-                    else:
-                        final_atlas_type = 'HIGH'
-                except:
-                    final_atlas_type = 'HIGH'
-            else:
-                final_atlas_type = 'HIGH'
-        else:
-            final_atlas_type = self.atlas_type
+        # Используем выбранный тип атласа
+        final_atlas_type = self.atlas_type
         
         print(f"\n{'='*60}")
         print(f"🎨 СОЗДАНИЕ АТЛАСА (ТОЛЬКО ТЕКСТУРЫ)")
@@ -2182,17 +2326,39 @@ class AGR_OT_CreateAtlasFromObject(Operator):
 # ===== APPLY EXISTING ATLAS TO OBJECT OPERATOR =====
 
 def get_available_atlases(self, context):
-    """Получает список доступных атласов для EnumProperty"""
+    """Получает список доступных атласов для EnumProperty (сканирует A_* папки напрямую)"""
     items = []
-    texture_sets_list = context.scene.agr_texture_sets
+    settings = context.scene.agr_baker_settings
     
-    for i, ts in enumerate(texture_sets_list):
-        if ts.is_atlas:
-            items.append((
-                ts.folder_path,
-                ts.name,
-                f"Atlas: {ts.name} ({ts.resolution}x{ts.resolution})"
-            ))
+    # Получаем путь к AGR_BAKE
+    blend_path = bpy.path.abspath("//")
+    if blend_path:
+        agr_bake_path = os.path.join(blend_path, settings.output_folder)
+        
+        if os.path.exists(agr_bake_path):
+            # Сканируем A_* папки
+            for item in os.listdir(agr_bake_path):
+                item_path = os.path.join(agr_bake_path, item)
+                if os.path.isdir(item_path) and item.startswith("A_"):
+                    # Проверяем наличие atlas_mapping.json
+                    mapping_path = os.path.join(item_path, 'atlas_mapping.json')
+                    if os.path.exists(mapping_path):
+                        try:
+                            with open(mapping_path, 'r', encoding='utf-8') as f:
+                                mapping = json.load(f)
+                                atlas_size = mapping.get('atlas_size', 'Unknown')
+                                items.append((
+                                    item_path,
+                                    item,
+                                    f"Atlas: {item} ({atlas_size}x{atlas_size})"
+                                ))
+                        except:
+                            # Если не удалось прочитать mapping, всё равно добавляем
+                            items.append((
+                                item_path,
+                                item,
+                                f"Atlas: {item}"
+                            ))
     
     if not items:
         items.append(('NONE', "No atlases", "No atlases available"))
@@ -2218,17 +2384,30 @@ class AGR_OT_ApplyAtlasToObject(Operator):
         if not obj or obj.type != 'MESH':
             return False
         
-        # Проверяем наличие атласов
-        texture_sets_list = context.scene.agr_texture_sets
-        atlases = [ts for ts in texture_sets_list if ts.is_atlas]
-        return len(atlases) > 0
+        # Проверяем наличие атласов (сканируем A_* папки напрямую)
+        settings = context.scene.agr_baker_settings
+        blend_path = bpy.path.abspath("//")
+        if not blend_path:
+            return False
+        
+        agr_bake_path = os.path.join(blend_path, settings.output_folder)
+        if not os.path.exists(agr_bake_path):
+            return False
+        
+        # Ищем хотя бы одну A_* папку
+        for item in os.listdir(agr_bake_path):
+            item_path = os.path.join(agr_bake_path, item)
+            if os.path.isdir(item_path) and item.startswith("A_"):
+                return True
+        
+        return False
     
     def invoke(self, context, event):
         # Показываем диалог выбора атласа
-        texture_sets_list = context.scene.agr_texture_sets
-        atlases = [ts for ts in texture_sets_list if ts.is_atlas]
+        # Проверяем наличие атласов через get_available_atlases
+        available = get_available_atlases(self, context)
         
-        if not atlases:
+        if not available or (len(available) == 1 and available[0][0] == 'NONE'):
             self.report({'WARNING'}, "Нет доступных атласов")
             return {'CANCELLED'}
         
@@ -2241,25 +2420,21 @@ class AGR_OT_ApplyAtlasToObject(Operator):
     
     def execute(self, context):
         obj = context.active_object
-        texture_sets_list = context.scene.agr_texture_sets
         
         if self.selected_atlas == 'NONE':
             self.report({'ERROR'}, "Не выбран атлас")
             return {'CANCELLED'}
         
-        # Находим атлас по folder_path
-        atlas_set = None
-        for ts in texture_sets_list:
-            if ts.is_atlas and ts.folder_path == self.selected_atlas:
-                atlas_set = ts
-                break
+        # selected_atlas содержит путь к папке атласа
+        atlas_folder_path = self.selected_atlas
+        atlas_name = os.path.basename(atlas_folder_path)
         
-        if not atlas_set:
-            self.report({'ERROR'}, "Атлас не найден")
+        if not os.path.exists(atlas_folder_path):
+            self.report({'ERROR'}, "Папка атласа не найдена")
             return {'CANCELLED'}
         
         # Загружаем atlas_mapping.json
-        mapping_path = os.path.join(atlas_set.folder_path, 'atlas_mapping.json')
+        mapping_path = os.path.join(atlas_folder_path, 'atlas_mapping.json')
         if not os.path.exists(mapping_path):
             self.report({'ERROR'}, f"Не найден atlas_mapping.json для атласа")
             return {'CANCELLED'}
@@ -2284,11 +2459,11 @@ class AGR_OT_ApplyAtlasToObject(Operator):
         print(f"📐 ПРИМЕНЕНИЕ АТЛАСА К ОБЪЕКТУ")
         print(f"{'='*60}")
         print(f"Объект: {obj.name}")
-        print(f"Атлас: {atlas_set.name}")
+        print(f"Атлас: {atlas_name}")
         
         try:
             # Применяем атлас
-            self.apply_atlas_uv(context, obj, atlas_set, mapping)
+            self.apply_atlas_uv(context, obj, atlas_folder_path, atlas_name, mapping)
             
             self.report({'INFO'}, f"Атлас применен к объекту")
             return {'FINISHED'}
@@ -2300,7 +2475,7 @@ class AGR_OT_ApplyAtlasToObject(Operator):
             traceback.print_exc()
             return {'CANCELLED'}
     
-    def apply_atlas_uv(self, context, obj, atlas_set, mapping):
+    def apply_atlas_uv(self, context, obj, atlas_folder_path, atlas_name, mapping):
         """Применяет UV раскладку атласа к объекту (ИСПРАВЛЕНО: сохраняет маппинг ДО очистки материалов)"""
         # Создаем маппинг материал -> UV координаты из JSON
         material_to_uv = {}
@@ -2336,10 +2511,10 @@ class AGR_OT_ApplyAtlasToObject(Operator):
         print(f"💾 Сохранено {len(face_to_material)} полигонов с материалами")
         
         # Получаем или создаем атласный материал
-        atlas_material_name = f"M_{atlas_set.name}"
+        atlas_material_name = f"M_{atlas_name}"
         if atlas_material_name not in bpy.data.materials:
             # Пытаемся создать материал из текстур атласа
-            self.create_atlas_material_from_textures(atlas_set, mapping)
+            self.create_atlas_material_from_textures(atlas_folder_path, atlas_name, mapping)
         
         if atlas_material_name not in bpy.data.materials:
             self.report({'WARNING'}, f"Материал атласа '{atlas_material_name}' не найден")
@@ -2396,9 +2571,9 @@ class AGR_OT_ApplyAtlasToObject(Operator):
         
         print(f"✅ UV раскладка применена: обработано {processed_faces} полигонов по JSON маппингу")
     
-    def create_atlas_material_from_textures(self, atlas_set, mapping):
+    def create_atlas_material_from_textures(self, atlas_folder_path, atlas_name, mapping):
         """Создает материал атласа из текстур"""
-        material_name = f"M_{atlas_set.name}"
+        material_name = f"M_{atlas_name}"
         atlas_type = mapping.get('atlas_type', 'HIGH')
         created_atlases = mapping.get('created_atlases', {})
         
@@ -2488,98 +2663,294 @@ class AGR_OT_ApplyAtlasToObject(Operator):
         print(f"🎨 Материал создан: {material_name}")
 
 
-# ===== PREVIEW EXISTING ATLAS OPERATOR =====
+# ===== UNPACK ATLAS TO MATERIALS OPERATOR =====
 
-class AGR_OT_PreviewAtlas(Operator):
-    """Preview existing atlas in Image Editor"""
-    bl_idname = "agr.preview_atlas"
-    bl_label = "Preview Atlas"
-    bl_options = {'REGISTER'}
+class AGR_OT_UnpackAtlasToMaterials(Operator):
+    """Unpack atlas back to individual materials and restore UV to 0-1 range"""
+    bl_idname = "agr.unpack_atlas_to_materials"
+    bl_label = "Unpack Atlas to Materials"
+    bl_options = {'REGISTER', 'UNDO'}
     
-    atlas_name: bpy.props.StringProperty(
-        name="Atlas Name",
-        description="Name of the atlas to preview"
-    )
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            return False
+        if not obj.active_material:
+            return False
+        return True
     
     def execute(self, context):
-        texture_sets_list = context.scene.agr_texture_sets
+        obj = context.active_object
+        active_material = obj.active_material
         
-        # Находим атлас
-        atlas_set = None
-        for ts in texture_sets_list:
-            if ts.is_atlas and ts.name == self.atlas_name:
-                atlas_set = ts
-                break
-        
-        if not atlas_set:
-            self.report({'ERROR'}, f"Атлас '{self.atlas_name}' не найден")
-            return {'CANCELLED'}
-        
-        # Ищем изображение атласа (DO или d текстуру)
-        atlas_folder = atlas_set.folder_path
-        atlas_image_path = None
-        
-        # Пробуем найти основную текстуру
-        for filename in os.listdir(atlas_folder):
-            if filename.endswith('.png'):
-                if '_DO.png' in filename or '_d.png' in filename or '_Diffuse.png' in filename:
-                    atlas_image_path = os.path.join(atlas_folder, filename)
-                    break
-        
-        if not atlas_image_path:
-            # Берем первую PNG
-            for filename in os.listdir(atlas_folder):
-                if filename.endswith('.png'):
-                    atlas_image_path = os.path.join(atlas_folder, filename)
-                    break
-        
-        if not atlas_image_path or not os.path.exists(atlas_image_path):
-            self.report({'ERROR'}, "Не найдено изображение атласа")
-            return {'CANCELLED'}
-        
-        # Загружаем изображение
-        image_name = f"Preview_{atlas_set.name}"
-        if image_name in bpy.data.images:
-            bpy.data.images.remove(bpy.data.images[image_name])
+        print(f"\n{'='*60}")
+        print(f"📦 РАСПАКОВКА АТЛАСА В МАТЕРИАЛЫ")
+        print(f"{'='*60}")
+        print(f"Объект: {obj.name}")
+        print(f"Активный материал: {active_material.name}")
         
         try:
-            image = bpy.data.images.load(atlas_image_path)
-            image.name = image_name
+            # 1. Находим путь к текстуре атласа через Base Color
+            atlas_folder = self.find_atlas_folder_from_material(active_material)
             
-            # Показываем в Image Editor
-            self.show_preview_in_editor(context, image)
+            if not atlas_folder:
+                self.report({'ERROR'}, "Не удалось найти папку атласа через текстуру Base Color")
+                return {'CANCELLED'}
             
-            self.report({'INFO'}, f"Предпросмотр атласа: {atlas_set.name}")
-            return {'FINISHED'}
+            print(f"📁 Найдена папка атласа: {atlas_folder}")
             
+            # 2. Загружаем atlas_mapping.json
+            mapping_path = os.path.join(atlas_folder, 'atlas_mapping.json')
+            if not os.path.exists(mapping_path):
+                self.report({'ERROR'}, f"Не найден atlas_mapping.json в {atlas_folder}")
+                return {'CANCELLED'}
+            
+            with open(mapping_path, 'r', encoding='utf-8') as f:
+                mapping = json.load(f)
+            
+            print(f"📄 Загружен atlas_mapping.json")
+            print(f"  Атлас: {mapping['atlas_name']}")
+            print(f"  Тип: {mapping['atlas_type']}")
+            print(f"  Размер: {mapping['atlas_size']}")
+            print(f"  Материалов в атласе: {len(mapping['layout'])}")
+            
+            # 3. Проверяем наличие всех материалов в texture sets
+            texture_sets_list = context.scene.agr_texture_sets
+            missing_materials = self.check_materials_availability(mapping, texture_sets_list)
+            
+            if missing_materials:
+                self.report({'WARNING'}, f"Материалы не найдены в texture sets: {', '.join(missing_materials)}")
+                print(f"⚠️ Отсутствующие материалы: {', '.join(missing_materials)}")
+            
+            # 4. Распаковываем атлас
+            result = self.unpack_atlas(context, obj, mapping, texture_sets_list)
+            
+            if result:
+                self.report({'INFO'}, f"Атлас распакован: {result['materials_count']} материалов, {result['faces_processed']} полигонов")
+                return {'FINISHED'}
+            else:
+                self.report({'ERROR'}, "Не удалось распаковать атлас")
+                return {'CANCELLED'}
+                
         except Exception as e:
-            self.report({'ERROR'}, f"Ошибка загрузки изображения: {e}")
+            self.report({'ERROR'}, f"Ошибка распаковки атласа: {str(e)}")
+            print(f"❌ Ошибка: {e}")
+            import traceback
+            traceback.print_exc()
             return {'CANCELLED'}
     
-    def show_preview_in_editor(self, context, image):
-        """Показывает изображение в Image Editor"""
-        for area in context.screen.areas:
-            if area.type == 'IMAGE_EDITOR':
-                for space in area.spaces:
-                    if space.type == 'IMAGE_EDITOR':
-                        space.image = image
-                        space.use_image_pin = False
-                        break
-                area.tag_redraw()
-                print(f"📷 Предпросмотр отображен в Image Editor")
-                return
+    def find_atlas_folder_from_material(self, material):
+        """Находит папку атласа через текстуру подключенную к Base Color"""
+        if not material.use_nodes:
+            return None
         
-        print(f"⚠️ Image Editor не найден, изображение загружено в Data")
+        nodes = material.node_tree.nodes
+        
+        # Ищем Principled BSDF
+        bsdf = None
+        for node in nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                bsdf = node
+                break
+        
+        if not bsdf:
+            return None
+        
+        # Ищем текстуру подключенную к Base Color
+        base_color_input = bsdf.inputs['Base Color']
+        if not base_color_input.is_linked:
+            return None
+        
+        # Получаем ноду текстуры
+        texture_node = base_color_input.links[0].from_node
+        if texture_node.type != 'TEX_IMAGE':
+            return None
+        
+        # Получаем изображение
+        if not texture_node.image:
+            return None
+        
+        # Получаем путь к файлу
+        texture_path = bpy.path.abspath(texture_node.image.filepath)
+        if not os.path.exists(texture_path):
+            return None
+        
+        # Папка атласа - это директория где лежит текстура
+        atlas_folder = os.path.dirname(texture_path)
+        
+        return atlas_folder
+    
+    def check_materials_availability(self, mapping, texture_sets_list):
+        """Проверяет наличие всех материалов из атласа в texture sets"""
+        missing_materials = []
+        
+        for item in mapping['layout']:
+            mat_name = item['material_name']
+            
+            # Ищем в texture sets
+            found = False
+            for ts in texture_sets_list:
+                if ts.material_name == mat_name and not ts.is_atlas:
+                    found = True
+                    break
+            
+            if not found:
+                missing_materials.append(mat_name)
+        
+        return missing_materials
+    
+    def unpack_atlas(self, context, obj, mapping, texture_sets_list):
+        """Распаковывает атлас обратно в отдельные материалы"""
+        
+        # Создаем маппинг UV region -> material_name
+        uv_region_to_material = {}
+        for item in mapping['layout']:
+            mat_name = item['material_name']
+            uv_region_to_material[mat_name] = {
+                'u_min': item['u_min'],
+                'v_min': item['v_min'],
+                'u_max': item['u_max'],
+                'v_max': item['v_max']
+            }
+        
+        print(f"\n📋 UV регионы атласа:")
+        for mat_name, coords in uv_region_to_material.items():
+            print(f"  {mat_name}: ({coords['u_min']:.3f}, {coords['v_min']:.3f}) - ({coords['u_max']:.3f}, {coords['v_max']:.3f})")
+        
+        # Переключаемся в object mode
+        bpy.ops.object.mode_set(mode='OBJECT')
+        
+        # Получаем UV layer
+        if not obj.data.uv_layers.active:
+            self.report({'ERROR'}, "У объекта нет UV слоя")
+            return None
+        
+        uv_layer = obj.data.uv_layers.active.data
+        
+        # Анализируем полигоны и определяем их материалы по UV координатам
+        face_to_material = {}
+        face_to_original_uvs = {}
+        
+        for poly in obj.data.polygons:
+            # Получаем UV координаты полигона
+            poly_uvs = []
+            for loop_idx in poly.loop_indices:
+                uv = uv_layer[loop_idx].uv
+                poly_uvs.append((uv.x, uv.y))
+            
+            # Вычисляем центр полигона в UV пространстве
+            center_u = sum(uv[0] for uv in poly_uvs) / len(poly_uvs)
+            center_v = sum(uv[1] for uv in poly_uvs) / len(poly_uvs)
+            
+            # Определяем к какому региону атласа принадлежит полигон
+            matched_material = None
+            for mat_name, coords in uv_region_to_material.items():
+                if (coords['u_min'] <= center_u <= coords['u_max'] and
+                    coords['v_min'] <= center_v <= coords['v_max']):
+                    matched_material = mat_name
+                    break
+            
+            if matched_material:
+                face_to_material[poly.index] = matched_material
+                
+                # Сохраняем оригинальные UV и вычисляем обратную трансформацию
+                coords = uv_region_to_material[matched_material]
+                original_uvs = []
+                for uv_u, uv_v in poly_uvs:
+                    # Обратная трансформация: из atlas space в 0-1 space
+                    orig_u = (uv_u - coords['u_min']) / (coords['u_max'] - coords['u_min'])
+                    orig_v = (uv_v - coords['v_min']) / (coords['v_max'] - coords['v_min'])
+                    original_uvs.append((orig_u, orig_v))
+                
+                face_to_original_uvs[poly.index] = original_uvs
+        
+        print(f"\n🔍 Анализ полигонов:")
+        print(f"  Всего полигонов: {len(obj.data.polygons)}")
+        print(f"  Определено материалов: {len(face_to_material)}")
+        
+        # Создаем/получаем материалы для каждого региона
+        material_objects = {}
+        material_indices = {}
+        
+        for mat_name in uv_region_to_material.keys():
+            # Ищем материал в texture sets
+            mat_texture_set = None
+            for ts in texture_sets_list:
+                if ts.material_name == mat_name and not ts.is_atlas:
+                    mat_texture_set = ts
+                    break
+            
+            # Создаем или получаем материал
+            if mat_name in bpy.data.materials:
+                material = bpy.data.materials[mat_name]
+                # Проверяем, есть ли у материала правильная настройка нод
+                has_proper_setup = False
+                if material.use_nodes and material.node_tree:
+                    # Проверяем наличие текстурных нод
+                    has_texture_nodes = any(node.type == 'TEX_IMAGE' for node in material.node_tree.nodes)
+                    if has_texture_nodes:
+                        has_proper_setup = True
+                        print(f"  ♻️ Используется существующий материал: {mat_name}")
+                
+                # Если нет правильной настройки, переподключаем
+                if not has_proper_setup and mat_texture_set:
+                    connect_texture_set_to_material(material, mat_texture_set.folder_path, mat_texture_set.material_name)
+                    print(f"  🔄 Обновлен материал: {mat_name}")
+            else:
+                material = bpy.data.materials.new(name=mat_name)
+                
+                # Если есть texture set, создаем материал с текстурами
+                if mat_texture_set:
+                    connect_texture_set_to_material(material, mat_texture_set.folder_path, mat_texture_set.material_name)
+                    print(f"  ✅ Создан материал: {mat_name}")
+                else:
+                    print(f"  ⚠️ Создан пустой материал: {mat_name} (texture set не найден)")
+            
+            material_objects[mat_name] = material
+        
+        # Очищаем материалы объекта и добавляем новые
+        obj.data.materials.clear()
+        
+        for mat_name in sorted(material_objects.keys()):
+            obj.data.materials.append(material_objects[mat_name])
+            material_indices[mat_name] = len(obj.data.materials) - 1
+            print(f"  📌 Добавлен материал: {mat_name} (index {material_indices[mat_name]})")
+        
+        # Применяем материалы и восстанавливаем UV
+        faces_processed = 0
+        for poly in obj.data.polygons:
+            if poly.index in face_to_material:
+                mat_name = face_to_material[poly.index]
+                poly.material_index = material_indices[mat_name]
+                
+                # Восстанавливаем UV координаты в 0-1 диапазон
+                original_uvs = face_to_original_uvs[poly.index]
+                for i, loop_idx in enumerate(poly.loop_indices):
+                    uv_layer[loop_idx].uv = original_uvs[i]
+                
+                faces_processed += 1
+        
+        print(f"\n✅ Распаковка завершена:")
+        print(f"  Материалов: {len(material_objects)}")
+        print(f"  Полигонов обработано: {faces_processed}")
+        print(f"{'='*60}\n")
+        
+        return {
+            'materials_count': len(material_objects),
+            'faces_processed': faces_processed
+        }
 
 
 # ===== REGISTRATION =====
 
 classes = (
     AGR_OT_PreviewAtlasLayout,
+    AGR_OT_PreviewAtlasLayoutFromObject,
     AGR_OT_CreateAtlasOnly,
     AGR_OT_CreateAtlasFromObject,
     AGR_OT_ApplyAtlasToObject,
-    AGR_OT_PreviewAtlas,
+    AGR_OT_UnpackAtlasToMaterials,
 )
 
 
