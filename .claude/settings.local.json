@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \":*)",
+      "Bash(python -m zipfile -l c:/0_CODE/0_AGR_baker/AGR_baker_v2.zip)"
+    ]
+  }
+}

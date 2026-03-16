@@ -60,3 +60,7 @@ Atlas folders use the `A_*` prefix with the same dual-mode distinction.
 - **Node tree manipulation**: Clears and rebuilds Principled BSDF connections; supports both legacy Separate RGB and modern Separate Color nodes.
 - **File structure**: `AGR_BAKE/` folder sits next to the `.blend` file. `AGR_BAKE_UDIM/` for UDIM workflows.
 - **Logging**: Extensive `print()` statements with emoji prefixes throughout — check Blender's system console for debug output.
+## Язык
+- Всегда отвечай на русском языке
+- Планы пиши на русском
+- Код и комментарии внутри кода — на английском

@@ -169,20 +169,49 @@ class AGR_BakerSettings(PropertyGroup):
         default=False
     )
     
-    # Photoshop integration
-    photoshop_path: StringProperty(
-        name="Photoshop Path",
-        description="Path to Photoshop executable",
-        default="",
-        subtype='FILE_PATH'
+    # UI collapsible sections
+    show_sets_list: BoolProperty(
+        name="Texture Sets List",
+        description="Show texture sets list",
+        default=True
     )
-    
-    photoshop_enabled: BoolProperty(
-        name="Enable Photoshop",
-        description="Enable Photoshop integration for texture processing",
+
+    show_batch_ops: BoolProperty(
+        name="Batch Operations",
+        description="Show batch operations section",
         default=False
     )
-    
+
+    show_delete_ops: BoolProperty(
+        name="Delete Operations",
+        description="Show delete operations",
+        default=False
+    )
+
+    show_atlas_ops: BoolProperty(
+        name="Atlas Operations",
+        description="Show atlas operations section",
+        default=False
+    )
+
+    show_atlas_from_selected: BoolProperty(
+        name="Atlas from Selected Sets",
+        description="Show preview/create atlas from selected sets",
+        default=False
+    )
+
+    show_udim_ops: BoolProperty(
+        name="UDIM Operations",
+        description="Show UDIM operations section",
+        default=False
+    )
+
+    show_sort_select: BoolProperty(
+        name="Sort & Select",
+        description="Show sort and selection controls",
+        default=False
+    )
+
     # Output settings
     output_folder: StringProperty(
         name="Output Folder",

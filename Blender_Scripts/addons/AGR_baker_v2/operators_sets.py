@@ -298,36 +298,6 @@ class AGR_OT_LoadSetsFromFolder(Operator):
         return {'FINISHED'}
 
 
-class AGR_OT_OpenPhotoshopSettings(Operator):
-    """Open Photoshop integration settings"""
-    bl_idname = "agr.open_photoshop_settings"
-    bl_label = "Photoshop Settings"
-    bl_options = {'REGISTER'}
-    
-    def execute(self, context):
-        return context.window_manager.invoke_props_dialog(self, width=400)
-    
-    def draw(self, context):
-        layout = self.layout
-        settings = context.scene.agr_baker_settings
-        
-        layout.label(text="Photoshop Integration", icon='TEXTURE')
-        layout.separator()
-        
-        layout.prop(settings, "photoshop_enabled")
-        layout.prop(settings, "photoshop_path")
-        
-        layout.separator()
-        layout.label(text="Photoshop will be used for:", icon='INFO')
-        box = layout.box()
-        box.label(text="• Texture resizing")
-        box.label(text="• Advanced texture processing")
-        box.label(text="• Batch operations")
-    
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=400)
-
-
 class AGR_OT_DeleteSelectedSets(Operator):
     """Delete selected texture sets (remove materials and slots, keep files)"""
     bl_idname = "agr.delete_selected_sets"
@@ -610,10 +580,6 @@ class AGR_OT_SelectSetsWithAlpha(Operator):
     bl_options = {'REGISTER'}
     
     def execute(self, context):
-        # Alpha check is now done automatically in refresh_texture_sets_list
-        # Just refresh to ensure alpha info is current
-        texture_sets.refresh_texture_sets_list(context)
-        
         texture_sets_list = context.scene.agr_texture_sets
         selected_count = 0
         
@@ -625,6 +591,27 @@ class AGR_OT_SelectSetsWithAlpha(Operator):
                 tex_set.is_selected = False
         
         self.report({'INFO'}, f"Selected {selected_count} sets with alpha")
+        return {'FINISHED'}
+
+
+class AGR_OT_SelectSetsWithFrame(Operator):
+    """Select all texture sets with _Frame suffix"""
+    bl_idname = "agr.select_sets_with_frame"
+    bl_label = "Select Sets with Frame"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        texture_sets_list = context.scene.agr_texture_sets
+        selected_count = 0
+
+        for tex_set in texture_sets_list:
+            if tex_set.name.endswith("_Frame"):
+                tex_set.is_selected = True
+                selected_count += 1
+            else:
+                tex_set.is_selected = False
+
+        self.report({'INFO'}, f"Selected {selected_count} sets with _Frame suffix")
         return {'FINISHED'}
 
 
@@ -922,13 +909,13 @@ classes = (
     AGR_OT_ConnectSetToMaterial,
     AGR_OT_AssignSetToActiveObject,
     AGR_OT_LoadSetsFromFolder,
-    AGR_OT_OpenPhotoshopSettings,
     AGR_OT_DeleteSelectedSets,
     AGR_OT_ToggleSetSelection,
     AGR_OT_SelectAllSets,
     AGR_OT_DeleteTexturesFromSelected,
     AGR_OT_CheckAlphaOnAllSets,
     AGR_OT_SelectSetsWithAlpha,
+    AGR_OT_SelectSetsWithFrame,
     AGR_OT_SelectSetsForObject,
     AGR_OT_SelectSetForActiveMaterial,
     AGR_OT_SelectSetsByResolution,

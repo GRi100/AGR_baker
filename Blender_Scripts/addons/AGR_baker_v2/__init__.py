@@ -9,7 +9,7 @@ bl_info = {
     "version": (2, 0, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > AGR Baker",
-    "description": "Advanced texture baking and set management with Photoshop integration",
+    "description": "Advanced texture baking, atlas creation, UDIM workflows, and asset renaming",
     "category": "Object",
 }
 
