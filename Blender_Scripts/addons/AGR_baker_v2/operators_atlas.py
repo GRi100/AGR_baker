@@ -728,15 +728,16 @@ class AGR_OT_CreateAtlasOnly(Operator):
 
                 # Создаем RGBA
                 do_img = Image.new('RGBA', (atlas_size, atlas_size))
-                do_img.paste(d_img, (0, 0))
-                do_img.putalpha(o_pil)
-
                 do_filename = f"T_{atlas_name}_DiffuseOpacity.png"
                 do_filepath = os.path.join(output_path, do_filename)
-                do_img.save(do_filepath)
-                d_img.close()
-                o_pil.close()
-                do_img.close()
+                try:
+                    do_img.paste(d_img, (0, 0))
+                    do_img.putalpha(o_pil)
+                    do_img.save(do_filepath)
+                finally:
+                    d_img.close()
+                    o_pil.close()
+                    do_img.close()
                 created_atlases['DIFFUSE_OPACITY'] = do_filepath
                 print(f"  ✅ Создан DiffuseOpacity с альфа: {do_filename}")
 
@@ -755,8 +756,10 @@ class AGR_OT_CreateAtlasOnly(Operator):
                 do_filepath = os.path.join(output_path, do_filename)
                 with Image.open(filepath) as raw_d:
                     d_img = raw_d.convert('RGB')
-                d_img.save(do_filepath)
-                d_img.close()
+                try:
+                    d_img.save(do_filepath)
+                finally:
+                    d_img.close()
                 created_atlases['DIFFUSE_OPACITY'] = do_filepath
                 print(f"  ✅ Создан DiffuseOpacity без альфа: {do_filename}")
 
@@ -825,13 +828,15 @@ class AGR_OT_CreateAtlasOnly(Operator):
 
             erm_filename = f"T_{atlas_name}_ERM.png"
             erm_filepath = os.path.join(output_path, erm_filename)
-            erm_img.save(erm_filepath)
+            try:
+                erm_img.save(erm_filepath)
+            finally:
+                e_img.close()
+                r_img.close()
+                m_img.close()
+                erm_img.close()
             created_atlases['ERM'] = erm_filepath
             print(f"  ✅ Создан ERM: {erm_filename}")
-            e_img.close()
-            r_img.close()
-            m_img.close()
-            erm_img.close()
 
         # Opacity (only if not already created in diffuse+alpha block above)
         if 'OPACITY' not in created_atlases:
@@ -895,12 +900,14 @@ class AGR_OT_CreateAtlasOnly(Operator):
 
                 # Создаем RGBA
                 do_img = Image.new('RGBA', (atlas_size, atlas_size))
-                do_img.paste(d_img, (0, 0))
-                do_img.putalpha(o_pil)
-                do_img.save(do_filepath)
-                d_img.close()
-                o_pil.close()
-                do_img.close()
+                try:
+                    do_img.paste(d_img, (0, 0))
+                    do_img.putalpha(o_pil)
+                    do_img.save(do_filepath)
+                finally:
+                    d_img.close()
+                    o_pil.close()
+                    do_img.close()
 
                 created_atlases['DIFFUSE_OPACITY'] = do_filepath
                 print(f"  ✅ Создан DO с альфа: {do_filename}")
@@ -918,8 +925,10 @@ class AGR_OT_CreateAtlasOnly(Operator):
                 print(f"  🔧 Дублирование D как DO (без альфа)")
                 with Image.open(filepath) as raw_d:
                     d_img = raw_d.convert('RGB')
-                d_img.save(do_filepath)
-                d_img.close()
+                try:
+                    d_img.save(do_filepath)
+                finally:
+                    d_img.close()
                 created_atlases['DIFFUSE_OPACITY'] = do_filepath
                 print(f"  ✅ Создан DO без альфа: {do_filename}")
             
@@ -1483,13 +1492,15 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 if not d_filename:
                     d_filename = f"T_{atlas_name}_Diffuse.png"
                 d_filepath = os.path.join(output_path, d_filename)
-                do_img.save(d_filepath)
-                do_img.close()
+                try:
+                    do_img.save(d_filepath)
+                finally:
+                    do_img.close()
                 created_atlases['DIFFUSE'] = d_filepath
                 print(f"  ✅ Создан Diffuse: {d_filename}")
-            
+
             bpy.data.images.remove(do_atlas)
-        
+
         # ERM (разделяем на отдельные карты для HIGH + создаем объединенную ERM)
         print(f"\n🖼️ Создание E, R, M атласов")
         
@@ -1560,13 +1571,15 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             if not erm_filename:
                 erm_filename = f"T_{atlas_name}_ERM.png"
             erm_filepath = os.path.join(output_path, erm_filename)
-            erm_img.save(erm_filepath)
+            try:
+                erm_img.save(erm_filepath)
+            finally:
+                e_img.close()
+                r_img.close()
+                m_img.close()
+                erm_img.close()
             created_atlases['ERM'] = erm_filepath
             print(f"  ✅ Создан ERM: {erm_filename}")
-            e_img.close()
-            r_img.close()
-            m_img.close()
-            erm_img.close()
 
         # Opacity (only if not already created in diffuse+alpha block above)
         if 'OPACITY' not in created_atlases:
@@ -1638,8 +1651,10 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 if not d_filename:
                     d_filename = f"T_{atlas_name}_d.png"
                 d_filepath = os.path.join(output_path, d_filename)
-                d_img.save(d_filepath)
-                d_img.close()
+                try:
+                    d_img.save(d_filepath)
+                finally:
+                    d_img.close()
                 created_atlases['DIFFUSE'] = d_filepath
                 print(f"  ✅ Создан D: {d_filename}")
             else:
@@ -1655,8 +1670,10 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 if not d_filename:
                     d_filename = f"T_{atlas_name}_d.png"
                 d_filepath = os.path.join(output_path, d_filename)
-                do_img.save(d_filepath)
-                do_img.close()
+                try:
+                    do_img.save(d_filepath)
+                finally:
+                    do_img.close()
                 created_atlases['DIFFUSE'] = d_filepath
                 print(f"  ✅ Создан D: {d_filename}")
             
@@ -1691,12 +1708,14 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                     o_pil = Image.fromarray(o_channel, mode='L')
 
                     do_img = Image.new('RGBA', (atlas_size, atlas_size))
-                    do_img.paste(d_img, (0, 0))
-                    do_img.putalpha(o_pil)
-                    do_img.save(do_filepath)
-                    d_img.close()
-                    o_pil.close()
-                    do_img.close()
+                    try:
+                        do_img.paste(d_img, (0, 0))
+                        do_img.putalpha(o_pil)
+                        do_img.save(do_filepath)
+                    finally:
+                        d_img.close()
+                        o_pil.close()
+                        do_img.close()
 
                     created_atlases['DIFFUSE_OPACITY'] = do_filepath
                     print(f"  ✅ Создан DO с альфа: {do_filename}")
@@ -1706,8 +1725,10 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                     # DO без альфа - просто копия D
                     with Image.open(d_filepath) as raw_d:
                         d_img = raw_d.convert('RGB')
-                    d_img.save(do_filepath)
-                    d_img.close()
+                    try:
+                        d_img.save(do_filepath)
+                    finally:
+                        d_img.close()
                     created_atlases['DIFFUSE_OPACITY'] = do_filepath
                     print(f"  ✅ Создан DO без альфа: {do_filename}")
                 

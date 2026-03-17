@@ -169,10 +169,10 @@ def bake_texture(context, target_obj, source_objects, image, bake_type,
         context.scene.render.bake.use_pass_direct = False
         context.scene.render.bake.use_pass_indirect = False
         context.scene.render.bake.use_pass_color = True
-        
+        image.colorspace_settings.name = 'sRGB'
+
         if use_alpha:
             context.scene.render.film_transparent = True
-            image.colorspace_settings.name = 'sRGB'
     
     elif bake_type == 'ROUGHNESS':
         context.scene.cycles.bake_type = 'ROUGHNESS'

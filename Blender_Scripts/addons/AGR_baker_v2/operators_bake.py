@@ -6,6 +6,7 @@ import bpy
 from bpy.types import Operator
 from bpy.props import EnumProperty, BoolProperty
 import os
+import shutil
 import numpy as np
 
 from .core import baking, materials, texture_sets
@@ -69,11 +70,11 @@ class AGR_OT_BakeTextures(Operator):
         original_denoise = context.scene.cycles.use_denoising
         
         context.scene.render.engine = 'CYCLES'
-        context.scene.cycles.samples = 1
-        context.scene.cycles.use_denoising = False
-        context.scene.cycles.device = 'CPU'
-        
-        print(f"🔧 Bake settings: engine=CYCLES, samples=1, device=CPU (forced), denoising=False")
+        context.scene.cycles.samples = settings.bake_samples
+        context.scene.cycles.use_denoising = settings.bake_use_denoising
+        context.scene.cycles.device = settings.bake_device
+
+        print(f"🔧 Bake settings: engine=CYCLES, samples={settings.bake_samples}, device={settings.bake_device}, denoising={settings.bake_use_denoising}")
         
         resolution = int(settings.resolution)
         
@@ -226,7 +227,6 @@ class AGR_OT_BakeTextures(Operator):
             else:
                 print("  🔄 No alpha - copying Diffuse as DiffuseOpacity...")
                 # Copy Diffuse as DiffuseOpacity (without alpha)
-                import shutil
                 diffuse_opacity_path = os.path.join(set_folder, f"T_{material_name}_DiffuseOpacity.png")
                 shutil.copy2(diffuse_path, diffuse_opacity_path)
                 
@@ -398,79 +398,82 @@ class AGR_OT_BakeTextures(Operator):
     
     def extract_opacity_from_saved_file(self, diffuse_opacity_path, opacity_img):
         """Extract opacity from alpha channel of saved DiffuseOpacity file"""
+        diffuse_opacity_file = None
         try:
             # Load the saved DiffuseOpacity file
             diffuse_opacity_file = bpy.data.images.load(diffuse_opacity_path)
             diffuse_opacity_file.colorspace_settings.name = 'sRGB'
-            
+
             width, height = diffuse_opacity_file.size
             pixels = np.array(diffuse_opacity_file.pixels[:]).reshape(height, width, 4)
-            
+
             # Extract alpha channel
             alpha = pixels[:, :, 3]
-            
+
             # Create opacity image (grayscale from alpha)
             opacity_array = np.zeros((height, width, 4), dtype=np.float32)
             opacity_array[:, :, 0] = alpha
             opacity_array[:, :, 1] = alpha
             opacity_array[:, :, 2] = alpha
             opacity_array[:, :, 3] = 1.0
-            
+
             opacity_img.pixels = opacity_array.flatten().tolist()
             opacity_img.update()
-            
-            # Cleanup loaded file
-            bpy.data.images.remove(diffuse_opacity_file)
-            
+
             print(f"  ✅ Extracted opacity from saved DiffuseOpacity file")
-        
+
         except Exception as e:
             print(f"  ❌ Opacity extraction error: {e}")
             import traceback
             traceback.print_exc()
+
+        finally:
+            if diffuse_opacity_file is not None:
+                bpy.data.images.remove(diffuse_opacity_file)
     
     def create_erm_from_files(self, set_folder, material_name, erm_img):
         """Create ERM texture from saved E, R, M files"""
+        emit_file = roughness_file = metallic_file = None
         try:
             emit_path = os.path.join(set_folder, f"T_{material_name}_Emit.png")
             roughness_path = os.path.join(set_folder, f"T_{material_name}_Roughness.png")
             metallic_path = os.path.join(set_folder, f"T_{material_name}_Metallic.png")
-            
+
             # Load files
             emit_file = bpy.data.images.load(emit_path)
             roughness_file = bpy.data.images.load(roughness_path)
             metallic_file = bpy.data.images.load(metallic_path)
-            
+
             emit_file.colorspace_settings.name = 'Non-Color'
             roughness_file.colorspace_settings.name = 'Non-Color'
             metallic_file.colorspace_settings.name = 'Non-Color'
-            
+
             width, height = emit_file.size
-            
+
             # Convert to arrays
             emit_array = np.array(emit_file.pixels[:]).reshape(height, width, 4)
             roughness_array = np.array(roughness_file.pixels[:]).reshape(height, width, 4)
             metallic_array = np.array(metallic_file.pixels[:]).reshape(height, width, 4)
-            
+
             # Create ERM
             erm_array = np.zeros((height, width, 4), dtype=np.float32)
             erm_array[:, :, 0] = emit_array[:, :, 0]       # R = Emit
             erm_array[:, :, 1] = roughness_array[:, :, 0]  # G = Roughness
             erm_array[:, :, 2] = metallic_array[:, :, 0]   # B = Metallic
             erm_array[:, :, 3] = 1.0
-            
+
             erm_img.pixels = erm_array.flatten().tolist()
             erm_img.update()
-            
-            # Cleanup loaded files
-            bpy.data.images.remove(emit_file)
-            bpy.data.images.remove(roughness_file)
-            bpy.data.images.remove(metallic_file)
-            
+
             print(f"  ✅ Created ERM texture from saved files")
-        
+
         except Exception as e:
             print(f"  ❌ ERM creation error: {e}")
+
+        finally:
+            for img in (emit_file, roughness_file, metallic_file):
+                if img is not None:
+                    bpy.data.images.remove(img)
     
     def bake_metallic_via_roughness(self, context, target_obj, source_objects,
                                     metallic_img, mat_idx, settings):
@@ -518,28 +521,29 @@ class AGR_OT_BakeTextures(Operator):
                 if nodes_data:
                     original_states.append((mat, nodes_data))
         
-        # Bake
-        baking.bake_texture(
-            context, target_obj, source_objects, metallic_img,
-            'ROUGHNESS', mat_idx,
-            max_ray_distance=settings.max_ray_distance,
-            extrusion=settings.extrusion
-        )
-        
-        # Restore all materials
-        for mat, nodes_data in original_states:
-            for node, metallic_value, roughness_value, metallic_links, roughness_links in nodes_data:
-                node.inputs['Metallic'].default_value = metallic_value
-                node.inputs['Roughness'].default_value = roughness_value
-                
-                # Remove temporary connections
-                for link in list(mat.node_tree.links):
-                    if link.to_socket == node.inputs['Roughness']:
-                        mat.node_tree.links.remove(link)
-                
-                # Restore original connections
-                for from_node, from_socket in roughness_links:
-                    mat.node_tree.links.new(from_socket, node.inputs['Roughness'])
+        # Bake — wrapped in try/finally so materials are always restored
+        try:
+            baking.bake_texture(
+                context, target_obj, source_objects, metallic_img,
+                'ROUGHNESS', mat_idx,
+                max_ray_distance=settings.max_ray_distance,
+                extrusion=settings.extrusion
+            )
+        finally:
+            # Restore all materials
+            for mat, nodes_data in original_states:
+                for node, metallic_value, roughness_value, metallic_links, roughness_links in nodes_data:
+                    node.inputs['Metallic'].default_value = metallic_value
+                    node.inputs['Roughness'].default_value = roughness_value
+
+                    # Remove temporary connections
+                    for link in list(mat.node_tree.links):
+                        if link.to_socket == node.inputs['Roughness']:
+                            mat.node_tree.links.remove(link)
+
+                    # Restore original connections
+                    for from_node, from_socket in roughness_links:
+                        mat.node_tree.links.new(from_socket, node.inputs['Roughness'])
     
     def bake_emit_via_roughness(self, context, target_obj, source_objects,
                                 emit_img, mat_idx, settings):
@@ -587,28 +591,29 @@ class AGR_OT_BakeTextures(Operator):
                 if nodes_data:
                     original_states.append((mat, nodes_data))
         
-        # Bake
-        baking.bake_texture(
-            context, target_obj, source_objects, emit_img,
-            'ROUGHNESS', mat_idx,
-            max_ray_distance=settings.max_ray_distance,
-            extrusion=settings.extrusion
-        )
-        
-        # Restore all materials
-        for mat, nodes_data in original_states:
-            for node, emit_value, roughness_value, emit_links, roughness_links in nodes_data:
-                node.inputs['Emission Strength'].default_value = emit_value
-                node.inputs['Roughness'].default_value = roughness_value
-                
-                # Remove temporary connections
-                for link in list(mat.node_tree.links):
-                    if link.to_socket == node.inputs['Roughness']:
-                        mat.node_tree.links.remove(link)
-                
-                # Restore original connections
-                for from_node, from_socket in roughness_links:
-                    mat.node_tree.links.new(from_socket, node.inputs['Roughness'])
+        # Bake — wrapped in try/finally so materials are always restored
+        try:
+            baking.bake_texture(
+                context, target_obj, source_objects, emit_img,
+                'ROUGHNESS', mat_idx,
+                max_ray_distance=settings.max_ray_distance,
+                extrusion=settings.extrusion
+            )
+        finally:
+            # Restore all materials
+            for mat, nodes_data in original_states:
+                for node, emit_value, roughness_value, emit_links, roughness_links in nodes_data:
+                    node.inputs['Emission Strength'].default_value = emit_value
+                    node.inputs['Roughness'].default_value = roughness_value
+
+                    # Remove temporary connections
+                    for link in list(mat.node_tree.links):
+                        if link.to_socket == node.inputs['Roughness']:
+                            mat.node_tree.links.remove(link)
+
+                    # Restore original connections
+                    for from_node, from_socket in roughness_links:
+                        mat.node_tree.links.new(from_socket, node.inputs['Roughness'])
 
 
 class AGR_OT_SimpleBake(Operator):
@@ -844,7 +849,6 @@ class AGR_OT_SimpleBake(Operator):
                 print(f"✅ Baked DIFFUSE_OPACITY and extracted OPACITY")
             else:
                 print(f"  🔄 No alpha - copying Diffuse as DiffuseOpacity...")
-                import shutil
                 diffuse_opacity_path = os.path.join(set_folder, f"T_{material_name}_DiffuseOpacity.png")
                 shutil.copy2(diffuse_path, diffuse_opacity_path)
                 
@@ -1081,29 +1085,30 @@ class AGR_OT_SimpleBake(Operator):
                 # Connect metallic to roughness
                 for from_node, from_socket in metallic_links:
                     material.node_tree.links.new(from_socket, node.inputs['Roughness'])
-                
+
                 if not metallic_links:
                     node.inputs['Roughness'].default_value = metallic_value
-                
+
                 node.inputs['Metallic'].default_value = 0.0
-                
-                # Bake
-                baking.bake_texture(
-                    context, bake_plane, [], metallic_img,
-                    'ROUGHNESS', 0
-                )
-                
-                # Restore
-                node.inputs['Metallic'].default_value = metallic_value
-                node.inputs['Roughness'].default_value = roughness_value
-                
-                for link in list(material.node_tree.links):
-                    if link.to_socket == node.inputs['Roughness']:
-                        material.node_tree.links.remove(link)
-                
-                for from_node, from_socket in roughness_links:
-                    material.node_tree.links.new(from_socket, node.inputs['Roughness'])
-                
+
+                # Bake — wrapped in try/finally so node state is always restored
+                try:
+                    baking.bake_texture(
+                        context, bake_plane, [], metallic_img,
+                        'ROUGHNESS', 0
+                    )
+                finally:
+                    # Restore
+                    node.inputs['Metallic'].default_value = metallic_value
+                    node.inputs['Roughness'].default_value = roughness_value
+
+                    for link in list(material.node_tree.links):
+                        if link.to_socket == node.inputs['Roughness']:
+                            material.node_tree.links.remove(link)
+
+                    for from_node, from_socket in roughness_links:
+                        material.node_tree.links.new(from_socket, node.inputs['Roughness'])
+
                 break
     
     @staticmethod
@@ -1132,98 +1137,104 @@ class AGR_OT_SimpleBake(Operator):
                 # Connect emit to roughness
                 for from_node, from_socket in emit_links:
                     material.node_tree.links.new(from_socket, node.inputs['Roughness'])
-                
+
                 if not emit_links:
                     node.inputs['Roughness'].default_value = emit_value
-                
+
                 node.inputs['Emission Strength'].default_value = 0.0
-                
-                # Bake
-                baking.bake_texture(
-                    context, bake_plane, [], emit_img,
-                    'ROUGHNESS', 0
-                )
-                
-                # Restore
-                node.inputs['Emission Strength'].default_value = emit_value
-                node.inputs['Roughness'].default_value = roughness_value
-                
-                for link in list(material.node_tree.links):
-                    if link.to_socket == node.inputs['Roughness']:
-                        material.node_tree.links.remove(link)
-                
-                for from_node, from_socket in roughness_links:
-                    material.node_tree.links.new(from_socket, node.inputs['Roughness'])
-                
+
+                # Bake — wrapped in try/finally so node state is always restored
+                try:
+                    baking.bake_texture(
+                        context, bake_plane, [], emit_img,
+                        'ROUGHNESS', 0
+                    )
+                finally:
+                    # Restore
+                    node.inputs['Emission Strength'].default_value = emit_value
+                    node.inputs['Roughness'].default_value = roughness_value
+
+                    for link in list(material.node_tree.links):
+                        if link.to_socket == node.inputs['Roughness']:
+                            material.node_tree.links.remove(link)
+
+                    for from_node, from_socket in roughness_links:
+                        material.node_tree.links.new(from_socket, node.inputs['Roughness'])
+
                 break
     
     @staticmethod
     def extract_opacity_from_saved_file(diffuse_opacity_path, opacity_img):
         """Extract opacity from alpha channel of saved DiffuseOpacity file"""
+        diffuse_opacity_file = None
         try:
             diffuse_opacity_file = bpy.data.images.load(diffuse_opacity_path)
             diffuse_opacity_file.colorspace_settings.name = 'sRGB'
-            
+
             width, height = diffuse_opacity_file.size
             pixels = np.array(diffuse_opacity_file.pixels[:]).reshape(height, width, 4)
-            
+
             alpha = pixels[:, :, 3]
-            
+
             opacity_array = np.zeros((height, width, 4), dtype=np.float32)
             opacity_array[:, :, 0] = alpha
             opacity_array[:, :, 1] = alpha
             opacity_array[:, :, 2] = alpha
             opacity_array[:, :, 3] = 1.0
-            
+
             opacity_img.pixels = opacity_array.flatten().tolist()
             opacity_img.update()
-            
-            bpy.data.images.remove(diffuse_opacity_file)
-            
+
             print(f"  ✅ Extracted opacity from saved DiffuseOpacity file")
-        
+
         except Exception as e:
             print(f"  ❌ Opacity extraction error: {e}")
+
+        finally:
+            if diffuse_opacity_file is not None:
+                bpy.data.images.remove(diffuse_opacity_file)
     
     @staticmethod
     def create_erm_from_files(set_folder, material_name, erm_img):
         """Create ERM texture from saved E, R, M files"""
+        emit_file = roughness_file = metallic_file = None
         try:
             emit_path = os.path.join(set_folder, f"T_{material_name}_Emit.png")
             roughness_path = os.path.join(set_folder, f"T_{material_name}_Roughness.png")
             metallic_path = os.path.join(set_folder, f"T_{material_name}_Metallic.png")
-            
+
             emit_file = bpy.data.images.load(emit_path)
             roughness_file = bpy.data.images.load(roughness_path)
             metallic_file = bpy.data.images.load(metallic_path)
-            
+
             emit_file.colorspace_settings.name = 'Non-Color'
             roughness_file.colorspace_settings.name = 'Non-Color'
             metallic_file.colorspace_settings.name = 'Non-Color'
-            
+
             width, height = emit_file.size
-            
+
             emit_array = np.array(emit_file.pixels[:]).reshape(height, width, 4)
             roughness_array = np.array(roughness_file.pixels[:]).reshape(height, width, 4)
             metallic_array = np.array(metallic_file.pixels[:]).reshape(height, width, 4)
-            
+
             erm_array = np.zeros((height, width, 4), dtype=np.float32)
             erm_array[:, :, 0] = emit_array[:, :, 0]
             erm_array[:, :, 1] = roughness_array[:, :, 0]
             erm_array[:, :, 2] = metallic_array[:, :, 0]
             erm_array[:, :, 3] = 1.0
-            
+
             erm_img.pixels = erm_array.flatten().tolist()
             erm_img.update()
-            
-            bpy.data.images.remove(emit_file)
-            bpy.data.images.remove(roughness_file)
-            bpy.data.images.remove(metallic_file)
-            
+
             print(f"  ✅ Created ERM texture from saved files")
-        
+
         except Exception as e:
             print(f"  ❌ ERM creation error: {e}")
+
+        finally:
+            for img in (emit_file, roughness_file, metallic_file):
+                if img is not None:
+                    bpy.data.images.remove(img)
 
 
 class AGR_OT_SimpleBakeAll(Operator):
