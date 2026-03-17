@@ -779,7 +779,78 @@ class AGR_OT_rename_textures(Operator):
         return None
     
     def update_material_paths(self, obj, old_folder, new_folder):
-        pass
+        """Update material texture paths after folder rename"""
+        new_textures = {}
+        try:
+            for filename in os.listdir(new_folder):
+                if filename.endswith('.1001.png'):
+                    if 'Diffuse' in filename:
+                        new_textures['Diffuse'] = filename
+                    elif 'Normal' in filename:
+                        new_textures['Normal'] = filename
+                    elif 'ERM' in filename or 'ORM' in filename:
+                        new_textures['ERM'] = filename
+        except OSError:
+            return
+
+        if not hasattr(obj.data, 'materials'):
+            return
+
+        for mat_slot in obj.data.materials:
+            if not mat_slot or not mat_slot.use_nodes:
+                continue
+            tree = mat_slot.node_tree
+            if not tree:
+                continue
+            nodes = tree.nodes
+
+            bsdf = None
+            for node in nodes:
+                if node.type == 'BSDF_PRINCIPLED':
+                    bsdf = node
+                    break
+            if not bsdf:
+                continue
+
+            # Update Diffuse texture
+            if bsdf.inputs['Base Color'].is_linked and 'Diffuse' in new_textures:
+                diffuse_link = bsdf.inputs['Base Color'].links[0]
+                diffuse_node = diffuse_link.from_node
+                if diffuse_node.type == 'TEX_IMAGE':
+                    self.load_udim_texture(new_folder, new_textures['Diffuse'], diffuse_node, 'sRGB')
+
+            # Update ERM texture
+            for node in nodes:
+                if node.type in ['SEPRGB', 'SEPARATE_COLOR']:
+                    is_connected = any(link.to_node == bsdf for output in node.outputs for link in output.links)
+                    if is_connected and node.inputs[0].is_linked and 'ERM' in new_textures:
+                        erm_node = node.inputs[0].links[0].from_node
+                        if erm_node.type == 'TEX_IMAGE':
+                            self.load_udim_texture(new_folder, new_textures['ERM'], erm_node, 'Non-Color')
+                        break
+
+            # Update Normal texture
+            for node in nodes:
+                if node.type == 'NORMAL_MAP':
+                    if node.outputs['Normal'].is_linked and node.inputs['Color'].is_linked and 'Normal' in new_textures:
+                        if any(link.to_node == bsdf for link in node.outputs['Normal'].links):
+                            normal_node = node.inputs['Color'].links[0].from_node
+                            if normal_node.type == 'TEX_IMAGE':
+                                self.load_udim_texture(new_folder, new_textures['Normal'], normal_node, 'Non-Color')
+                            break
+
+    def load_udim_texture(self, folder, filename, node, color_space='sRGB'):
+        """Load new UDIM texture into node"""
+        try:
+            base_name = filename.replace('.1001.png', '')
+            udim_path = os.path.join(folder, f"{base_name}.<UDIM>.png")
+            abs_path = os.path.abspath(udim_path)
+            new_image = bpy.data.images.load(abs_path, check_existing=True)
+            new_image.source = 'TILED'
+            new_image.colorspace_settings.name = color_space
+            node.image = new_image
+        except Exception as e:
+            print(f"  ⚠️ Error loading UDIM texture {filename}: {e}")
     
     def process_textures_batch(self, obj, textures, target_folder, address, number, obj_type):
         renamed_count = 0
@@ -852,21 +923,22 @@ class AGR_OT_rename_textures(Operator):
     
     def reconnect_textures(self, obj, new_texture_paths):
         loaded_images = []
-        
+
         for mat_slot in obj.data.materials:
             if not mat_slot or not mat_slot.use_nodes:
                 continue
-            
+
             nodes = mat_slot.node_tree.nodes
             bsdf = None
             for node in nodes:
                 if node.type == 'BSDF_PRINCIPLED':
                     bsdf = node
                     break
-            
+
             if not bsdf:
                 continue
-            
+
+            # Diffuse
             if 'd' in new_texture_paths and bsdf.inputs['Base Color'].is_linked:
                 diffuse_link = bsdf.inputs['Base Color'].links[0]
                 diffuse_node = diffuse_link.from_node
@@ -875,7 +947,8 @@ class AGR_OT_rename_textures(Operator):
                     if new_img:
                         diffuse_node.image = new_img
                         loaded_images.append(new_img)
-            
+
+            # Normal
             if 'n' in new_texture_paths:
                 for node in nodes:
                     if node.type == 'NORMAL_MAP':
@@ -888,7 +961,61 @@ class AGR_OT_rename_textures(Operator):
                                         normal_node.image = new_img
                                         loaded_images.append(new_img)
                                 break
-        
+
+            # ERM (through Separate Color / Separate RGB node)
+            if 'erm' in new_texture_paths:
+                for node in nodes:
+                    if node.type in ['SEPRGB', 'SEPARATE_COLOR']:
+                        is_connected = any(link.to_node == bsdf for output in node.outputs for link in output.links)
+                        if is_connected and node.inputs[0].is_linked:
+                            erm_node = node.inputs[0].links[0].from_node
+                            if erm_node.type == 'TEX_IMAGE':
+                                new_img = self.load_texture(new_texture_paths['erm'], 'Non-Color')
+                                if new_img:
+                                    erm_node.image = new_img
+                                    loaded_images.append(new_img)
+                            break
+
+            # Roughness (direct connection to BSDF)
+            if 'r' in new_texture_paths and bsdf.inputs['Roughness'].is_linked:
+                roughness_link = bsdf.inputs['Roughness'].links[0]
+                roughness_node = roughness_link.from_node
+                if roughness_node.type == 'TEX_IMAGE':
+                    new_img = self.load_texture(new_texture_paths['r'], 'Non-Color')
+                    if new_img:
+                        roughness_node.image = new_img
+                        loaded_images.append(new_img)
+
+            # Metallic (direct connection to BSDF)
+            if 'm' in new_texture_paths and bsdf.inputs['Metallic'].is_linked:
+                metallic_link = bsdf.inputs['Metallic'].links[0]
+                metallic_node = metallic_link.from_node
+                if metallic_node.type == 'TEX_IMAGE':
+                    new_img = self.load_texture(new_texture_paths['m'], 'Non-Color')
+                    if new_img:
+                        metallic_node.image = new_img
+                        loaded_images.append(new_img)
+
+            # Emit
+            if 'e' in new_texture_paths and bsdf.inputs['Emission Color'].is_linked:
+                emit_link = bsdf.inputs['Emission Color'].links[0]
+                emit_node = emit_link.from_node
+                if emit_node.type == 'TEX_IMAGE':
+                    new_img = self.load_texture(new_texture_paths['e'], 'sRGB')
+                    if new_img:
+                        emit_node.image = new_img
+                        loaded_images.append(new_img)
+
+            # Opacity (Alpha on BSDF)
+            if 'o' in new_texture_paths and bsdf.inputs['Alpha'].is_linked:
+                alpha_link = bsdf.inputs['Alpha'].links[0]
+                alpha_node = alpha_link.from_node
+                if alpha_node.type == 'TEX_IMAGE':
+                    new_img = self.load_texture(new_texture_paths['o'], 'Non-Color')
+                    if new_img:
+                        alpha_node.image = new_img
+                        loaded_images.append(new_img)
+
         return loaded_images
     
     def load_texture(self, filepath, color_space='sRGB'):

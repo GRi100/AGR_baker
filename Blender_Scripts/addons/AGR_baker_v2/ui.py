@@ -3,6 +3,7 @@ UI panels for AGR Baker v2
 """
 
 import bpy
+import re
 from bpy.types import Panel, UIList
 
 
@@ -287,7 +288,7 @@ class AGR_PT_TextureSetsPanel(Panel):
                             from .operators_atlas import process_object_name
                             address, obj_type = process_object_name(context.active_object.name)
                             atlas_box.label(text=f"Active: {obj_type} ({address})", icon='OBJECT_DATA')
-                        except:
+                        except Exception:
                             atlas_box.label(text=f"Active: {context.active_object.name}", icon='OBJECT_DATA')
                 else:
                     atlas_box.label(text="Select texture sets to create atlas", icon='INFO')
@@ -412,7 +413,6 @@ class AGR_PT_RenamePanel(Panel):
         row = col.row()
         row.scale_y = 1.4
         if active_obj and active_obj.type == 'MESH':
-            import re
             obj_name = re.sub(r'\.\d{3}$', '', active_obj.name)
             if re.match(r'^SM_.+?(_\d{3})?_(Main|MainGlass|Ground|GroundGlass|GroundEl|GroundElGlass|Flora)', obj_name):
                 row.operator("agr.rename_materials", text="Переименовать материалы объекта", icon='MATERIAL')
@@ -427,7 +427,6 @@ class AGR_PT_RenamePanel(Panel):
         row = col.row()
         row.scale_y = 1.4
         if active_obj and active_obj.type == 'MESH' and scene.agr_rename_address:
-            import re
             obj_name = re.sub(r'\.\d{3}$', '', active_obj.name)
             if re.match(r'^SM_.+?(_\d{3})?_(MainGlass|GroundGlass|GroundElGlass)', obj_name):
                 row.operator("agr.rename_glass_materials", text="Переименовать материалы стекла", icon='MATERIAL')
@@ -459,7 +458,6 @@ class AGR_PT_RenamePanel(Panel):
         row = col.row()
         row.scale_y = 1.4
         if active_obj and active_obj.type == 'MESH' and scene.agr_rename_address:
-            import re
             obj_name = re.sub(r'\.\d{3}$', '', active_obj.name)
             if re.match(r'^SM_.+?(_\d{3})?_(Main|Ground|GroundEl|GroundElGlass|Flora)', obj_name):
                 row.operator("agr.rename_textures", text="Переименовать текстуры", icon='TEXTURE')
@@ -477,7 +475,6 @@ class AGR_PT_RenamePanel(Panel):
         row = col.row()
         row.scale_y = 1.4
         if active_obj and active_obj.type == 'MESH' and scene.agr_rename_address:
-            import re
             obj_name = re.sub(r'\.\d{3}$', '', active_obj.name)
             if re.match(r'^SM_.+?(_\d{3})?_(Main|Ground)', obj_name):
                 row.operator("agr.rename_geojson", text="Переименовать GEOJSON", icon='FILE_TEXT')

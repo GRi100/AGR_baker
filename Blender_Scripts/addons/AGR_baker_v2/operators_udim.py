@@ -7,6 +7,7 @@ from bpy.types import Operator
 from bpy.props import StringProperty
 import os
 import json
+import math
 import re
 import shutil
 from pathlib import Path
@@ -60,6 +61,14 @@ def get_udim_material_name(address, obj_type):
         return f"M_{address}"
     else:  # Ground
         return f"M_{address}_Ground"
+
+
+def _get_output_folder():
+    """Get output folder name from settings, default AGR_BAKE"""
+    try:
+        return bpy.context.scene.agr_baker_settings.output_folder
+    except Exception:
+        return "AGR_BAKE"
 
 
 def setup_udim_material_nodes(material):
@@ -137,14 +146,14 @@ def find_udim_directory(address, obj_type, base_dir, use_main_dir=False):
             return udim_dir_root
         
         # Fallback to AGR_BAKE
-        agr_bake_dir = base_dir / "AGR_BAKE"
+        agr_bake_dir = base_dir / _get_output_folder()
         udim_dir_agr = agr_bake_dir / udim_dir_name
         if udim_dir_agr.exists():
             print(f"✅ Found UDIM directory in AGR_BAKE: {udim_dir_agr}")
             return udim_dir_agr
     else:
         # Prioritize AGR_BAKE (default)
-        agr_bake_dir = base_dir / "AGR_BAKE"
+        agr_bake_dir = base_dir / _get_output_folder()
         udim_dir_agr = agr_bake_dir / udim_dir_name
         if udim_dir_agr.exists():
             print(f"✅ Found UDIM directory in AGR_BAKE: {udim_dir_agr}")
@@ -172,7 +181,7 @@ def scan_texture_sets_for_udim(context, obj):
     
     from pathlib import Path
     base_dir = Path(blend_path).parent
-    agr_bake_dir = base_dir / "AGR_BAKE"
+    agr_bake_dir = base_dir / _get_output_folder()
     
     if not agr_bake_dir.exists():
         print(f"⚠️ AGR_BAKE folder not found: {agr_bake_dir}")
@@ -357,7 +366,7 @@ class AGR_OT_CreateUDIM(Operator):
             print(f"📁 Creating UDIM folder in root directory")
         else:
             # Create in AGR_BAKE (default)
-            agr_bake_dir = base_dir / "AGR_BAKE"
+            agr_bake_dir = base_dir / _get_output_folder()
             if not agr_bake_dir.exists():
                 agr_bake_dir.mkdir(parents=True)
             udim_dir = agr_bake_dir / udim_dir_name
@@ -690,7 +699,7 @@ class AGR_OT_AddToUDIM(Operator):
     def prepare_texture_sets(self, selected_sets, base_dir):
         """Convert selected texture sets to format needed for UDIM creation"""
         texture_sets = []
-        agr_bake_dir = base_dir / "AGR_BAKE"
+        agr_bake_dir = base_dir / _get_output_folder()
         
         if not agr_bake_dir.exists():
             print(f"⚠️ AGR_BAKE folder not found: {agr_bake_dir}")
@@ -1085,7 +1094,7 @@ class AGR_OT_RevertUDIM(Operator):
             # Load textures from set folder - always in AGR_BAKE
             blend_path = bpy.data.filepath
             base_dir = Path(blend_path).parent
-            agr_bake_dir = base_dir / "AGR_BAKE"
+            agr_bake_dir = base_dir / _get_output_folder()
             set_folder = agr_bake_dir / set_name
             
             if set_folder.exists():
@@ -1226,7 +1235,7 @@ class AGR_OT_RevertUDIM(Operator):
             # Load textures from set folder - always in AGR_BAKE
             blend_path = bpy.data.filepath
             base_dir = Path(blend_path).parent
-            agr_bake_dir = base_dir / "AGR_BAKE"
+            agr_bake_dir = base_dir / _get_output_folder()
             set_folder = agr_bake_dir / set_name
             
             if set_folder.exists():
@@ -1399,8 +1408,8 @@ class AGR_OT_RevertUDIM(Operator):
             
             for loop in face.loops:
                 uv = loop[uv_layer].uv
-                tile_u = int(uv.x)
-                tile_v = int(uv.y)
+                tile_u = math.floor(uv.x)
+                tile_v = math.floor(uv.y)
                 udim_number = 1001 + tile_u + tile_v * 10
                 tile_votes[udim_number] = tile_votes.get(udim_number, 0) + 1
             
@@ -1469,18 +1478,26 @@ class AGR_OT_RevertUDIM(Operator):
                     if node.image.source == 'TILED':
                         udim_images.append(node.image)
         
-        # Remove the material
-        try:
-            bpy.data.materials.remove(udim_material)
-            print(f"  ✅ Removed material: {udim_material.name}")
-        except Exception as e:
-            print(f"  ⚠️ Error removing material: {e}")
-        
-        # Remove UDIM images
+        # Remove the material only if no other users remain
+        mat_name = udim_material.name
+        if udim_material.users > 0:
+            print(f"  ⏭️ Skipping material removal: still used by {udim_material.users} other(s): {mat_name}")
+        else:
+            try:
+                bpy.data.materials.remove(udim_material)
+                print(f"  ✅ Removed material: {mat_name}")
+            except Exception as e:
+                print(f"  ⚠️ Error removing material: {e}")
+
+        # Remove UDIM images only if no other users remain
         for img in udim_images:
+            img_name = img.name
+            if img.users > 0:
+                print(f"  ⏭️ Skipping image removal: still used by {img.users} other(s): {img_name}")
+                continue
             try:
                 bpy.data.images.remove(img)
-                print(f"  ✅ Removed UDIM image: {img.name}")
+                print(f"  ✅ Removed UDIM image: {img_name}")
             except Exception as e:
                 print(f"  ⚠️ Error removing image: {e}")
         

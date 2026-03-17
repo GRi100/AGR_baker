@@ -90,20 +90,21 @@ class AGR_OT_ResizeTextureSet(Operator):
                 
                 try:
                     # Load image
-                    img = Image.open(filepath)
-                    original_size = img.size
-                    
-                    # Skip if already at target resolution
-                    if img.width == target_res and img.height == target_res:
-                        print(f"  ⏭️ {filename}: already {target_res}px")
-                        continue
-                    
-                    # Resize using LANCZOS
-                    img_resized = img.resize((target_res, target_res), Image.LANCZOS)
-                    
+                    with Image.open(filepath) as img:
+                        original_size = img.size
+
+                        # Skip if already at target resolution
+                        if img.width == target_res and img.height == target_res:
+                            print(f"  ⏭️ {filename}: already {target_res}px")
+                            continue
+
+                        # Resize using LANCZOS
+                        img_resized = img.resize((target_res, target_res), Image.LANCZOS)
+
                     # Save back to same file
                     img_resized.save(filepath, 'PNG')
-                    
+                    img_resized.close()
+
                     print(f"  ✅ {filename}: {original_size[0]}px → {target_res}px")
                     resized_count += 1
                     
@@ -837,13 +838,13 @@ class AGR_OT_GaussianBlurSet(Operator):
                     if os.path.exists(tex_path):
                         try:
                             # Load texture
-                            img = Image.open(tex_path)
-                            
-                            # Apply Gaussian blur
-                            img_blurred = img.filter(ImageFilter.GaussianBlur(radius=self.blur_radius))
-                            
+                            with Image.open(tex_path) as img:
+                                # Apply Gaussian blur
+                                img_blurred = img.filter(ImageFilter.GaussianBlur(radius=self.blur_radius))
+
                             # Save blurred texture
                             img_blurred.save(tex_path, 'PNG')
+                            img_blurred.close()
                             print(f"  🌀 Blurred {tex_type}")
                             blurred_count += 1
                             

@@ -84,7 +84,7 @@ def connect_texture_set_to_material(material, texture_set_path, material_name):
     roughness_path = os.path.join(texture_set_path, f"T_{material_name}_Roughness.png")
     metallic_path = os.path.join(texture_set_path, f"T_{material_name}_Metallic.png")
     opacity_path = os.path.join(texture_set_path, f"T_{material_name}_Opacity.png")
-    
+
     has_erm = os.path.exists(erm_path)
     has_diffuse_opacity = os.path.exists(diffuse_opacity_path)
     
@@ -140,6 +140,7 @@ def connect_texture_set_to_material(material, texture_set_path, material_name):
             )
             if tex_diffuse:
                 links.new(tex_diffuse.outputs['Color'], bsdf.inputs['Base Color'])
+                links.new(tex_diffuse.outputs['Color'], bsdf.inputs['Emission Color'])
         
         # Metallic
         if os.path.exists(metallic_path):
@@ -176,11 +177,11 @@ def connect_texture_set_to_material(material, texture_set_path, material_name):
             tex_normal = load_texture_from_disk(
                 nodes, normal_path,
                 f"T_{material_name}_Normal",
-                "Normal", (-700, -400), 'Non-Color'
+                "Normal", (-700, -600), 'Non-Color'
             )
             if tex_normal:
-                connect_normal_map(nodes, links, tex_normal, bsdf, (-400, -400))
-    
+                connect_normal_map(nodes, links, tex_normal, bsdf, (-400, -600))
+
     # Configure material settings
     material.blend_method = 'HASHED'
     material.use_backface_culling = False
@@ -191,8 +192,8 @@ def connect_texture_set_to_material(material, texture_set_path, material_name):
     bsdf.inputs['Roughness'].default_value = 0.8
     bsdf.inputs['IOR'].default_value = 1.5
     bsdf.inputs['Alpha'].default_value = 1.0
-    bsdf.inputs['Emission Color'].default_value = (0.0, 0.0, 0.0, 1.0)
-    bsdf.inputs['Emission Strength'].default_value = 0.0
+    bsdf.inputs['Emission Color'].default_value = (1.0, 1.0, 1.0, 1.0)
+    bsdf.inputs['Emission Strength'].default_value = 0.0  # Emit texture drives strength; 0 = no emission by default
     
     # Update viewport
     bpy.context.view_layer.update()

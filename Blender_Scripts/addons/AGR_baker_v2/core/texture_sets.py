@@ -4,6 +4,7 @@ Texture set management for AGR Baker v2
 
 import bpy
 import os
+import struct
 from pathlib import Path
 
 
@@ -128,14 +129,21 @@ def scan_texture_set_folder(folder_path, material_name):
             texture_info[key] = True
             texture_info['has_any'] = True
             
-            # Get resolution from each texture and find maximum
+            # Get resolution from PNG IHDR chunk (first 33 bytes) without loading full image
             try:
-                img = bpy.data.images.load(filepath)
-                current_resolution = max(img.size[0], img.size[1])  # Use max of width/height
-                if current_resolution > max_resolution:
-                    max_resolution = current_resolution
-                    print(f"  📏 {filename}: {current_resolution}px (new max)")
-                bpy.data.images.remove(img)
+                with open(filepath, 'rb') as f:
+                    signature = f.read(8)
+                    if signature == b'\x89PNG\r\n\x1a\n':
+                        chunk_length_bytes = f.read(4)
+                        chunk_type = f.read(4)
+                        if chunk_type == b'IHDR' and len(chunk_length_bytes) == 4:
+                            ihdr_data = f.read(8)  # width(4) + height(4)
+                            if len(ihdr_data) == 8:
+                                width, height = struct.unpack('>II', ihdr_data)
+                                current_resolution = max(width, height)
+                                if current_resolution > max_resolution:
+                                    max_resolution = current_resolution
+                                    print(f"  📏 {filename}: {current_resolution}px (new max)")
             except Exception as e:
                 print(f"  ⚠️ Could not read resolution from {filename}: {e}")
     

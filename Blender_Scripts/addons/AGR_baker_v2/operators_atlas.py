@@ -62,7 +62,7 @@ def get_atlas_naming(context, atlas_type, atlas_size, texture_sets_count):
             atlas_name = f"A_{address}_{obj_type}"
             material_name = f"M_{address}_{obj_type}_1"
             return atlas_name, material_name, True
-        except:
+        except Exception:
             pass
     
     # HIGH атлас или объект не подходит под LOW схему
@@ -122,22 +122,22 @@ def check_sets_have_alpha(texture_sets):
             do_path = os.path.join(tex_set.folder_path, f"T_{tex_set.material_name}_DiffuseOpacity.png")
             if os.path.exists(do_path):
                 try:
-                    img = Image.open(do_path)
-                    if img.mode in ('RGBA', 'LA'):
-                        print(f"  ✓ Найден альфа-канал в {tex_set.name}")
-                        return True
-                except:
+                    with Image.open(do_path) as img:
+                        if img.mode in ('RGBA', 'LA'):
+                            print(f"  ✓ Найден альфа-канал в {tex_set.name}")
+                            return True
+                except Exception:
                     pass
-            
+
             # Проверяем Diffuse файл
             d_path = os.path.join(tex_set.folder_path, f"T_{tex_set.material_name}_Diffuse.png")
             if os.path.exists(d_path):
                 try:
-                    img = Image.open(d_path)
-                    if img.mode in ('RGBA', 'LA'):
-                        print(f"  ✓ Найден альфа-канал в {tex_set.name}")
-                        return True
-                except:
+                    with Image.open(d_path) as img:
+                        if img.mode in ('RGBA', 'LA'):
+                            print(f"  ✓ Найден альфа-канал в {tex_set.name}")
+                            return True
+                except Exception:
                     pass
         
         print(f"  ℹ️ Альфа-канал не найден ни в одном сете")
@@ -248,97 +248,6 @@ def calculate_atlas_packing_layout(texture_sets, atlas_size):
     return layout
 
 
-def create_erm_atlas_combined(texture_sets, atlas_size, layout):
-    """Создает ERM атлас (объединяет E, R, M в RGB каналы) - общая функция"""
-    from PIL import Image
-    
-    atlas_name = f"Atlas_ERM_{atlas_size}"
-    
-    # Удаляем старое изображение если есть
-    if atlas_name in bpy.data.images:
-        bpy.data.images.remove(bpy.data.images[atlas_name])
-    
-    # Создаем новое изображение
-    atlas_image = bpy.data.images.new(
-        atlas_name,
-        width=atlas_size,
-        height=atlas_size,
-        alpha=False,
-        float_buffer=False
-    )
-    
-    atlas_image.colorspace_settings.name = 'Non-Color'
-    
-    # Заполняем черным цветом
-    fill = [0.0, 0.0, 0.0, 1.0]
-    total_px = atlas_size * atlas_size * 4
-    buf = fill * (total_px // 4)
-    atlas_image.pixels = buf
-    
-    # Создаем numpy массив для работы
-    atlas_array = np.array(atlas_image.pixels[:]).reshape(atlas_size, atlas_size, 4)
-    
-    # Размещаем текстуры в атласе
-    for item in layout:
-        # Получаем пути к E, R, M текстурам
-        material_name = item['texture_set'].material_name
-        folder_path = item['texture_set'].folder_path
-        
-        emit_path = os.path.join(folder_path, f"T_{material_name}_Emit.png")
-        roughness_path = os.path.join(folder_path, f"T_{material_name}_Roughness.png")
-        metallic_path = os.path.join(folder_path, f"T_{material_name}_Metallic.png")
-        
-        cell_width = item['width']
-        cell_height = item['height']
-        x = item['x']
-        y = item['y']
-        
-        # Загружаем каналы через PIL
-        e_channel = None
-        r_channel = None
-        m_channel = None
-        
-        if os.path.exists(emit_path):
-            e_img = Image.open(emit_path).convert('L')
-            if e_img.size != (cell_width, cell_height):
-                e_img = e_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-            e_channel = np.array(e_img, dtype=np.float32) / 255.0
-        
-        if os.path.exists(roughness_path):
-            r_img = Image.open(roughness_path).convert('L')
-            if r_img.size != (cell_width, cell_height):
-                r_img = r_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-            r_channel = np.array(r_img, dtype=np.float32) / 255.0
-        
-        if os.path.exists(metallic_path):
-            m_img = Image.open(metallic_path).convert('L')
-            if m_img.size != (cell_width, cell_height):
-                m_img = m_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-            m_channel = np.array(m_img, dtype=np.float32) / 255.0
-        
-        # Создаем ERM текстуру
-        if e_channel is None:
-            e_channel = np.zeros((cell_height, cell_width), dtype=np.float32)
-        if r_channel is None:
-            r_channel = np.ones((cell_height, cell_width), dtype=np.float32) * 0.5
-        if m_channel is None:
-            m_channel = np.zeros((cell_height, cell_width), dtype=np.float32)
-        
-        # Размещаем в атласе
-        atlas_array[y:y+cell_height, x:x+cell_width, 0] = e_channel
-        atlas_array[y:y+cell_height, x:x+cell_width, 1] = r_channel
-        atlas_array[y:y+cell_height, x:x+cell_width, 2] = m_channel
-        atlas_array[y:y+cell_height, x:x+cell_width, 3] = 1.0
-        
-        print(f"  📍 Размещена ERM: {item['texture_set'].name} в ({x}, {y})")
-    
-    # Записываем массив обратно в изображение
-    flat = atlas_array.flatten().tolist()
-    atlas_image.pixels = flat
-    atlas_image.update()
-    
-    return atlas_image
-
 
 # ===== PREVIEW ATLAS LAYOUT OPERATOR =====
 
@@ -413,38 +322,34 @@ class AGR_OT_PreviewAtlasLayout(Operator):
             float_buffer=False
         )
         
-        # Заполняем черным цветом
-        pixels = [0.0, 0.0, 0.0, 1.0] * (atlas_size * atlas_size)
-        preview_image.pixels = pixels
-        
-        # Создаем numpy массив для работы
-        preview_array = np.array(preview_image.pixels[:]).reshape(atlas_size, atlas_size, 4)
-        
+        # Создаем numpy массив напрямую (без GPU roundtrip)
+        preview_array = np.zeros((atlas_size, atlas_size, 4), dtype=np.float32)
+        preview_array[:, :, 3] = 1.0  # alpha = 1.0
+
         # Рисуем прямоугольники для каждой текстуры
         for item in layout:
             x = item['x']
             y = item['y']
             w = item['width']
             h = item['height']
-            
+
             # Генерируем случайный цвет для каждой текстуры
             color = [random.random(), random.random(), random.random(), 1.0]
-            
+
             # Заполняем область
             preview_array[y:y+h, x:x+w, :] = color
-            
+
             # Рисуем границу (белая рамка 2px)
             border_width = max(2, atlas_size // 512)
             preview_array[y:y+border_width, x:x+w, :] = [1.0, 1.0, 1.0, 1.0]  # Верх
             preview_array[y+h-border_width:y+h, x:x+w, :] = [1.0, 1.0, 1.0, 1.0]  # Низ
             preview_array[y:y+h, x:x+border_width, :] = [1.0, 1.0, 1.0, 1.0]  # Лево
             preview_array[y:y+h, x+w-border_width:x+w, :] = [1.0, 1.0, 1.0, 1.0]  # Право
-        
-        # Записываем массив обратно в изображение
-        flat = preview_array.flatten().tolist()
-        preview_image.pixels = flat
+
+        # Записываем массив в изображение
+        preview_image.pixels.foreach_set(preview_array.ravel())
         preview_image.update()
-        
+
         print(f"✅ Создано превью: {len(layout)} текстур")
         
         return preview_image
@@ -569,38 +474,34 @@ class AGR_OT_PreviewAtlasLayoutFromObject(Operator):
             float_buffer=False
         )
         
-        # Заполняем черным цветом
-        pixels = [0.0, 0.0, 0.0, 1.0] * (atlas_size * atlas_size)
-        preview_image.pixels = pixels
-        
-        # Создаем numpy массив для работы
-        preview_array = np.array(preview_image.pixels[:]).reshape(atlas_size, atlas_size, 4)
-        
+        # Создаем numpy массив напрямую (без GPU roundtrip)
+        preview_array = np.zeros((atlas_size, atlas_size, 4), dtype=np.float32)
+        preview_array[:, :, 3] = 1.0  # alpha = 1.0
+
         # Рисуем прямоугольники для каждой текстуры
         for item in layout:
             x = item['x']
             y = item['y']
             w = item['width']
             h = item['height']
-            
+
             # Генерируем случайный цвет для каждой текстуры
             color = [random.random(), random.random(), random.random(), 1.0]
-            
+
             # Заполняем область
             preview_array[y:y+h, x:x+w, :] = color
-            
+
             # Рисуем границу (белая рамка 2px)
             border_width = max(2, atlas_size // 512)
             preview_array[y:y+border_width, x:x+w, :] = [1.0, 1.0, 1.0, 1.0]  # Верх
             preview_array[y+h-border_width:y+h, x:x+w, :] = [1.0, 1.0, 1.0, 1.0]  # Низ
             preview_array[y:y+h, x:x+border_width, :] = [1.0, 1.0, 1.0, 1.0]  # Лево
             preview_array[y:y+h, x+w-border_width:x+w, :] = [1.0, 1.0, 1.0, 1.0]  # Право
-        
-        # Записываем массив обратно в изображение
-        flat = preview_array.flatten().tolist()
-        preview_image.pixels = flat
+
+        # Записываем массив в изображение
+        preview_image.pixels.foreach_set(preview_array.ravel())
         preview_image.update()
-        
+
         print(f"✅ Создано превью для {obj_name}: {len(layout)} текстур")
         
         return preview_image
@@ -817,42 +718,48 @@ class AGR_OT_CreateAtlasOnly(Operator):
                 # С альфа-каналом из Opacity
                 print(f"  🔧 Создание DiffuseOpacity с альфа-каналом")
                 opacity_atlas = self.create_atlas_for_type(texture_sets, 'OPACITY', atlas_size, layout, False)
-                
+
                 # Объединяем D + O в DO через PIL
-                d_img = Image.open(filepath).convert('RGB')
+                with Image.open(filepath) as raw_d:
+                    d_img = raw_d.convert('RGB')
                 o_array = np.array(opacity_atlas.pixels[:]).reshape(atlas_size, atlas_size, 4)
                 o_channel = (o_array[:, :, 0] * 255).astype(np.uint8)
                 o_pil = Image.fromarray(o_channel, mode='L')
-                
+
                 # Создаем RGBA
                 do_img = Image.new('RGBA', (atlas_size, atlas_size))
                 do_img.paste(d_img, (0, 0))
                 do_img.putalpha(o_pil)
-                
+
                 do_filename = f"T_{atlas_name}_DiffuseOpacity.png"
                 do_filepath = os.path.join(output_path, do_filename)
                 do_img.save(do_filepath)
+                d_img.close()
+                o_pil.close()
+                do_img.close()
                 created_atlases['DIFFUSE_OPACITY'] = do_filepath
                 print(f"  ✅ Создан DiffuseOpacity с альфа: {do_filename}")
-                
+
                 # Сохраняем Opacity отдельно
                 opacity_filename = f"T_{atlas_name}_Opacity.png"
                 opacity_filepath = os.path.join(output_path, opacity_filename)
                 self.save_atlas_image(opacity_atlas, opacity_filepath, 'OPACITY')
                 created_atlases['OPACITY'] = opacity_filepath
                 print(f"  ✅ Создан Opacity: {opacity_filename}")
-                
+
                 bpy.data.images.remove(opacity_atlas)
             else:
                 # Без альфа - просто копируем Diffuse как DiffuseOpacity (RGB)
                 print(f"  🔧 Дублирование Diffuse как DiffuseOpacity (без альфа)")
                 do_filename = f"T_{atlas_name}_DiffuseOpacity.png"
                 do_filepath = os.path.join(output_path, do_filename)
-                d_img = Image.open(filepath).convert('RGB')
+                with Image.open(filepath) as raw_d:
+                    d_img = raw_d.convert('RGB')
                 d_img.save(do_filepath)
+                d_img.close()
                 created_atlases['DIFFUSE_OPACITY'] = do_filepath
                 print(f"  ✅ Создан DiffuseOpacity без альфа: {do_filename}")
-            
+
             bpy.data.images.remove(diffuse_atlas)
         
         # Emit
@@ -894,32 +801,50 @@ class AGR_OT_CreateAtlasOnly(Operator):
             print(f"  ✅ Создан: {filename}")
             bpy.data.images.remove(metallic_atlas)
         
-        # Создаем объединенную ERM текстуру из E, R, M
-        if emit_filepath and roughness_filepath and metallic_filepath:
+        # Создаем объединенную ERM текстуру из E, R, M (any channel present)
+        if emit_filepath or roughness_filepath or metallic_filepath:
             print(f"\n🖼️ Создание объединенной ERM текстуры")
-            e_img = Image.open(emit_filepath).convert('L')
-            r_img = Image.open(roughness_filepath).convert('L')
-            m_img = Image.open(metallic_filepath).convert('L')
-            
+            # Default: black for Emit/Metallic, mid-gray for Roughness
+            if emit_filepath:
+                with Image.open(emit_filepath) as raw:
+                    e_img = raw.convert('L')
+            else:
+                e_img = Image.new('L', (atlas_size, atlas_size), 0)
+            if roughness_filepath:
+                with Image.open(roughness_filepath) as raw:
+                    r_img = raw.convert('L')
+            else:
+                r_img = Image.new('L', (atlas_size, atlas_size), 128)
+            if metallic_filepath:
+                with Image.open(metallic_filepath) as raw:
+                    m_img = raw.convert('L')
+            else:
+                m_img = Image.new('L', (atlas_size, atlas_size), 0)
+
             erm_img = Image.merge('RGB', (e_img, r_img, m_img))
-            
+
             erm_filename = f"T_{atlas_name}_ERM.png"
             erm_filepath = os.path.join(output_path, erm_filename)
             erm_img.save(erm_filepath)
             created_atlases['ERM'] = erm_filepath
             print(f"  ✅ Создан ERM: {erm_filename}")
-        
-        # Opacity (всегда создаем из исходных сетов)
-        print(f"\n🖼️ Создание Opacity атласа")
-        opacity_atlas = self.create_atlas_for_type(texture_sets, 'OPACITY', atlas_size, layout, False)
-        if opacity_atlas:
-            filename = f"T_{atlas_name}_Opacity.png"
-            filepath = os.path.join(output_path, filename)
-            self.save_atlas_image(opacity_atlas, filepath, 'OPACITY')
-            created_atlases['OPACITY'] = filepath
-            print(f"  ✅ Создан: {filename}")
-            bpy.data.images.remove(opacity_atlas)
-        
+            e_img.close()
+            r_img.close()
+            m_img.close()
+            erm_img.close()
+
+        # Opacity (only if not already created in diffuse+alpha block above)
+        if 'OPACITY' not in created_atlases:
+            print(f"\n🖼️ Создание Opacity атласа")
+            opacity_atlas = self.create_atlas_for_type(texture_sets, 'OPACITY', atlas_size, layout, False)
+            if opacity_atlas:
+                filename = f"T_{atlas_name}_Opacity.png"
+                filepath = os.path.join(output_path, filename)
+                self.save_atlas_image(opacity_atlas, filepath, 'OPACITY')
+                created_atlases['OPACITY'] = filepath
+                print(f"  ✅ Создан: {filename}")
+                bpy.data.images.remove(opacity_atlas)
+
         # Normal
         print(f"\n🖼️ Создание Normal атласа")
         normal_atlas = self.create_atlas_for_type(texture_sets, 'NORMAL', atlas_size, layout, False)
@@ -955,40 +880,46 @@ class AGR_OT_CreateAtlasOnly(Operator):
             if has_alpha:
                 # Если есть альфа, создаем DO с альфа-каналом из Opacity
                 print(f"  🔧 Создание DO с альфа-каналом")
-                
+
                 # Создаем Opacity atlas
                 opacity_atlas = self.create_atlas_for_type(texture_sets, 'OPACITY', atlas_size, layout, False)
-                
+
                 # Объединяем D + O в DO через PIL
-                d_img = Image.open(filepath).convert('RGB')
-                
+                with Image.open(filepath) as raw_d:
+                    d_img = raw_d.convert('RGB')
+
                 # Конвертируем Blender image в PIL
                 o_array = np.array(opacity_atlas.pixels[:]).reshape(atlas_size, atlas_size, 4)
                 o_channel = (o_array[:, :, 0] * 255).astype(np.uint8)
                 o_pil = Image.fromarray(o_channel, mode='L')
-                
+
                 # Создаем RGBA
                 do_img = Image.new('RGBA', (atlas_size, atlas_size))
                 do_img.paste(d_img, (0, 0))
                 do_img.putalpha(o_pil)
                 do_img.save(do_filepath)
-                
+                d_img.close()
+                o_pil.close()
+                do_img.close()
+
                 created_atlases['DIFFUSE_OPACITY'] = do_filepath
                 print(f"  ✅ Создан DO с альфа: {do_filename}")
-                
+
                 # Сохраняем Opacity отдельно
                 opacity_filename = f"T_{atlas_name}_o.png"
                 opacity_filepath = os.path.join(output_path, opacity_filename)
                 self.save_atlas_image(opacity_atlas, opacity_filepath, 'OPACITY')
                 created_atlases['OPACITY'] = opacity_filepath
                 print(f"  ✅ Создан Opacity: {opacity_filename}")
-                
+
                 bpy.data.images.remove(opacity_atlas)
             else:
                 # Если нет альфа, просто копируем D как DO (RGB без альфа)
                 print(f"  🔧 Дублирование D как DO (без альфа)")
-                d_img = Image.open(filepath).convert('RGB')
+                with Image.open(filepath) as raw_d:
+                    d_img = raw_d.convert('RGB')
                 d_img.save(do_filepath)
+                d_img.close()
                 created_atlases['DIFFUSE_OPACITY'] = do_filepath
                 print(f"  ✅ Создан DO без альфа: {do_filename}")
             
@@ -1044,14 +975,12 @@ class AGR_OT_CreateAtlasOnly(Operator):
     def create_erm_atlas(self, texture_sets, atlas_size, layout):
         """Создает ERM атлас (объединяет E, R, M в RGB каналы)"""
         from PIL import Image
-        
+
         atlas_name = f"Atlas_ERM_{atlas_size}"
-        
-        # Удаляем старое изображение если есть
+
         if atlas_name in bpy.data.images:
             bpy.data.images.remove(bpy.data.images[atlas_name])
-        
-        # Создаем новое изображение
+
         atlas_image = bpy.data.images.new(
             atlas_name,
             width=atlas_size,
@@ -1059,85 +988,73 @@ class AGR_OT_CreateAtlasOnly(Operator):
             alpha=False,
             float_buffer=False
         )
-        
         atlas_image.colorspace_settings.name = 'Non-Color'
-        
-        # Заполняем черным цветом
-        fill = [0.0, 0.0, 0.0, 1.0]
-        total_px = atlas_size * atlas_size * 4
-        buf = fill * (total_px // 4)
-        atlas_image.pixels = buf
-        
-        # Создаем numpy массив для работы
-        atlas_array = np.array(atlas_image.pixels[:]).reshape(atlas_size, atlas_size, 4)
-        
-        # Размещаем текстуры в атласе
+
+        # Создаем numpy массив напрямую (без GPU roundtrip)
+        atlas_array = np.zeros((atlas_size, atlas_size, 4), dtype=np.float32)
+        atlas_array[:, :, 3] = 1.0
+
         for item in layout:
-            # Получаем пути к E, R, M текстурам
             emit_path = self.get_texture_path(item['texture_set'], 'EMIT')
             roughness_path = self.get_texture_path(item['texture_set'], 'ROUGHNESS')
             metallic_path = self.get_texture_path(item['texture_set'], 'METALLIC')
-            
+
             cell_width = item['width']
             cell_height = item['height']
             x = item['x']
             y = item['y']
-            
-            # Загружаем каналы через PIL
+
             e_channel = None
             r_channel = None
             m_channel = None
-            
+
             if emit_path and os.path.exists(emit_path):
-                e_img = Image.open(emit_path).convert('L')
-                if e_img.size != (cell_width, cell_height):
-                    e_img = e_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                e_channel = np.array(e_img, dtype=np.float32) / 255.0
-            
+                with Image.open(emit_path) as raw:
+                    e_img = raw.convert('L')
+                    if e_img.size != (cell_width, cell_height):
+                        e_img = e_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+                    e_channel = np.array(e_img, dtype=np.float32) / 255.0
+
             if roughness_path and os.path.exists(roughness_path):
-                r_img = Image.open(roughness_path).convert('L')
-                if r_img.size != (cell_width, cell_height):
-                    r_img = r_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                r_channel = np.array(r_img, dtype=np.float32) / 255.0
-            
+                with Image.open(roughness_path) as raw:
+                    r_img = raw.convert('L')
+                    if r_img.size != (cell_width, cell_height):
+                        r_img = r_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+                    r_channel = np.array(r_img, dtype=np.float32) / 255.0
+
             if metallic_path and os.path.exists(metallic_path):
-                m_img = Image.open(metallic_path).convert('L')
-                if m_img.size != (cell_width, cell_height):
-                    m_img = m_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                m_channel = np.array(m_img, dtype=np.float32) / 255.0
-            
-            # Создаем ERM текстуру
+                with Image.open(metallic_path) as raw:
+                    m_img = raw.convert('L')
+                    if m_img.size != (cell_width, cell_height):
+                        m_img = m_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+                    m_channel = np.array(m_img, dtype=np.float32) / 255.0
+
             if e_channel is None:
                 e_channel = np.zeros((cell_height, cell_width), dtype=np.float32)
             if r_channel is None:
                 r_channel = np.ones((cell_height, cell_width), dtype=np.float32) * 0.5
             if m_channel is None:
                 m_channel = np.zeros((cell_height, cell_width), dtype=np.float32)
-            
-            # Размещаем в атласе
+
             atlas_array[y:y+cell_height, x:x+cell_width, 0] = e_channel
             atlas_array[y:y+cell_height, x:x+cell_width, 1] = r_channel
             atlas_array[y:y+cell_height, x:x+cell_width, 2] = m_channel
             atlas_array[y:y+cell_height, x:x+cell_width, 3] = 1.0
-            
+
             print(f"  📍 Размещена ERM: {item['texture_set'].name} в ({x}, {y})")
-        
-        # Записываем массив обратно в изображение
-        flat = atlas_array.flatten().tolist()
-        atlas_image.pixels = flat
+
+        atlas_image.pixels.foreach_set(atlas_array.ravel())
         atlas_image.update()
-        
+
         return atlas_image
-    
+
     def create_atlas_for_type(self, texture_sets, texture_type, atlas_size, layout, with_alpha=False):
         """Создает атлас для конкретного типа текстуры"""
         atlas_name = f"Atlas_{texture_type}_{atlas_size}"
-        
-        # Удаляем старое изображение если есть
+
         if atlas_name in bpy.data.images:
             bpy.data.images.remove(bpy.data.images[atlas_name])
-        
-        # Создаем новое изображение
+
         atlas_image = bpy.data.images.new(
             atlas_name,
             width=atlas_size,
@@ -1145,25 +1062,16 @@ class AGR_OT_CreateAtlasOnly(Operator):
             alpha=with_alpha,
             float_buffer=False
         )
-        
-        # Устанавливаем цветовое пространство
+
         if texture_type in ['DIFFUSE', 'DIFFUSE_OPACITY']:
             atlas_image.colorspace_settings.name = 'sRGB'
         else:
             atlas_image.colorspace_settings.name = 'Non-Color'
-        
-        # Заполняем черным цветом
-        if with_alpha:
-            fill = [0.0, 0.0, 0.0, 0.0]
-        else:
-            fill = [0.0, 0.0, 0.0, 1.0]
-        
-        total_px = atlas_size * atlas_size * 4
-        buf = fill * (total_px // 4)
-        atlas_image.pixels = buf
-        
-        # Создаем numpy массив для работы
-        atlas_array = np.array(atlas_image.pixels[:]).reshape(atlas_size, atlas_size, 4)
+
+        # Создаем numpy массив напрямую (без GPU roundtrip)
+        atlas_array = np.zeros((atlas_size, atlas_size, 4), dtype=np.float32)
+        if not with_alpha:
+            atlas_array[:, :, 3] = 1.0
         
         # Размещаем текстуры в атласе
         for item in layout:
@@ -1174,18 +1082,16 @@ class AGR_OT_CreateAtlasOnly(Operator):
             else:
                 print(f"  ⚠️ Текстура не найдена: {texture_type} для {item['texture_set'].name}")
         
-        # Записываем массив обратно в изображение
-        flat = atlas_array.flatten().tolist()
-        atlas_image.pixels = flat
+        atlas_image.pixels.foreach_set(atlas_array.ravel())
         atlas_image.update()
-        
+
         return atlas_image
-    
+
     def get_texture_path(self, texture_set, texture_type):
         """Получает путь к файлу текстуры заданного типа"""
         material_name = texture_set.material_name
         folder_path = texture_set.folder_path
-        
+
         # Маппинг типов текстур на имена файлов
         texture_file_map = {
             'DIFFUSE': f"T_{material_name}_Diffuse.png",
@@ -1211,24 +1117,19 @@ class AGR_OT_CreateAtlasOnly(Operator):
         try:
             cell_width = layout_item['width']
             cell_height = layout_item['height']
-            
+
             # Используем Pillow для качественного масштабирования
             if PILLOW_AVAILABLE:
                 from PIL import Image
-                # Загружаем через Pillow
-                pil_img = Image.open(texture_path)
-                
-                # Масштабируем если нужно с использованием LANCZOS
-                if pil_img.size != (cell_width, cell_height):
-                    pil_img = pil_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                
-                # Конвертируем в RGBA если нужно
-                if pil_img.mode != 'RGBA':
-                    pil_img = pil_img.convert('RGBA')
-                
-                # Конвертируем в numpy массив (0-255) и нормализуем в 0-1
-                tex_array = np.array(pil_img, dtype=np.float32) / 255.0
-                
+                with Image.open(texture_path) as raw_img:
+                    if raw_img.size != (cell_width, cell_height):
+                        pil_img = raw_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+                    else:
+                        pil_img = raw_img
+                    if pil_img.mode != 'RGBA':
+                        pil_img = pil_img.convert('RGBA')
+                    tex_array = np.array(pil_img, dtype=np.float32) / 255.0
+
             else:
                 # Fallback: загружаем через Blender
                 temp_img = bpy.data.images.load(texture_path)
@@ -1401,7 +1302,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             else:
                 atlas_type = 'HIGH'
                 use_low_naming = False
-        except:
+        except Exception:
             atlas_type = 'HIGH'
             use_low_naming = False
         
@@ -1448,7 +1349,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 address, obj_type = process_object_name(obj.name)
                 atlas_name = f"A_{address}_{obj_type}"
                 material_name = f"M_{address}_{obj_type}_1"
-            except:
+            except Exception:
                 atlas_name = f"A_{obj.name}"
                 material_name = f"M_{atlas_name}"
                 use_low_naming = False
@@ -1526,7 +1427,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         if use_low_naming:
             try:
                 address, obj_type = process_object_name(bpy.context.active_object.name)
-            except:
+            except Exception:
                 pass
         
         # Создаем DO из DiffuseOpacity текстур
@@ -1543,44 +1444,47 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 self.save_atlas_image(do_atlas, do_filepath, 'DIFFUSE_OPACITY')
                 created_atlases['DIFFUSE_OPACITY'] = do_filepath
                 print(f"  ✅ Создан DO с альфа: {do_filename}")
-                
+
                 # Разделяем DO на D и O через PIL
                 print(f"  🔧 Разделение DO на D и O")
-                do_img = Image.open(do_filepath)
-                
-                # D - RGB часть
-                d_img = do_img.convert('RGB')
-                d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type)
-                if not d_filename:
-                    d_filename = f"T_{atlas_name}_Diffuse.png"
-                d_filepath = os.path.join(output_path, d_filename)
-                d_img.save(d_filepath)
-                created_atlases['DIFFUSE'] = d_filepath
-                print(f"  ✅ Создан Diffuse: {d_filename}")
-                
-                # O - Alpha канал
-                if do_img.mode in ('RGBA', 'LA'):
-                    o_channel = do_img.split()[-1]
-                    o_filename = get_texture_filename(atlas_name, 'OPACITY', use_low_naming, address, obj_type)
-                    if not o_filename:
-                        o_filename = f"T_{atlas_name}_Opacity.png"
-                    o_filepath = os.path.join(output_path, o_filename)
-                    o_channel.save(o_filepath)
-                    created_atlases['OPACITY'] = o_filepath
-                    print(f"  ✅ Создан Opacity: {o_filename}")
+                with Image.open(do_filepath) as do_img:
+                    # D - RGB часть
+                    d_img = do_img.convert('RGB')
+                    d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type)
+                    if not d_filename:
+                        d_filename = f"T_{atlas_name}_Diffuse.png"
+                    d_filepath = os.path.join(output_path, d_filename)
+                    d_img.save(d_filepath)
+                    d_img.close()
+                    created_atlases['DIFFUSE'] = d_filepath
+                    print(f"  ✅ Создан Diffuse: {d_filename}")
+
+                    # O - Alpha канал
+                    if do_img.mode in ('RGBA', 'LA'):
+                        o_channel = do_img.split()[-1]
+                        o_filename = get_texture_filename(atlas_name, 'OPACITY', use_low_naming, address, obj_type)
+                        if not o_filename:
+                            o_filename = f"T_{atlas_name}_Opacity.png"
+                        o_filepath = os.path.join(output_path, o_filename)
+                        o_channel.save(o_filepath)
+                        o_channel.close()
+                        created_atlases['OPACITY'] = o_filepath
+                        print(f"  ✅ Создан Opacity: {o_filename}")
             else:
                 # DO без альфа - сохраняем как RGB
                 self.save_atlas_image(do_atlas, do_filepath, 'DIFFUSE')
                 created_atlases['DIFFUSE_OPACITY'] = do_filepath
                 print(f"  ✅ Создан DiffuseOpacity без альфа: {do_filename}")
-                
+
                 # D - просто копия DO (без альфа)
-                do_img = Image.open(do_filepath).convert('RGB')
+                with Image.open(do_filepath) as raw:
+                    do_img = raw.convert('RGB')
                 d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type)
                 if not d_filename:
                     d_filename = f"T_{atlas_name}_Diffuse.png"
                 d_filepath = os.path.join(output_path, d_filename)
                 do_img.save(d_filepath)
+                do_img.close()
                 created_atlases['DIFFUSE'] = d_filepath
                 print(f"  ✅ Создан Diffuse: {d_filename}")
             
@@ -1631,15 +1535,27 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             print(f"  ✅ Создан Metallic: {filename}")
             bpy.data.images.remove(metallic_atlas)
         
-        # Создаем объединенную ERM текстуру из E, R, M
-        if emit_filepath and roughness_filepath and metallic_filepath:
+        # Создаем объединенную ERM текстуру из E, R, M (any channel present)
+        if emit_filepath or roughness_filepath or metallic_filepath:
             print(f"\n🖼️ Создание объединенной ERM текстуры")
-            e_img = Image.open(emit_filepath).convert('L')
-            r_img = Image.open(roughness_filepath).convert('L')
-            m_img = Image.open(metallic_filepath).convert('L')
-            
+            if emit_filepath:
+                with Image.open(emit_filepath) as raw:
+                    e_img = raw.convert('L')
+            else:
+                e_img = Image.new('L', (atlas_size, atlas_size), 0)
+            if roughness_filepath:
+                with Image.open(roughness_filepath) as raw:
+                    r_img = raw.convert('L')
+            else:
+                r_img = Image.new('L', (atlas_size, atlas_size), 128)
+            if metallic_filepath:
+                with Image.open(metallic_filepath) as raw:
+                    m_img = raw.convert('L')
+            else:
+                m_img = Image.new('L', (atlas_size, atlas_size), 0)
+
             erm_img = Image.merge('RGB', (e_img, r_img, m_img))
-            
+
             erm_filename = get_texture_filename(atlas_name, 'ERM', use_low_naming, address, obj_type)
             if not erm_filename:
                 erm_filename = f"T_{atlas_name}_ERM.png"
@@ -1647,19 +1563,24 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             erm_img.save(erm_filepath)
             created_atlases['ERM'] = erm_filepath
             print(f"  ✅ Создан ERM: {erm_filename}")
-        
-        # Opacity (всегда создаем из исходных сетов)
-        print(f"\n🖼️ Создание Opacity атласа")
-        opacity_atlas = self.create_atlas_for_type(texture_sets, 'OPACITY', atlas_size, layout, False)
-        if opacity_atlas:
-            filename = get_texture_filename(atlas_name, 'OPACITY', use_low_naming, address, obj_type)
-            if not filename:
-                filename = f"T_{atlas_name}_Opacity.png"
-            filepath = os.path.join(output_path, filename)
-            self.save_atlas_image(opacity_atlas, filepath, 'OPACITY')
-            created_atlases['OPACITY'] = filepath
-            print(f"  ✅ Создан Opacity: {filename}")
-            bpy.data.images.remove(opacity_atlas)
+            e_img.close()
+            r_img.close()
+            m_img.close()
+            erm_img.close()
+
+        # Opacity (only if not already created in diffuse+alpha block above)
+        if 'OPACITY' not in created_atlases:
+            print(f"\n🖼️ Создание Opacity атласа")
+            opacity_atlas = self.create_atlas_for_type(texture_sets, 'OPACITY', atlas_size, layout, False)
+            if opacity_atlas:
+                filename = get_texture_filename(atlas_name, 'OPACITY', use_low_naming, address, obj_type)
+                if not filename:
+                    filename = f"T_{atlas_name}_Opacity.png"
+                filepath = os.path.join(output_path, filename)
+                self.save_atlas_image(opacity_atlas, filepath, 'OPACITY')
+                created_atlases['OPACITY'] = filepath
+                print(f"  ✅ Создан Opacity: {filename}")
+                bpy.data.images.remove(opacity_atlas)
         
         # Normal
         print(f"\n🖼️ Создание Normal атласа")
@@ -1687,7 +1608,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         if use_low_naming:
             try:
                 address, obj_type = process_object_name(bpy.context.active_object.name)
-            except:
+            except Exception:
                 pass
         
         # Создаем DO из DiffuseOpacity текстур (или Diffuse + Opacity)
@@ -1708,16 +1629,17 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 self.save_atlas_image(do_atlas, do_filepath, 'DIFFUSE_OPACITY')
                 created_atlases['DIFFUSE_OPACITY'] = do_filepath
                 print(f"  ✅ Создан DO с альфа: {do_filename}")
-                
+
                 # Разделяем DO на D (для совместимости)
                 print(f"  🔧 Извлечение D из DO")
-                do_img = Image.open(do_filepath)
-                d_img = do_img.convert('RGB')
+                with Image.open(do_filepath) as do_img:
+                    d_img = do_img.convert('RGB')
                 d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type)
                 if not d_filename:
                     d_filename = f"T_{atlas_name}_d.png"
                 d_filepath = os.path.join(output_path, d_filename)
                 d_img.save(d_filepath)
+                d_img.close()
                 created_atlases['DIFFUSE'] = d_filepath
                 print(f"  ✅ Создан D: {d_filename}")
             else:
@@ -1725,14 +1647,16 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 self.save_atlas_image(do_atlas, do_filepath, 'DIFFUSE')
                 created_atlases['DIFFUSE_OPACITY'] = do_filepath
                 print(f"  ✅ Создан DO без альфа: {do_filename}")
-                
+
                 # D - копия DO
-                do_img = Image.open(do_filepath).convert('RGB')
+                with Image.open(do_filepath) as raw:
+                    do_img = raw.convert('RGB')
                 d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type)
                 if not d_filename:
                     d_filename = f"T_{atlas_name}_d.png"
                 d_filepath = os.path.join(output_path, d_filename)
                 do_img.save(d_filepath)
+                do_img.close()
                 created_atlases['DIFFUSE'] = d_filepath
                 print(f"  ✅ Создан D: {d_filename}")
             
@@ -1759,25 +1683,31 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 if has_alpha:
                     # Объединяем D + O в DO
                     opacity_atlas = self.create_atlas_for_type(texture_sets, 'OPACITY', atlas_size, layout, False)
-                    
-                    d_img = Image.open(d_filepath).convert('RGB')
+
+                    with Image.open(d_filepath) as raw_d:
+                        d_img = raw_d.convert('RGB')
                     o_array = np.array(opacity_atlas.pixels[:]).reshape(atlas_size, atlas_size, 4)
                     o_channel = (o_array[:, :, 0] * 255).astype(np.uint8)
                     o_pil = Image.fromarray(o_channel, mode='L')
-                    
+
                     do_img = Image.new('RGBA', (atlas_size, atlas_size))
                     do_img.paste(d_img, (0, 0))
                     do_img.putalpha(o_pil)
                     do_img.save(do_filepath)
-                    
+                    d_img.close()
+                    o_pil.close()
+                    do_img.close()
+
                     created_atlases['DIFFUSE_OPACITY'] = do_filepath
                     print(f"  ✅ Создан DO с альфа: {do_filename}")
-                    
+
                     bpy.data.images.remove(opacity_atlas)
                 else:
                     # DO без альфа - просто копия D
-                    d_img = Image.open(d_filepath).convert('RGB')
+                    with Image.open(d_filepath) as raw_d:
+                        d_img = raw_d.convert('RGB')
                     d_img.save(do_filepath)
+                    d_img.close()
                     created_atlases['DIFFUSE_OPACITY'] = do_filepath
                     print(f"  ✅ Создан DO без альфа: {do_filename}")
                 
@@ -1865,12 +1795,12 @@ class AGR_OT_CreateAtlasFromObject(Operator):
     def create_erm_atlas(self, texture_sets, atlas_size, layout):
         """Создает ERM атлас (объединяет E, R, M в RGB каналы)"""
         from PIL import Image
-        
+
         atlas_name = f"Atlas_ERM_{atlas_size}"
-        
+
         if atlas_name in bpy.data.images:
             bpy.data.images.remove(bpy.data.images[atlas_name])
-        
+
         atlas_image = bpy.data.images.new(
             atlas_name,
             width=atlas_size,
@@ -1878,73 +1808,71 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             alpha=False,
             float_buffer=False
         )
-        
         atlas_image.colorspace_settings.name = 'Non-Color'
-        
-        fill = [0.0, 0.0, 0.0, 1.0]
-        total_px = atlas_size * atlas_size * 4
-        buf = fill * (total_px // 4)
-        atlas_image.pixels = buf
-        
-        atlas_array = np.array(atlas_image.pixels[:]).reshape(atlas_size, atlas_size, 4)
-        
+
+        # Создаем numpy массив напрямую (без GPU roundtrip)
+        atlas_array = np.zeros((atlas_size, atlas_size, 4), dtype=np.float32)
+        atlas_array[:, :, 3] = 1.0
+
         for item in layout:
             emit_path = self.get_texture_path(item['texture_set'], 'EMIT')
             roughness_path = self.get_texture_path(item['texture_set'], 'ROUGHNESS')
             metallic_path = self.get_texture_path(item['texture_set'], 'METALLIC')
-            
+
             cell_width = item['width']
             cell_height = item['height']
             x = item['x']
             y = item['y']
-            
+
             e_channel = None
             r_channel = None
             m_channel = None
-            
+
             if emit_path and os.path.exists(emit_path):
-                e_img = Image.open(emit_path).convert('L')
-                if e_img.size != (cell_width, cell_height):
-                    e_img = e_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                e_channel = np.array(e_img, dtype=np.float32) / 255.0
-            
+                with Image.open(emit_path) as raw:
+                    e_img = raw.convert('L')
+                    if e_img.size != (cell_width, cell_height):
+                        e_img = e_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+                    e_channel = np.array(e_img, dtype=np.float32) / 255.0
+
             if roughness_path and os.path.exists(roughness_path):
-                r_img = Image.open(roughness_path).convert('L')
-                if r_img.size != (cell_width, cell_height):
-                    r_img = r_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                r_channel = np.array(r_img, dtype=np.float32) / 255.0
-            
+                with Image.open(roughness_path) as raw:
+                    r_img = raw.convert('L')
+                    if r_img.size != (cell_width, cell_height):
+                        r_img = r_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+                    r_channel = np.array(r_img, dtype=np.float32) / 255.0
+
             if metallic_path and os.path.exists(metallic_path):
-                m_img = Image.open(metallic_path).convert('L')
-                if m_img.size != (cell_width, cell_height):
-                    m_img = m_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                m_channel = np.array(m_img, dtype=np.float32) / 255.0
-            
+                with Image.open(metallic_path) as raw:
+                    m_img = raw.convert('L')
+                    if m_img.size != (cell_width, cell_height):
+                        m_img = m_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+                    m_channel = np.array(m_img, dtype=np.float32) / 255.0
+
             if e_channel is None:
                 e_channel = np.zeros((cell_height, cell_width), dtype=np.float32)
             if r_channel is None:
                 r_channel = np.ones((cell_height, cell_width), dtype=np.float32) * 0.5
             if m_channel is None:
                 m_channel = np.zeros((cell_height, cell_width), dtype=np.float32)
-            
+
             atlas_array[y:y+cell_height, x:x+cell_width, 0] = e_channel
             atlas_array[y:y+cell_height, x:x+cell_width, 1] = r_channel
             atlas_array[y:y+cell_height, x:x+cell_width, 2] = m_channel
             atlas_array[y:y+cell_height, x:x+cell_width, 3] = 1.0
-        
-        flat = atlas_array.flatten().tolist()
-        atlas_image.pixels = flat
+
+        atlas_image.pixels.foreach_set(atlas_array.ravel())
         atlas_image.update()
-        
+
         return atlas_image
-    
+
     def create_atlas_for_type(self, texture_sets, texture_type, atlas_size, layout, with_alpha=False):
         """Создает атлас для конкретного типа текстуры"""
         atlas_name = f"Atlas_{texture_type}_{atlas_size}"
-        
+
         if atlas_name in bpy.data.images:
             bpy.data.images.remove(bpy.data.images[atlas_name])
-        
+
         atlas_image = bpy.data.images.new(
             atlas_name,
             width=atlas_size,
@@ -1952,35 +1880,28 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             alpha=with_alpha,
             float_buffer=False
         )
-        
+
         if texture_type in ['DIFFUSE', 'DIFFUSE_OPACITY']:
             atlas_image.colorspace_settings.name = 'sRGB'
         else:
             atlas_image.colorspace_settings.name = 'Non-Color'
-        
-        if with_alpha:
-            fill = [0.0, 0.0, 0.0, 0.0]
-        else:
-            fill = [0.0, 0.0, 0.0, 1.0]
-        
-        total_px = atlas_size * atlas_size * 4
-        buf = fill * (total_px // 4)
-        atlas_image.pixels = buf
-        
-        atlas_array = np.array(atlas_image.pixels[:]).reshape(atlas_size, atlas_size, 4)
-        
+
+        # Создаем numpy массив напрямую (без GPU roundtrip)
+        atlas_array = np.zeros((atlas_size, atlas_size, 4), dtype=np.float32)
+        if not with_alpha:
+            atlas_array[:, :, 3] = 1.0
+
         for item in layout:
             texture_path = self.get_texture_path(item['texture_set'], texture_type)
-            
+
             if texture_path and os.path.exists(texture_path):
                 self.place_texture_in_atlas(atlas_array, texture_path, item)
             else:
                 print(f"  ⚠️ Текстура не найдена: {texture_type} для {item['texture_set'].name}")
-        
-        flat = atlas_array.flatten().tolist()
-        atlas_image.pixels = flat
+
+        atlas_image.pixels.foreach_set(atlas_array.ravel())
         atlas_image.update()
-        
+
         return atlas_image
     
     def get_texture_path(self, texture_set, texture_type):
@@ -2012,40 +1933,39 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         try:
             cell_width = layout_item['width']
             cell_height = layout_item['height']
-            
+
             if PILLOW_AVAILABLE:
                 from PIL import Image
-                pil_img = Image.open(texture_path)
-                
-                if pil_img.size != (cell_width, cell_height):
-                    pil_img = pil_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                
-                if pil_img.mode != 'RGBA':
-                    pil_img = pil_img.convert('RGBA')
-                
-                tex_array = np.array(pil_img, dtype=np.float32) / 255.0
-                
+                with Image.open(texture_path) as raw_img:
+                    if raw_img.size != (cell_width, cell_height):
+                        pil_img = raw_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+                    else:
+                        pil_img = raw_img
+                    if pil_img.mode != 'RGBA':
+                        pil_img = pil_img.convert('RGBA')
+                    tex_array = np.array(pil_img, dtype=np.float32) / 255.0
+
             else:
                 temp_img = bpy.data.images.load(texture_path)
                 temp_img.update()
                 _ = temp_img.pixels[0]
-                
+
                 tex_width = temp_img.size[0]
                 tex_height = temp_img.size[1]
                 tex_array = np.array(temp_img.pixels[:]).reshape(tex_height, tex_width, 4)
-                
+
                 if tex_width != cell_width or tex_height != cell_height:
                     indices_y = np.round(np.linspace(0, tex_height - 1, cell_height)).astype(int)
                     indices_x = np.round(np.linspace(0, tex_width - 1, cell_width)).astype(int)
                     tex_array = tex_array[np.ix_(indices_y, indices_x)]
-                
+
                 if temp_img.name in bpy.data.images:
                     bpy.data.images.remove(temp_img)
-            
+
             x = layout_item['x']
             y = layout_item['y']
             atlas_array[y:y+cell_height, x:x+cell_width, :] = tex_array
-            
+
         except Exception as e:
             print(f"  ❌ Ошибка размещения {texture_path}: {e}")
     
@@ -2352,7 +2272,7 @@ def get_available_atlases(self, context):
                                     item,
                                     f"Atlas: {item} ({atlas_size}x{atlas_size})"
                                 ))
-                        except:
+                        except Exception:
                             # Если не удалось прочитать mapping, всё равно добавляем
                             items.append((
                                 item_path,
@@ -2384,23 +2304,18 @@ class AGR_OT_ApplyAtlasToObject(Operator):
         if not obj or obj.type != 'MESH':
             return False
         
-        # Проверяем наличие атласов (сканируем A_* папки напрямую)
+        # Check for atlases via texture sets collection (no filesystem I/O in poll)
+        for tex_set in context.scene.agr_texture_sets:
+            if getattr(tex_set, 'is_atlas', False):
+                return True
+
+        # Fallback: check if any A_* folder name pattern exists in scene data
         settings = context.scene.agr_baker_settings
         blend_path = bpy.path.abspath("//")
         if not blend_path:
             return False
-        
         agr_bake_path = os.path.join(blend_path, settings.output_folder)
-        if not os.path.exists(agr_bake_path):
-            return False
-        
-        # Ищем хотя бы одну A_* папку
-        for item in os.listdir(agr_bake_path):
-            item_path = os.path.join(agr_bake_path, item)
-            if os.path.isdir(item_path) and item.startswith("A_"):
-                return True
-        
-        return False
+        return os.path.isdir(agr_bake_path)
     
     def invoke(self, context, event):
         # Показываем диалог выбора атласа
@@ -2857,10 +2772,12 @@ class AGR_OT_UnpackAtlasToMaterials(Operator):
                 # Сохраняем оригинальные UV и вычисляем обратную трансформацию
                 coords = uv_region_to_material[matched_material]
                 original_uvs = []
+                u_range = coords['u_max'] - coords['u_min']
+                v_range = coords['v_max'] - coords['v_min']
                 for uv_u, uv_v in poly_uvs:
                     # Обратная трансформация: из atlas space в 0-1 space
-                    orig_u = (uv_u - coords['u_min']) / (coords['u_max'] - coords['u_min'])
-                    orig_v = (uv_v - coords['v_min']) / (coords['v_max'] - coords['v_min'])
+                    orig_u = (uv_u - coords['u_min']) / u_range if u_range > 0 else 0.0
+                    orig_v = (uv_v - coords['v_min']) / v_range if v_range > 0 else 0.0
                     original_uvs.append((orig_u, orig_v))
                 
                 face_to_original_uvs[poly.index] = original_uvs
