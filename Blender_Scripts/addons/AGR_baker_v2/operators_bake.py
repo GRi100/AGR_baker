@@ -6,10 +6,16 @@ import bpy
 from bpy.types import Operator
 from bpy.props import EnumProperty, BoolProperty
 import os
+import re
 import shutil
 import numpy as np
 
 from .core import baking, materials, texture_sets
+
+
+def sanitize_material_name(name):
+    """Replace filesystem-unsafe characters in material name with underscores"""
+    return re.sub(r'[/\\:*?"<>|]', '_', name)
 
 
 class AGR_OT_BakeTextures(Operator):
@@ -68,7 +74,8 @@ class AGR_OT_BakeTextures(Operator):
         original_engine = context.scene.render.engine
         original_samples = context.scene.cycles.samples
         original_denoise = context.scene.cycles.use_denoising
-        
+        original_device = context.scene.cycles.device
+
         context.scene.render.engine = 'CYCLES'
         context.scene.cycles.samples = settings.bake_samples
         context.scene.cycles.use_denoising = settings.bake_use_denoising
@@ -85,7 +92,7 @@ class AGR_OT_BakeTextures(Operator):
                     continue
                 
                 material = mat_slot.material
-                material_name = material.name
+                material_name = sanitize_material_name(material.name)
                 
                 print(f"\n🔥 Baking texture set for: {material_name}")
                 
@@ -134,7 +141,8 @@ class AGR_OT_BakeTextures(Operator):
             context.scene.render.engine = original_engine
             context.scene.cycles.samples = original_samples
             context.scene.cycles.use_denoising = original_denoise
-            
+            context.scene.cycles.device = original_device
+
             # Restore selection context
             bpy.ops.object.select_all(action='DESELECT')
             for obj in original_selection:
@@ -142,7 +150,7 @@ class AGR_OT_BakeTextures(Operator):
                     bpy.data.objects[obj.name].select_set(True)
             if original_active and original_active.name in bpy.data.objects:
                 context.view_layer.objects.active = bpy.data.objects[original_active.name]
-                
+
                 # Restore original mode
                 if original_mode != 'OBJECT':
                     try:
@@ -150,16 +158,22 @@ class AGR_OT_BakeTextures(Operator):
                         print(f"🔄 Restored mode: {original_mode}")
                     except Exception as e:
                         print(f"⚠️ Could not restore mode {original_mode}: {e}")
-            
+
             print(f"🔄 Restored selection: {len(original_selection)} objects")
-        
+
         return {'FINISHED'}
-    
+
     def bake_material_textures(self, context, target_obj, source_objects,
                                material, mat_idx, material_name,
                                set_folder, resolution, settings):
         """Bake all textures for a material"""
-        
+
+        # Validate single Principled BSDF
+        if material.use_nodes:
+            bsdf_count = sum(1 for n in material.node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
+            if bsdf_count > 1:
+                print(f"⚠️ Material '{material.name}' has {bsdf_count} Principled BSDF nodes — only one is expected")
+
         # Create images (opacity created conditionally later based on alpha baking)
         img_diffuse = baking.create_texture_image(
             f"T_{material_name}_Diffuse", resolution
@@ -672,17 +686,18 @@ class AGR_OT_SimpleBake(Operator):
         original_engine = context.scene.render.engine
         original_samples = context.scene.cycles.samples
         original_denoise = context.scene.cycles.use_denoising
-        
+        original_device = context.scene.cycles.device
+
         context.scene.render.engine = 'CYCLES'
         context.scene.cycles.samples = settings.bake_samples
         context.scene.cycles.use_denoising = settings.bake_use_denoising
         context.scene.cycles.device = settings.bake_device
-        
+
         print(f"🔧 Bake settings: engine=CYCLES, samples={settings.bake_samples}, device={settings.bake_device}, denoising={settings.bake_use_denoising}")
-        
+
         user_resolution = int(settings.resolution)
-        material_name = active_material.name
-        
+        material_name = sanitize_material_name(active_material.name)
+
         print(f"\n🔥 Simple Bake for material: {material_name}")
         print(f"📏 User selected resolution: {user_resolution}px")
         
@@ -766,7 +781,8 @@ class AGR_OT_SimpleBake(Operator):
             context.scene.render.engine = original_engine
             context.scene.cycles.samples = original_samples
             context.scene.cycles.use_denoising = original_denoise
-            
+            context.scene.cycles.device = original_device
+
             # Restore selection context
             bpy.ops.object.select_all(action='DESELECT')
             for obj in original_selection:
@@ -774,7 +790,7 @@ class AGR_OT_SimpleBake(Operator):
                     bpy.data.objects[obj.name].select_set(True)
             if original_active and original_active.name in bpy.data.objects:
                 context.view_layer.objects.active = bpy.data.objects[original_active.name]
-                
+
                 # Restore original mode
                 if original_mode != 'OBJECT':
                     try:
@@ -782,16 +798,22 @@ class AGR_OT_SimpleBake(Operator):
                         print(f"🔄 Restored mode: {original_mode}")
                     except Exception as e:
                         print(f"⚠️ Could not restore mode {original_mode}: {e}")
-            
+
             print(f"🔄 Restored selection: {len(original_selection)} objects")
-        
+
         return {'FINISHED'}
-    
+
     @staticmethod
     def bake_material_simple(context, bake_plane, material, material_name,
                             set_folder, diffuse_res, pbr_res, normal_res, bake_with_alpha, settings):
         """Bake all textures from material on plane"""
-        
+
+        # Validate single Principled BSDF
+        if material.use_nodes:
+            bsdf_count = sum(1 for n in material.node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
+            if bsdf_count > 1:
+                print(f"⚠️ Material '{material.name}' has {bsdf_count} Principled BSDF nodes — only one is expected")
+
         # Create images with determined resolutions
         img_diffuse = baking.create_texture_image(
             f"T_{material_name}_Diffuse", diffuse_res
@@ -1286,12 +1308,13 @@ class AGR_OT_SimpleBakeAll(Operator):
         original_engine = context.scene.render.engine
         original_samples = context.scene.cycles.samples
         original_denoise = context.scene.cycles.use_denoising
-        
+        original_device = context.scene.cycles.device
+
         context.scene.render.engine = 'CYCLES'
         context.scene.cycles.samples = settings.bake_samples
         context.scene.cycles.use_denoising = settings.bake_use_denoising
         context.scene.cycles.device = settings.bake_device
-        
+
         user_resolution = int(settings.resolution)
         
         print(f"\n🔥 Simple Bake All Materials for object: {active_obj.name}")
@@ -1309,7 +1332,7 @@ class AGR_OT_SimpleBakeAll(Operator):
                     continue
                 
                 material = mat_slot.material
-                material_name = material.name
+                material_name = sanitize_material_name(material.name)
                 
                 print(f"\n📦 Processing material: {material_name}")
                 
@@ -1396,7 +1419,8 @@ class AGR_OT_SimpleBakeAll(Operator):
             context.scene.render.engine = original_engine
             context.scene.cycles.samples = original_samples
             context.scene.cycles.use_denoising = original_denoise
-            
+            context.scene.cycles.device = original_device
+
             # Restore selection context
             bpy.ops.object.select_all(action='DESELECT')
             for obj in original_selection:

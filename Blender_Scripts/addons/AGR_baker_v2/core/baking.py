@@ -208,6 +208,7 @@ def bake_texture(context, target_obj, source_objects, image, bake_type,
             print(f"✅ Baked {bake_type} on retry")
         except Exception as e2:
             print(f"❌ Retry failed {bake_type}: {e2}")
+            raise RuntimeError(f"Bake failed for {bake_type} after retry: {e2}") from e2
     
     context.scene.render.film_transparent = original_film_transparent
 
@@ -243,16 +244,18 @@ def save_texture(image, filepath):
     
     # Save
     original_filepath = image.filepath
+    original_filepath_raw = image.filepath_raw
     image.filepath_raw = filepath
-    
+
     try:
         image.save_render(filepath)
         print(f"💾 Saved: {filepath}")
     except Exception as e:
         print(f"❌ Save error {filepath}: {e}")
         image.save_render(filepath, scene=scene)
-    
+
     image.filepath = original_filepath
+    image.filepath_raw = original_filepath_raw
     
     # Restore settings
     scene.render.image_settings.file_format = original_format
@@ -433,7 +436,7 @@ def check_normal_is_only_normal_map(material):
             from_node = socket.links[0].from_node
             
             # Check if it's a Normal Map node
-            if from_node.type == 'NORMALMAP':
+            if from_node.type == 'NORMAL_MAP':
                 # Check if Normal Map is connected to a texture
                 color_input = from_node.inputs.get('Color')
                 if color_input and color_input.links:
@@ -593,7 +596,7 @@ def should_bake_with_alpha(material):
                 elif from_socket.name == 'Alpha':
                     print(f"  🔍 Alpha: Connected to texture Alpha output")
                     # Check if texture has alpha channel
-                    has_alpha = from_node.image.alpha_mode != 'NONE' and from_node.image.depth == 32
+                    has_alpha = from_node.image.alpha_mode != 'NONE' and from_node.image.depth in (32, 64)
                     if not has_alpha:
                         print(f"  🔍 Alpha: Texture has no alpha channel → bake without alpha")
                         return False

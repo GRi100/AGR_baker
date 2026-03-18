@@ -111,6 +111,10 @@ class AGR_PT_MainPanel(Panel):
         row.scale_y = 1.2
         row.operator("agr.convert_materials_to_sets", text="Convert Materials to Sets", icon='IMPORT')
 
+        row = box.row()
+        row.scale_y = 1.2
+        row.operator("agr.convert_active_material_to_set", text="Convert Active Material", icon='MATERIAL')
+
         # Pillow installation check
         try:
             from PIL import Image

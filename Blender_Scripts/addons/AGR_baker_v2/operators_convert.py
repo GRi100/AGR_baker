@@ -11,6 +11,18 @@ from .core.materials import connect_texture_set_to_material
 from .core import baking as baking_core
 
 
+def _linear_to_srgb(c):
+    """Convert a single linear float channel (0.0-1.0) to sRGB (0-255 int).
+    Blender stores Base Color in linear space; PNG files are interpreted as sRGB.
+    """
+    c = max(0.0, min(1.0, c))
+    if c <= 0.0031308:
+        encoded = c * 12.92
+    else:
+        encoded = 1.055 * (c ** (1.0 / 2.4)) - 0.055
+    return int(encoded * 255 + 0.5)
+
+
 class AGR_OT_ConvertMaterialsToSets(Operator):
     """Convert object materials to texture sets by extracting and splitting textures"""
     bl_idname = "agr.convert_materials_to_sets"
@@ -311,109 +323,6 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
 
         return None
 
-    def _bake_diffuse_simple(self, context, material, set_folder):
-        """Bake only the Diffuse channel for a material using a temporary bake plane.
-        Saves Diffuse.png, white Opacity.png and RGB DiffuseOpacity.png to set_folder.
-        Returns True on success.
-        """
-        material_name = material.name
-        res = 256
-
-        # Save and switch render engine to Cycles
-        original_engine = context.scene.render.engine
-        original_samples = context.scene.cycles.samples
-        original_denoise = context.scene.cycles.use_denoising
-        original_active = context.view_layer.objects.active
-        original_mode = context.object.mode if context.object else 'OBJECT'
-        if original_mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-        context.scene.render.engine = 'CYCLES'
-        context.scene.cycles.samples = 1
-        context.scene.cycles.use_denoising = False
-
-        bake_plane = None
-        try:
-            # Create temporary bake plane with material assigned
-            bake_plane = baking_core.create_bake_plane(f"_ConvBakePlane_{material_name}")
-            if len(bake_plane.material_slots) == 0:
-                bake_plane.data.materials.append(material)
-            else:
-                bake_plane.material_slots[0].material = material
-
-            # Create target image
-            img = baking_core.create_texture_image(f"T_{material_name}_Diffuse_BakeTmp", res)
-
-            # Set up bake node and point it at our target image
-            bake_node = baking_core.setup_bake_node(material)
-            bake_node.image = img
-            bake_node.select = True
-            material.node_tree.nodes.active = bake_node
-
-            # Disable metallic (required for correct diffuse bake)
-            metallic_val = None
-            metallic_from_socket = None
-            metallic_to_socket = None
-            if material.use_nodes:
-                for node in material.node_tree.nodes:
-                    if node.type == 'BSDF_PRINCIPLED':
-                        metallic_val = node.inputs['Metallic'].default_value
-                        metallic_to_socket = node.inputs['Metallic']
-                        for link in list(material.node_tree.links):
-                            if link.to_socket == metallic_to_socket:
-                                metallic_from_socket = link.from_socket
-                                material.node_tree.links.remove(link)
-                                break
-                        node.inputs['Metallic'].default_value = 0.0
-                        break
-
-            try:
-                baking_core.bake_texture(context, bake_plane, [], img, 'DIFFUSE', 0)
-            finally:
-                # Always restore metallic value and link
-                if metallic_val is not None:
-                    for node in material.node_tree.nodes:
-                        if node.type == 'BSDF_PRINCIPLED':
-                            node.inputs['Metallic'].default_value = metallic_val
-                            break
-                if metallic_from_socket and metallic_to_socket:
-                    material.node_tree.links.new(metallic_from_socket, metallic_to_socket)
-
-            # Save Diffuse
-            diffuse_path = str(set_folder / f"T_{material_name}_Diffuse.png")
-            baking_core.save_texture(img, diffuse_path)
-            print(f"  💾 Saved Diffuse (baked): {os.path.basename(diffuse_path)}")
-
-            # White Opacity placeholder
-            from PIL import Image as PILImage
-            white_op = PILImage.new('L', (res, res), 255)
-            opacity_path = set_folder / f"T_{material_name}_Opacity.png"
-            white_op.save(str(opacity_path))
-            print(f"  💾 Saved Opacity (white placeholder): {opacity_path.name}")
-
-            # DiffuseOpacity = copy of Diffuse (RGB, no alpha since no transparency)
-            import shutil
-            do_path = str(set_folder / f"T_{material_name}_DiffuseOpacity.png")
-            shutil.copy2(diffuse_path, do_path)
-            print(f"  💾 Saved DiffuseOpacity (RGB copy of Diffuse): {os.path.basename(do_path)}")
-
-            return True
-
-        except Exception as e:
-            print(f"  ❌ _bake_diffuse_simple error: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-        finally:
-            if bake_plane:
-                bpy.data.objects.remove(bake_plane, do_unlink=True)
-            context.view_layer.objects.active = original_active
-            if original_mode != 'OBJECT' and context.object:
-                bpy.ops.object.mode_set(mode=original_mode)
-            context.scene.render.engine = original_engine
-            context.scene.cycles.samples = original_samples
-            context.scene.cycles.use_denoising = original_denoise
-
     def _get_erm_channel_connections(self, bsdf, erm_image):
         """Check which ERM channels are actually routed through Separate Color to the BSDF.
         Returns dict {'emit': bool, 'roughness': bool, 'metallic': bool}.
@@ -526,13 +435,26 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                         rgb.save(str(diffuse_path))
                         print(f"  💾 Saved Diffuse: {diffuse_path.name}")
 
-                        opacity_path = set_folder / f"T_{material_name}_Opacity.png"
-                        alpha.save(str(opacity_path))
-                        print(f"  💾 Saved Opacity: {opacity_path.name}")
+                        alpha_is_white = min(alpha.getdata()) == 255
+                        if alpha_is_white:
+                            # Alpha fully white — no real transparency, save as RGB
+                            print(f"  ℹ️ Alpha channel is fully white — treating as opaque")
+                            white_opacity = Image.new('L', rgb.size, 255)
+                            opacity_path = set_folder / f"T_{material_name}_Opacity.png"
+                            white_opacity.save(str(opacity_path))
+                            print(f"  💾 Saved Opacity (white placeholder): {opacity_path.name}")
 
-                        do_path = set_folder / f"T_{material_name}_DiffuseOpacity.png"
-                        pil_img.save(str(do_path))
-                        print(f"  💾 Saved DiffuseOpacity (RGBA): {do_path.name}")
+                            do_path = set_folder / f"T_{material_name}_DiffuseOpacity.png"
+                            rgb.save(str(do_path))
+                            print(f"  💾 Saved DiffuseOpacity (RGB, alpha was white): {do_path.name}")
+                        else:
+                            opacity_path = set_folder / f"T_{material_name}_Opacity.png"
+                            alpha.save(str(opacity_path))
+                            print(f"  💾 Saved Opacity: {opacity_path.name}")
+
+                            do_path = set_folder / f"T_{material_name}_DiffuseOpacity.png"
+                            pil_img.save(str(do_path))
+                            print(f"  💾 Saved DiffuseOpacity (RGBA): {do_path.name}")
                     else:
                         rgb = pil_img.convert('RGB')
 
@@ -553,15 +475,25 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                 print(f"  ❌ Error processing Diffuse/Opacity: {e}")
 
         else:
-            # No diffuse texture found — bake diffuse channel only using Cycles
-            print(f"  ⚠️ No Diffuse texture found — baking Diffuse at 256px")
+            # No diffuse texture — create flat color from BSDF Base Color
+            print(f"  ⚠️ No Diffuse texture found — creating from BSDF Base Color")
             try:
-                baked = self._bake_diffuse_simple(context, material, set_folder)
-                if baked:
-                    diffuse_ok = True
-                    print(f"  ✅ Diffuse baked successfully")
+                res = 256
+                if bsdf:
+                    bc = bsdf.inputs['Base Color'].default_value
+                    r, g, b = (_linear_to_srgb(bc[i]) for i in range(3))
+                else:
+                    r, g, b = 204, 204, 204
+
+                flat = Image.new('RGB', (res, res), (r, g, b))
+
+                flat.save(str(set_folder / f"T_{material_name}_Diffuse.png"))
+                Image.new('L', (res, res), 255).save(str(set_folder / f"T_{material_name}_Opacity.png"))
+                flat.save(str(set_folder / f"T_{material_name}_DiffuseOpacity.png"))
+
+                diffuse_ok = True
             except Exception as e:
-                print(f"  ❌ Diffuse bake failed: {e}")
+                print(f"  ❌ Error creating flat Diffuse: {e}")
 
         # ── ERM ──────────────────────────────────────────────────────────────
 
@@ -722,8 +654,96 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
         return diffuse_ok
 
 
+class AGR_OT_ConvertActiveMaterialToSet(Operator):
+    """Convert only the active material of the active object to a texture set"""
+    bl_idname = "agr.convert_active_material_to_set"
+    bl_label = "Convert Active Material to Set"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (obj and obj.type == 'MESH' and obj.active_material
+                and obj.active_material.use_nodes)
+
+    def execute(self, context):
+        try:
+            try:
+                from PIL import Image
+            except ImportError:
+                self.report({'ERROR'}, "Pillow not installed. Install it first.")
+                return {'CANCELLED'}
+
+            obj = context.active_object
+
+            blend_path = bpy.data.filepath
+            if not blend_path:
+                self.report({'ERROR'}, "Save blend file first")
+                return {'CANCELLED'}
+
+            self.base_dir = Path(blend_path).parent
+            agr_bake_dir = self.base_dir / "AGR_BAKE"
+
+            if not agr_bake_dir.exists():
+                agr_bake_dir.mkdir(parents=True)
+
+            material = obj.active_material
+
+            print(f"\n🔄 === CONVERTING ACTIVE MATERIAL TO SET ===")
+            print(f"Object: {obj.name}, Material: {material.name}")
+
+            textures, bsdf = self.find_material_textures(material)
+
+            set_name = f"S_{material.name}"
+            set_folder = agr_bake_dir / set_name
+
+            if not set_folder.exists():
+                set_folder.mkdir(parents=True)
+                print(f"  📁 Created folder: {set_folder}")
+
+            success = self.process_material_textures(context, material, textures, bsdf, set_folder)
+
+            if success:
+                connect_texture_set_to_material(material, str(set_folder), material.name)
+                print(f"  ✅ Material converted and reconnected successfully")
+
+            bpy.ops.agr.refresh_texture_sets()
+
+            if success:
+                self.report({'INFO'}, f"Converted active material: {material.name}")
+            else:
+                self.report({'WARNING'}, f"Conversion incomplete for: {material.name}")
+
+            print(f"\n✅ Active material conversion complete")
+            return {'FINISHED'}
+
+        except Exception as e:
+            print(f"❌ Error converting active material: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Error: {str(e)}")
+            return {'CANCELLED'}
+
+
+# Copy helper methods from AGR_OT_ConvertMaterialsToSets so that
+# AGR_OT_ConvertActiveMaterialToSet can use self.method() without inheriting
+# from a registered Blender operator class (which causes RNA struct conflicts).
+_SHARED_METHODS = (
+    'find_material_textures',
+    'find_texture_node',
+    'resolve_image_path',
+    'load_pil_image',
+    '_get_erm_channel_connections',
+    'process_material_textures',
+)
+for _m in _SHARED_METHODS:
+    setattr(AGR_OT_ConvertActiveMaterialToSet, _m,
+            getattr(AGR_OT_ConvertMaterialsToSets, _m))
+
+
 classes = (
     AGR_OT_ConvertMaterialsToSets,
+    AGR_OT_ConvertActiveMaterialToSet,
 )
 
 

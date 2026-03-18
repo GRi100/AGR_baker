@@ -496,49 +496,51 @@ class AGR_OT_CreateUDIM(Operator):
         
         bm = bmesh.new()
         bm.from_mesh(obj.data)
-        
+
         if not bm.loops.layers.uv:
             print("⚠️ No UV layer in bmesh")
             bm.free()
             return
-        
+
         uv_layer = bm.loops.layers.uv.active
-        
+
         print(f"📐 Moving UVs to UDIM tiles...")
-        
+
         # Count polygons per material
         material_counts = {}
-        
-        for face in bm.faces:
-            mat_idx = face.material_index
-            
-            if mat_idx >= num_materials:
-                continue
-            
-            # Calculate UDIM offset
-            udim_number = 1001 + mat_idx
-            udim_offset = udim_number - 1001
-            udim_offset_u = udim_offset % 10
-            udim_offset_v = udim_offset // 10
-            
-            # Move UVs
-            for loop in face.loops:
-                uv = loop[uv_layer].uv
-                uv.x += udim_offset_u
-                uv.y += udim_offset_v
-            
-            material_counts[mat_idx] = material_counts.get(mat_idx, 0) + 1
-        
-        # Update mesh
-        bm.to_mesh(obj.data)
-        bm.free()
-        obj.data.update()
-        
+
+        try:
+            for face in bm.faces:
+                mat_idx = face.material_index
+
+                if mat_idx >= num_materials:
+                    continue
+
+                # Calculate UDIM offset
+                udim_number = 1001 + mat_idx
+                udim_offset = udim_number - 1001
+                udim_offset_u = udim_offset % 10
+                udim_offset_v = udim_offset // 10
+
+                # Move UVs
+                for loop in face.loops:
+                    uv = loop[uv_layer].uv
+                    uv.x += udim_offset_u
+                    uv.y += udim_offset_v
+
+                material_counts[mat_idx] = material_counts.get(mat_idx, 0) + 1
+
+            # Update mesh
+            bm.to_mesh(obj.data)
+            obj.data.update()
+        finally:
+            bm.free()
+
         # Print statistics
         for mat_idx, count in sorted(material_counts.items()):
             udim_number = 1001 + mat_idx
             print(f"  UDIM {udim_number}: {count} polygons moved")
-        
+
         print(f"✅ UV coordinates moved to UDIM tiles")
 
 
@@ -791,13 +793,16 @@ class AGR_OT_AddToUDIM(Operator):
                 if source_path and os.path.exists(source_path):
                     udim_filename = get_udim_texture_name(address, obj_type, tex_type, udim_number)
                     target_path = udim_dir / udim_filename
-                    
+
                     try:
                         shutil.copy2(source_path, target_path)
                         print(f"    {tex_type}: {os.path.basename(source_path)} -> {udim_filename}")
                     except Exception as e:
                         print(f"    ❌ Error copying {tex_type}: {e}")
                         success = False
+                else:
+                    print(f"    ⚠️ Missing {tex_type} texture for UDIM {udim_number}")
+                    success = False
             
             if success:
                 added_count += 1
@@ -1208,7 +1213,11 @@ class AGR_OT_RevertUDIM(Operator):
         # Create materials from mapping
         udim_to_material = {}
         
-        for tile_info in mapping['udim_tiles']:
+        udim_tiles = mapping.get('udim_tiles', [])
+        if not udim_tiles:
+            print("⚠️ JSON mapping has no 'udim_tiles' key or it is empty")
+            return {'CANCELLED'}
+        for tile_info in udim_tiles:
             udim_number = tile_info['udim_number']
             set_name = tile_info['set_name']
             material_name = tile_info['material_name']
