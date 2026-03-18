@@ -1256,8 +1256,9 @@ class AGR_OT_SimpleBakeAll(Operator):
         # Save selection context
         original_selection = list(context.selected_objects)
         original_active = context.active_object
-        print(f"💾 Saved selection: {len(original_selection)} objects, active: {original_active.name if original_active else 'None'}")
-        
+        original_mode = original_active.mode if original_active else 'OBJECT'
+        print(f"💾 Saved selection: {len(original_selection)} objects, active: {original_active.name if original_active else 'None'}, mode: {original_mode}")
+
         # Ensure we're in OBJECT mode before baking
         if context.active_object and context.active_object.mode != 'OBJECT':
             try:
@@ -1403,8 +1404,16 @@ class AGR_OT_SimpleBakeAll(Operator):
                     bpy.data.objects[obj.name].select_set(True)
             if original_active and original_active.name in bpy.data.objects:
                 context.view_layer.objects.active = bpy.data.objects[original_active.name]
+
+                if original_mode != 'OBJECT':
+                    try:
+                        bpy.ops.object.mode_set(mode=original_mode)
+                        print(f"🔄 Restored mode: {original_mode}")
+                    except Exception as e:
+                        print(f"⚠️ Could not restore mode {original_mode}: {e}")
+
             print(f"🔄 Restored selection: {len(original_selection)} objects")
-        
+
         return {'FINISHED'}
 
 
