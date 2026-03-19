@@ -124,7 +124,7 @@ class AGR_BakerSettings(PropertyGroup):
     bake_normal_enabled: BoolProperty(
         name="Bake Normal from High-Poly",
         description="Bake normal map from high-poly objects (if disabled, creates flat normal)",
-        default=True
+        default=False
     )
     
     
@@ -173,7 +173,7 @@ class AGR_BakerSettings(PropertyGroup):
     show_sets_list: BoolProperty(
         name="Texture Sets List",
         description="Show texture sets list",
-        default=True
+        default=False
     )
 
     show_batch_ops: BoolProperty(

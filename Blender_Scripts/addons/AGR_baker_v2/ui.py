@@ -94,6 +94,7 @@ class AGR_PT_MainPanel(Panel):
         row = box.row()
         row.scale_y = 1.5
         row.operator("agr.bake_textures", text="Bake from High-Poly", icon='RENDER_STILL')
+        box.separator()
 
         # Simple bake (from material)
         row = box.row()
@@ -103,17 +104,17 @@ class AGR_PT_MainPanel(Panel):
         # Simple bake all materials
         row = box.row()
         row.scale_y = 1.3
-        row.operator("agr.simple_bake_all", text="Simple Bake All Materials", icon='MATERIAL_DATA')
+        row.operator("agr.simple_bake_all", text="Simple Bake All Materials", icon='MATERIAL')
 
         # Convert materials to sets
         box.separator()
         row = box.row()
         row.scale_y = 1.2
-        row.operator("agr.convert_materials_to_sets", text="Convert Materials to Sets", icon='IMPORT')
+        row.operator("agr.convert_active_material_to_set", text="Convert Active Material", icon='MATERIAL')
 
         row = box.row()
         row.scale_y = 1.2
-        row.operator("agr.convert_active_material_to_set", text="Convert Active Material", icon='MATERIAL')
+        row.operator("agr.convert_materials_to_sets", text="Convert Materials to Sets", icon='MATERIAL')
 
         # Pillow installation check
         try:
@@ -161,39 +162,6 @@ class AGR_PT_TextureSetsPanel(Panel):
         # Texture sets list
         box = layout.box()
 
-        # --- Sort & Select (collapsible, inside main box) ---
-        sort_header = box.row()
-        sort_header.prop(settings, "show_sort_select",
-                         icon='TRIA_DOWN' if settings.show_sort_select else 'TRIA_RIGHT',
-                         text="Sort & Select", emboss=False)
-
-        if settings.show_sort_select:
-            sort_box = box.box()
-
-            # Sort buttons
-            sort_row = sort_box.row(align=True)
-            sort_row.label(text="Sort:")
-            sort_row.operator("agr.sort_sets_by_name", text="Name", depress=(settings.sets_sort_mode == 'NAME'))
-            sort_row.operator("agr.sort_sets_by_resolution", text="Res", depress=(settings.sets_sort_mode == 'RESOLUTION'))
-            sort_row.operator("agr.sort_sets_by_alpha", text="Alpha", depress=(settings.sets_sort_mode == 'ALPHA'))
-
-            # Selection buttons
-            sel_row = sort_box.row(align=True)
-            sel_row.label(text="Select:")
-            op = sel_row.operator("agr.select_all_sets", text="All")
-            op.action = 'SELECT'
-            op = sel_row.operator("agr.select_all_sets", text="None")
-            op.action = 'DESELECT'
-
-            sel_row2 = sort_box.row(align=True)
-            sel_row2.operator("agr.select_sets_with_alpha", text="With Alpha", icon='IMAGE_ALPHA')
-            sel_row2.operator("agr.select_sets_by_resolution", text="By Res", icon='TEXTURE')
-            sel_row2.operator("agr.select_sets_with_frame", text="Frame", icon='IMAGE_PLANE')
-
-            sel_row3 = sort_box.row(align=True)
-            sel_row3.operator("agr.select_sets_for_object", text="For Active", icon='OBJECT_DATA')
-            sel_row3.operator("agr.select_set_for_active_material", text="For Active Mat", icon='MATERIAL')
-
         # Count selected
         selected_count = sum(1 for ts in context.scene.agr_texture_sets if ts.is_selected)
         header_text = f"Sets ({len(context.scene.agr_texture_sets)})"
@@ -206,15 +174,53 @@ class AGR_PT_TextureSetsPanel(Panel):
                          icon='TRIA_DOWN' if settings.show_sets_list else 'TRIA_RIGHT',
                          text=header_text, emboss=False)
 
-        if settings.show_sets_list and len(context.scene.agr_texture_sets) > 0:
-            box.template_list(
-                "AGR_UL_TextureSetsList", "",
-                context.scene, "agr_texture_sets",
-                context.scene, "agr_texture_sets_index",
-                rows=5
-            )
+        if settings.show_sets_list:
+            if len(context.scene.agr_texture_sets) > 0:
+                box.template_list(
+                    "AGR_UL_TextureSetsList", "",
+                    context.scene, "agr_texture_sets",
+                    context.scene, "agr_texture_sets_index",
+                    rows=5
+                )
+            else:
+                box.label(text="No texture sets found", icon='INFO')
+                box.label(text="Bake textures or refresh list")
 
-        # --- Batch Operations (collapsible, independent of list) ---
+        # --- Sort & Select (collapsible, hidden if no sets) ---
+        if len(context.scene.agr_texture_sets) > 0:
+            sort_header = box.row()
+            sort_header.prop(settings, "show_sort_select",
+                             icon='TRIA_DOWN' if settings.show_sort_select else 'TRIA_RIGHT',
+                             text="Sort & Select", emboss=False)
+
+            if settings.show_sort_select:
+                sort_box = box.box()
+
+                # Sort buttons
+                sort_row = sort_box.row(align=True)
+                sort_row.label(text="Sort:")
+                sort_row.operator("agr.sort_sets_by_name", text="Name", depress=(settings.sets_sort_mode == 'NAME'))
+                sort_row.operator("agr.sort_sets_by_resolution", text="Res", depress=(settings.sets_sort_mode == 'RESOLUTION'))
+                sort_row.operator("agr.sort_sets_by_alpha", text="Alpha", depress=(settings.sets_sort_mode == 'ALPHA'))
+
+                # Selection buttons
+                sel_row = sort_box.row(align=True)
+                sel_row.label(text="Select:")
+                op = sel_row.operator("agr.select_all_sets", text="All")
+                op.action = 'SELECT'
+                op = sel_row.operator("agr.select_all_sets", text="None")
+                op.action = 'DESELECT'
+
+                sel_row2 = sort_box.row(align=True)
+                sel_row2.operator("agr.select_sets_with_alpha", text="With Alpha", icon='IMAGE_ALPHA')
+                sel_row2.operator("agr.select_sets_by_resolution", text="By Res", icon='TEXTURE')
+                sel_row2.operator("agr.select_sets_with_frame", text="Frame", icon='IMAGE_PLANE')
+
+                sel_row3 = sort_box.row(align=True)
+                sel_row3.operator("agr.select_sets_for_object", text="For Active", icon='OBJECT_DATA')
+                sel_row3.operator("agr.select_set_for_active_material", text="For Active Mat", icon='MATERIAL')
+
+        # --- Batch Operations (collapsible, hidden if no sets) ---
         if len(context.scene.agr_texture_sets) > 0:
             batch_header = box.row()
             batch_header.prop(settings, "show_batch_ops",
@@ -273,30 +279,6 @@ class AGR_PT_TextureSetsPanel(Panel):
             # Atlas settings
             atlas_box.prop(settings, "atlas_size", text="Atlas Size")
 
-            # --- Atlas from Selected Sets (collapsible) ---
-            sel_atlas_header = atlas_box.row()
-            sel_atlas_header.prop(settings, "show_atlas_from_selected",
-                                  icon='TRIA_DOWN' if settings.show_atlas_from_selected else 'TRIA_RIGHT',
-                                  text="Atlas from Selected Sets", emboss=False)
-
-            if settings.show_atlas_from_selected:
-                selected_non_atlas = sum(1 for ts in context.scene.agr_texture_sets if ts.is_selected and not ts.is_atlas)
-
-                if selected_non_atlas > 0:
-                    atlas_box.label(text=f"Selected: {selected_non_atlas} sets", icon='CHECKBOX_HLT')
-                    atlas_box.operator("agr.preview_atlas_layout", text="Preview Atlas Layout", icon='HIDE_OFF')
-                    atlas_box.operator("agr.create_atlas_only", text="Create Atlas Only", icon='IMAGE_PLANE')
-
-                    if context.active_object:
-                        try:
-                            from .operators_atlas import process_object_name
-                            address, obj_type = process_object_name(context.active_object.name)
-                            atlas_box.label(text=f"Active: {obj_type} ({address})", icon='OBJECT_DATA')
-                        except Exception:
-                            atlas_box.label(text=f"Active: {context.active_object.name}", icon='OBJECT_DATA')
-                else:
-                    atlas_box.label(text="Select texture sets to create atlas", icon='INFO')
-
             # Preview and create atlas from active object materials
             atlas_box.separator()
             if context.active_object and context.active_object.type == 'MESH' and len(context.active_object.material_slots) > 0:
@@ -323,6 +305,31 @@ class AGR_PT_TextureSetsPanel(Panel):
                 row = atlas_box.row()
                 row.enabled = False
                 row.operator("agr.unpack_atlas_to_materials", text="Unpack Atlas to Materials", icon='LOOP_BACK')
+
+            # --- Atlas from Selected Sets (collapsible, at bottom) ---
+            atlas_box.separator()
+            sel_atlas_header = atlas_box.row()
+            sel_atlas_header.prop(settings, "show_atlas_from_selected",
+                                  icon='TRIA_DOWN' if settings.show_atlas_from_selected else 'TRIA_RIGHT',
+                                  text="Atlas from Selected Sets", emboss=False)
+
+            if settings.show_atlas_from_selected:
+                selected_non_atlas = sum(1 for ts in context.scene.agr_texture_sets if ts.is_selected and not ts.is_atlas)
+
+                if selected_non_atlas > 0:
+                    atlas_box.label(text=f"Selected: {selected_non_atlas} sets", icon='CHECKBOX_HLT')
+                    atlas_box.operator("agr.preview_atlas_layout", text="Preview Atlas Layout", icon='HIDE_OFF')
+                    atlas_box.operator("agr.create_atlas_only", text="Create Atlas Only", icon='IMAGE_PLANE')
+
+                    if context.active_object:
+                        try:
+                            from .operators_atlas import process_object_name
+                            address, obj_type = process_object_name(context.active_object.name)
+                            atlas_box.label(text=f"Active: {obj_type} ({address})", icon='OBJECT_DATA')
+                        except Exception:
+                            atlas_box.label(text=f"Active: {context.active_object.name}", icon='OBJECT_DATA')
+                else:
+                    atlas_box.label(text="Select texture sets to create atlas", icon='INFO')
 
         # --- UDIM Operations (collapsible, inside main box) ---
         box.separator()
@@ -370,10 +377,6 @@ class AGR_PT_TextureSetsPanel(Panel):
                 row = udim_box.row()
                 row.enabled = False
                 row.operator("agr.revert_udim", text="Disassemble UDIM", icon='LOOP_BACK')
-
-        if settings.show_sets_list and len(context.scene.agr_texture_sets) == 0:
-            box.label(text="No texture sets found", icon='INFO')
-            box.label(text="Bake textures or refresh list")
 
 
 class AGR_PT_RenamePanel(Panel):

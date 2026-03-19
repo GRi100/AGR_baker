@@ -2,3 +2,5 @@ materials/
 CLAUDE.md
 .claude/
 __pycache__/
+make_zip.py
+AGR_baker_v2.zip
