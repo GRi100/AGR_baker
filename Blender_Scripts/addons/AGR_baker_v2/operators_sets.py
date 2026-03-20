@@ -120,11 +120,8 @@ class AGR_OT_ResizeTextureSet(Operator):
             if material_name in bpy.data.materials:
                 material = bpy.data.materials[material_name]
                 print(f"🔗 Reconnecting textures to material {material_name}...")
-                materials.connect_texture_set_to_material(
-                    material,
-                    folder_path,
-                    material_name
-                )
+                if not materials.connect_texture_set_to_material(material, folder_path, material_name):
+                    materials.connect_regular_texture_set_to_material(material, folder_path, material_name)
         
         # Refresh texture sets list
         texture_sets.refresh_texture_sets_list(context)
@@ -162,37 +159,77 @@ class AGR_OT_ConnectSetToMaterial(Operator):
     
     def execute(self, context):
         texture_sets_list = context.scene.agr_texture_sets
-        
-        # Get all selected sets
-        selected_sets = [tex_set for tex_set in texture_sets_list if tex_set.is_selected]
-        
-        if len(selected_sets) == 0:
+        selected_sets = [ts for ts in texture_sets_list if ts.is_selected]
+
+        if not selected_sets:
             self.report({'WARNING'}, "No texture sets selected")
             return {'CANCELLED'}
-        
-        connected_count = 0
-        
+
+        # Validate ALL sets before making any changes
+        errors = {}
+        for tex_set in selected_sets:
+            missing = materials.validate_high_mode(tex_set.folder_path, tex_set.material_name)
+            if missing:
+                errors[tex_set.material_name] = missing
+
+        if errors:
+            names = ', '.join(f"{name} (no {', '.join(m)})" for name, m in errors.items())
+            self.report({'ERROR'}, f"Missing HIGH textures: {names}")
+            return {'CANCELLED'}
+
+        # All validated — now connect
         for tex_set in selected_sets:
             material_name = tex_set.material_name
-            
-            # Find or create material
             if material_name in bpy.data.materials:
                 material = bpy.data.materials[material_name]
             else:
                 material = bpy.data.materials.new(name=material_name)
-            
-            # Connect texture set
-            materials.connect_texture_set_to_material(
-                material,
-                tex_set.folder_path,
-                material_name
-            )
-            
-            # Update assignment flag
+
+            materials.connect_texture_set_to_material(material, tex_set.folder_path, material_name)
             tex_set.is_assigned = True
-            connected_count += 1
-        
-        self.report({'INFO'}, f"Connected {connected_count} sets to materials")
+
+        self.report({'INFO'}, f"Connected {len(selected_sets)} sets to materials")
+        return {'FINISHED'}
+
+
+class AGR_OT_ConnectRegularSetToMaterial(Operator):
+    """Connect selected texture sets to materials using regular (separate) textures"""
+    bl_idname = "agr.connect_regular_set_to_material"
+    bl_label = "Connect Regular Textures to Materials"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        texture_sets_list = context.scene.agr_texture_sets
+        selected_sets = [ts for ts in texture_sets_list if ts.is_selected]
+
+        if not selected_sets:
+            self.report({'WARNING'}, "No texture sets selected")
+            return {'CANCELLED'}
+
+        # Validate ALL sets before making any changes
+        errors = {}
+        for tex_set in selected_sets:
+            missing = materials.validate_regular_mode(tex_set.folder_path, tex_set.material_name)
+            if missing:
+                errors[tex_set.material_name] = missing
+
+        if errors:
+            names = ', '.join(f"{name} (no {', '.join(m)})" for name, m in errors.items())
+            self.report({'ERROR'}, f"Missing regular textures: {names}")
+            return {'CANCELLED'}
+
+        # All validated — now connect
+        for tex_set in selected_sets:
+            material_name = tex_set.material_name
+            if material_name in bpy.data.materials:
+                material = bpy.data.materials[material_name]
+            else:
+                material = bpy.data.materials.new(name=material_name)
+
+            materials.connect_regular_texture_set_to_material(material, tex_set.folder_path, material_name)
+            tex_set.is_assigned = True
+
+        self.report({'INFO'}, f"Connected {len(selected_sets)} sets with regular textures")
         return {'FINISHED'}
 
 
@@ -229,13 +266,10 @@ class AGR_OT_AssignSetToActiveObject(Operator):
             else:
                 material = bpy.data.materials.new(name=material_name)
                 
-            # Connect texture set
-            materials.connect_texture_set_to_material(
-                material,
-                tex_set.folder_path,
-                material_name
-            )
-            
+            # Connect texture set (try HIGH, fallback to regular)
+            if not materials.connect_texture_set_to_material(material, tex_set.folder_path, material_name):
+                materials.connect_regular_texture_set_to_material(material, tex_set.folder_path, material_name)
+
             # Check if material already on object
             already_assigned = False
             for slot in obj.material_slots:
@@ -284,13 +318,10 @@ class AGR_OT_LoadSetsFromFolder(Operator):
             if material_name in bpy.data.materials:
                 material = bpy.data.materials[material_name]
                 
-                # Connect texture set
-                materials.connect_texture_set_to_material(
-                    material,
-                    tex_set.folder_path,
-                    material_name
-                )
-                
+                # Connect texture set (try HIGH, fallback to regular)
+                if not materials.connect_texture_set_to_material(material, tex_set.folder_path, material_name):
+                    materials.connect_regular_texture_set_to_material(material, tex_set.folder_path, material_name)
+
                 tex_set.is_assigned = True
                 connected_count += 1
                 print(f"✅ Connected S_{material_name} to existing material")
@@ -858,12 +889,8 @@ class AGR_OT_GaussianBlurSet(Operator):
                     if material_name in bpy.data.materials:
                         material = bpy.data.materials[material_name]
                         print(f"  🔗 Reconnecting textures to material...")
-                        
-                        materials.connect_texture_set_to_material(
-                            material,
-                            folder_path,
-                            material_name
-                        )
+                        if not materials.connect_texture_set_to_material(material, folder_path, material_name):
+                            materials.connect_regular_texture_set_to_material(material, folder_path, material_name)
                         print(f"  ✅ Reconnected textures to material")
                     
                     processed_count += 1
@@ -908,6 +935,7 @@ classes = (
     AGR_OT_RefreshTextureSets,
     AGR_OT_ResizeTextureSet,
     AGR_OT_ConnectSetToMaterial,
+    AGR_OT_ConnectRegularSetToMaterial,
     AGR_OT_AssignSetToActiveObject,
     AGR_OT_LoadSetsFromFolder,
     AGR_OT_DeleteSelectedSets,

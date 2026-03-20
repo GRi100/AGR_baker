@@ -17,7 +17,7 @@ except ImportError:
     PILLOW_AVAILABLE = False
 
 # Import material utilities
-from .core.materials import connect_texture_set_to_material
+from .core.materials import connect_texture_set_to_material, connect_regular_texture_set_to_material
 
 
 # ===== HELPER FUNCTIONS =====
@@ -2116,10 +2116,8 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 )
                 if tex_do:
                     links.new(tex_do.outputs['Color'], bsdf.inputs['Base Color'])
-                    if 'OPACITY' in created_atlases:
-                        # Есть альфа-канал
-                        links.new(tex_do.outputs['Alpha'], bsdf.inputs['Alpha'])
-                        material.blend_method = 'HASHED'
+                    links.new(tex_do.outputs['Color'], bsdf.inputs['Emission Color'])
+                    links.new(tex_do.outputs['Alpha'], bsdf.inputs['Alpha'])
             
             # ERM - используем уже созданную объединенную текстуру
             if 'ERM' in created_atlases:
@@ -2833,14 +2831,16 @@ class AGR_OT_UnpackAtlasToMaterials(Operator):
                 
                 # Если нет правильной настройки, переподключаем
                 if not has_proper_setup and mat_texture_set:
-                    connect_texture_set_to_material(material, mat_texture_set.folder_path, mat_texture_set.material_name)
+                    if not connect_texture_set_to_material(material, mat_texture_set.folder_path, mat_texture_set.material_name):
+                        connect_regular_texture_set_to_material(material, mat_texture_set.folder_path, mat_texture_set.material_name)
                     print(f"  🔄 Обновлен материал: {mat_name}")
             else:
                 material = bpy.data.materials.new(name=mat_name)
-                
+
                 # Если есть texture set, создаем материал с текстурами
                 if mat_texture_set:
-                    connect_texture_set_to_material(material, mat_texture_set.folder_path, mat_texture_set.material_name)
+                    if not connect_texture_set_to_material(material, mat_texture_set.folder_path, mat_texture_set.material_name):
+                        connect_regular_texture_set_to_material(material, mat_texture_set.folder_path, mat_texture_set.material_name)
                     print(f"  ✅ Создан материал: {mat_name}")
                 else:
                     print(f"  ⚠️ Создан пустой материал: {mat_name} (texture set не найден)")

@@ -67,7 +67,7 @@ class AGR_PT_MainPanel(Panel):
 
         # Header
         box = layout.box()
-        box.label(text="Texture Baking", icon='RENDER_STILL')
+        box.label(text="Bake settings:", icon='RENDER_STILL')
 
         # Baking settings
         col = box.column(align=True)
@@ -99,7 +99,7 @@ class AGR_PT_MainPanel(Panel):
         # Simple bake (from material)
         row = box.row()
         row.scale_y = 1.3
-        row.operator("agr.simple_bake", text="Simple Bake Active Material", icon='MATERIAL')
+        row.operator("agr.simple_bake", text="Simple Bake Material", icon='MATERIAL')
 
         # Simple bake all materials
         row = box.row()
@@ -114,7 +114,7 @@ class AGR_PT_MainPanel(Panel):
 
         row = box.row()
         row.scale_y = 1.2
-        row.operator("agr.convert_materials_to_sets", text="Convert Materials to Sets", icon='MATERIAL')
+        row.operator("agr.convert_materials_to_sets", text="Convert All Materials", icon='MATERIAL')
 
         # Pillow installation check
         try:
@@ -186,7 +186,6 @@ class AGR_PT_TextureSetsPanel(Panel):
                 )
             else:
                 box.label(text="No texture sets found", icon='INFO')
-                box.label(text="Bake textures or refresh list")
 
         # --- Sort & Select (collapsible, hidden if no sets) ---
         if sets_count > 0:
@@ -234,6 +233,7 @@ class AGR_PT_TextureSetsPanel(Panel):
 
                 # Connect and assign (most frequent)
                 batch_box.operator("agr.connect_set_to_material", text="Connect to Materials", icon='LINKED')
+                batch_box.operator("agr.connect_regular_set_to_material", text="Connect Regular to Materials", icon='LINKED')
 
                 if context.active_object and context.active_object.type == 'MESH':
                     batch_box.operator("agr.assign_set_to_active", text="Assign to Active Object", icon='OBJECT_DATA')
@@ -241,12 +241,12 @@ class AGR_PT_TextureSetsPanel(Panel):
                 batch_box.separator()
 
                 # Resize, blur, frame
-                batch_box.operator("agr.resize_texture_set", text="Resize Selected Sets", icon='IMAGE_DATA')
-                batch_box.operator("agr.gaussian_blur_set", text="Gaussian Blur on Selected", icon='BRUSH_DATA')
+                batch_box.operator("agr.resize_texture_set", text="Resize Sets", icon='IMAGE_DATA')
+                batch_box.operator("agr.gaussian_blur_set", text="Gaussian Blur", icon='BRUSH_DATA')
 
                 batch_box.separator()
 
-                batch_box.operator("agr.create_frame_on_sets", text="Create Frame on Selected", icon='IMAGE_PLANE')
+                batch_box.operator("agr.create_frame_on_sets", text="Create Frame", icon='IMAGE_PLANE')
                 batch_box.operator("agr.create_frame_on_files", text="Create Frame on Files...", icon='FILEBROWSER')
 
                 # --- Delete Operations (collapsible, nested) ---
@@ -396,9 +396,9 @@ class AGR_PT_RenamePanel(Panel):
 
         # Address input
         box = layout.box()
-        box.label(text="Настройки", icon='SETTINGS')
+        box.label(text="Settings", icon='SETTINGS')
         box.prop(scene, "agr_rename_address", text="Address")
-        box.prop(scene, "agr_rp_project_lowpoly_number", text="Lowpoly Number (4 цифры)")
+        box.prop(scene, "agr_rp_project_lowpoly_number", text="Lowpoly Number")
 
         layout.separator()
 

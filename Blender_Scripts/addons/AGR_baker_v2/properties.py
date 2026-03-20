@@ -116,13 +116,13 @@ class AGR_BakerSettings(PropertyGroup):
     )
     
     bake_with_alpha: BoolProperty(
-        name="Bake with Alpha",
+        name="Bake Alpha",
         description="Bake diffuse with alpha channel",
         default=False
     )
     
     bake_normal_enabled: BoolProperty(
-        name="Bake Normal from High-Poly",
+        name="Bake Normal",
         description="Bake normal map from high-poly objects (if disabled, creates flat normal)",
         default=False
     )
@@ -160,7 +160,7 @@ class AGR_BakerSettings(PropertyGroup):
             ('CPU', "CPU", "Use CPU for baking"),
             ('GPU', "GPU", "Use GPU for baking (if available)"),
         ],
-        default='CPU'
+        default='GPU'
     )
     
     bake_use_denoising: BoolProperty(
