@@ -163,8 +163,10 @@ class AGR_PT_TextureSetsPanel(Panel):
         box = layout.box()
 
         # Count selected
-        selected_count = sum(1 for ts in context.scene.agr_texture_sets if ts.is_selected)
-        header_text = f"Sets ({len(context.scene.agr_texture_sets)})"
+        texture_sets = context.scene.agr_texture_sets
+        sets_count = len(texture_sets)
+        selected_count = sum(1 for ts in texture_sets if ts.is_selected)
+        header_text = f"Sets ({sets_count})"
         if selected_count > 0:
             header_text += f"  |  Selected: {selected_count}"
 
@@ -175,7 +177,7 @@ class AGR_PT_TextureSetsPanel(Panel):
                          text=header_text, emboss=False)
 
         if settings.show_sets_list:
-            if len(context.scene.agr_texture_sets) > 0:
+            if sets_count > 0:
                 box.template_list(
                     "AGR_UL_TextureSetsList", "",
                     context.scene, "agr_texture_sets",
@@ -187,7 +189,7 @@ class AGR_PT_TextureSetsPanel(Panel):
                 box.label(text="Bake textures or refresh list")
 
         # --- Sort & Select (collapsible, hidden if no sets) ---
-        if len(context.scene.agr_texture_sets) > 0:
+        if sets_count > 0:
             sort_header = box.row()
             sort_header.prop(settings, "show_sort_select",
                              icon='TRIA_DOWN' if settings.show_sort_select else 'TRIA_RIGHT',
@@ -221,7 +223,7 @@ class AGR_PT_TextureSetsPanel(Panel):
                 sel_row3.operator("agr.select_set_for_active_material", text="For Active Mat", icon='MATERIAL')
 
         # --- Batch Operations (collapsible, hidden if no sets) ---
-        if len(context.scene.agr_texture_sets) > 0:
+        if sets_count > 0:
             batch_header = box.row()
             batch_header.prop(settings, "show_batch_ops",
                               icon='TRIA_DOWN' if settings.show_batch_ops else 'TRIA_RIGHT',
@@ -314,7 +316,7 @@ class AGR_PT_TextureSetsPanel(Panel):
                                   text="Atlas from Selected Sets", emboss=False)
 
             if settings.show_atlas_from_selected:
-                selected_non_atlas = sum(1 for ts in context.scene.agr_texture_sets if ts.is_selected and not ts.is_atlas)
+                selected_non_atlas = sum(1 for ts in texture_sets if ts.is_selected and not ts.is_atlas)
 
                 if selected_non_atlas > 0:
                     atlas_box.label(text=f"Selected: {selected_non_atlas} sets", icon='CHECKBOX_HLT')

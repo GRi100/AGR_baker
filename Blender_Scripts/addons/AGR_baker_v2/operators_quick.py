@@ -17,8 +17,22 @@ _active_quick_mode_instance = None
 # Registered keymaps for cleanup
 addon_keymaps = []
 
-# Resolution enum values matching AGR_BakerSettings.resolution
-RESOLUTION_VALUES = ['64', '128', '256', '512', '1024', '2048', '4096']
+# Cached shader (resolved once on first draw)
+_cached_shader = None
+
+
+def _get_resolution_values():
+    """Extract resolution enum values from AGR_BakerSettings.resolution property."""
+    prop = bpy.types.Scene.bl_rna.properties['agr_baker_settings'].fixed_type.properties['resolution']
+    return [item.identifier for item in prop.enum_items]
+
+
+def _get_shader():
+    """Get or cache the UNIFORM_COLOR builtin shader."""
+    global _cached_shader
+    if _cached_shader is None:
+        _cached_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    return _cached_shader
 
 
 def _draw_viewport_hints_callback(operator, context):
@@ -37,11 +51,21 @@ class AGR_OT_QuickMode(Operator):
 
         # Close previous instance if any
         if _active_quick_mode_instance is not None:
-            try:
-                _active_quick_mode_instance._is_finished = True
-                _active_quick_mode_instance.finish_modal(context)
-            except Exception:
-                pass
+            prev = _active_quick_mode_instance
+            prev._is_finished = True
+            # Clean up draw handler and timer even if finish_modal fails partially
+            if prev._handle:
+                try:
+                    bpy.types.SpaceView3D.draw_handler_remove(prev._handle, 'WINDOW')
+                except Exception:
+                    pass
+                prev._handle = None
+            if prev._timer:
+                try:
+                    context.window_manager.event_timer_remove(prev._timer)
+                except Exception:
+                    pass
+                prev._timer = None
             _active_quick_mode_instance = None
 
         # Only works in 3D Viewport
@@ -62,10 +86,8 @@ class AGR_OT_QuickMode(Operator):
             _draw_viewport_hints_callback, args, 'WINDOW', 'POST_PIXEL'
         )
 
-        # Timer for periodic redraws
-        self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
-
         context.window_manager.modal_handler_add(self)
+        context.area.tag_redraw()
         self.report({'INFO'}, "AGR Quick Mode activated")
         return {'RUNNING_MODAL'}
 
@@ -73,15 +95,14 @@ class AGR_OT_QuickMode(Operator):
         if self._is_finished:
             return {'FINISHED'}
 
-        # Redraw viewport for HUD updates
-        context.area.tag_redraw()
-
         # --- Mouse wheel: resolution ---
         if event.type == 'WHEELUPMOUSE':
             self.change_resolution(context, 1)
+            context.area.tag_redraw()
             return {'RUNNING_MODAL'}
         elif event.type == 'WHEELDOWNMOUSE':
             self.change_resolution(context, -1)
+            context.area.tag_redraw()
             return {'RUNNING_MODAL'}
 
         # --- Q: Bake from high poly ---
@@ -93,14 +114,18 @@ class AGR_OT_QuickMode(Operator):
 
         # --- E: Convert material ---
         elif event.type == 'E' and event.value == 'PRESS':
-            if self.quick_convert(context, event):
+            if self._run_operator_pair(context, event,
+                    'agr.convert_materials_to_sets',
+                    'agr.convert_active_material_to_set'):
                 self.finish_modal(context)
                 return {'FINISHED'}
             return {'RUNNING_MODAL'}
 
         # --- R: Simple bake ---
         elif event.type == 'R' and event.value == 'PRESS':
-            if self.quick_simple_bake(context, event):
+            if self._run_operator_pair(context, event,
+                    'agr.simple_bake_all',
+                    'agr.simple_bake'):
                 self.finish_modal(context)
                 return {'FINISHED'}
             return {'RUNNING_MODAL'}
@@ -108,15 +133,19 @@ class AGR_OT_QuickMode(Operator):
         # --- WASD: Parameter tuning ---
         elif event.type == 'W' and event.value == 'PRESS':
             self.change_ray_distance(context, 0.01)
+            context.area.tag_redraw()
             return {'RUNNING_MODAL'}
         elif event.type == 'S' and event.value == 'PRESS':
             self.change_ray_distance(context, -0.01)
+            context.area.tag_redraw()
             return {'RUNNING_MODAL'}
         elif event.type == 'A' and event.value == 'PRESS':
             self.change_extrusion(context, -0.01)
+            context.area.tag_redraw()
             return {'RUNNING_MODAL'}
         elif event.type == 'D' and event.value == 'PRESS':
             self.change_extrusion(context, 0.01)
+            context.area.tag_redraw()
             return {'RUNNING_MODAL'}
 
         # --- Exit ---
@@ -153,15 +182,16 @@ class AGR_OT_QuickMode(Operator):
         """Cycle resolution through enum values."""
         settings = context.scene.agr_baker_settings
         current_res = settings.resolution
+        res_values = _get_resolution_values()
 
         try:
-            idx = RESOLUTION_VALUES.index(current_res)
+            idx = res_values.index(current_res)
         except ValueError:
-            idx = RESOLUTION_VALUES.index('1024')
+            idx = res_values.index('1024')
 
-        new_idx = max(0, min(len(RESOLUTION_VALUES) - 1, idx + direction))
+        new_idx = max(0, min(len(res_values) - 1, idx + direction))
         if new_idx != idx:
-            settings.resolution = RESOLUTION_VALUES[new_idx]
+            settings.resolution = res_values[new_idx]
 
     def change_ray_distance(self, context, delta):
         """Adjust max_ray_distance by delta (clamped to >= 0)."""
@@ -175,6 +205,21 @@ class AGR_OT_QuickMode(Operator):
 
     # ── Action methods ──────────────────────────────────────────
 
+    def _run_operator_pair(self, context, event, shift_op, default_op):
+        """Run one of two operators based on Shift modifier.
+
+        Shift: run shift_op (all). Default: run default_op (active only).
+        Returns True on success, False on cancel/error.
+        """
+        op_id = shift_op if event.shift else default_op
+        try:
+            module, name = op_id.split('.')
+            result = getattr(getattr(bpy.ops, module), name)()
+            return result != {'CANCELLED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return False
+
     def quick_bake(self, context, event):
         """Bake from high poly with modifier-driven normal/alpha settings.
 
@@ -184,19 +229,6 @@ class AGR_OT_QuickMode(Operator):
         Modifiers combine (Ctrl+Alt = both).
         """
         settings = context.scene.agr_baker_settings
-
-        # Validate selection for selected-to-active
-        if not context.active_object or context.active_object.type != 'MESH':
-            self.report({'ERROR'}, "No active mesh object")
-            return False
-        if len(context.active_object.material_slots) != 1:
-            self.report({'ERROR'}, "Active object must have exactly 1 material")
-            return False
-        other_meshes = [o for o in context.selected_objects
-                        if o != context.active_object and o.type == 'MESH']
-        if not other_meshes:
-            self.report({'ERROR'}, "Select high-poly source objects")
-            return False
 
         # Save original settings
         orig_normal = settings.bake_normal_enabled
@@ -227,54 +259,7 @@ class AGR_OT_QuickMode(Operator):
 
         return success
 
-    def quick_convert(self, context, event):
-        """Convert material(s) to texture set(s).
-
-        Default: active material only.
-        Shift: all materials.
-        """
-        if not context.active_object or context.active_object.type != 'MESH':
-            self.report({'ERROR'}, "No active mesh object")
-            return False
-
-        try:
-            if event.shift:
-                result = bpy.ops.agr.convert_materials_to_sets()
-            else:
-                result = bpy.ops.agr.convert_active_material_to_set()
-            return result != {'CANCELLED'}
-        except Exception as e:
-            self.report({'ERROR'}, str(e))
-            return False
-
-    def quick_simple_bake(self, context, event):
-        """Simple bake from material.
-
-        Default: active material only.
-        Shift: all materials.
-        """
-        if not context.active_object or context.active_object.type != 'MESH':
-            self.report({'ERROR'}, "No active mesh object")
-            return False
-
-        try:
-            if event.shift:
-                result = bpy.ops.agr.simple_bake_all()
-            else:
-                result = bpy.ops.agr.simple_bake()
-            return result != {'CANCELLED'}
-        except Exception as e:
-            self.report({'ERROR'}, str(e))
-            return False
-
     # ── HUD rendering ───────────────────────────────────────────
-
-    def set_blf_size(self, font_id, font_size):
-        """Blender version-compatible blf.size wrapper."""
-        try:
-            blf.size(font_id, font_size)
-        except TypeError:
-            blf.size(font_id, font_size, 72)
 
     def draw_viewport_hints(self, context):
         """Draw HUD overlay in the bottom-right corner of the viewport."""
@@ -329,7 +314,7 @@ class AGR_OT_QuickMode(Operator):
         ]
 
         # Compute background dimensions
-        self.set_blf_size(font_id, font_size)
+        blf.size(font_id, font_size)
         max_text_width = max(blf.dimensions(font_id, text)[0] for text, _ in hints if text)
         bg_width = max_text_width + 30
         bg_height = len(hints) * line_height + 30
@@ -341,15 +326,11 @@ class AGR_OT_QuickMode(Operator):
             y_offset = height - bg_height - 10
 
         # Draw background
-        try:
-            self.draw_background_rect(
-                x_offset - 15, y_offset - 15, bg_width, bg_height, bg_color
-            )
-        except Exception:
-            pass
+        self.draw_background_rect(
+            x_offset - 15, y_offset - 15, bg_width, bg_height, bg_color
+        )
 
         # Draw text lines
-        self.set_blf_size(font_id, font_size)
         current_y = y_offset + bg_height - 40
 
         for text, color in hints:
@@ -361,37 +342,25 @@ class AGR_OT_QuickMode(Operator):
 
     def draw_background_rect(self, x, y, width, height, color):
         """Draw a semi-transparent rectangle behind HUD text."""
-        try:
-            vertices = [
-                (x, y),
-                (x + width, y),
-                (x + width, y + height),
-                (x, y + height),
-            ]
-            indices = [(0, 1, 2), (2, 3, 0)]
+        shader = _get_shader()
+        if shader is None:
+            return
 
-            # Try multiple shader names for Blender version compatibility
-            shader = None
-            for name in ('UNIFORM_COLOR', 'FLAT_COLOR', '2D_UNIFORM_COLOR'):
-                try:
-                    shader = gpu.shader.from_builtin(name)
-                    break
-                except ValueError:
-                    continue
+        vertices = [
+            (x, y),
+            (x + width, y),
+            (x + width, y + height),
+            (x, y + height),
+        ]
+        indices = [(0, 1, 2), (2, 3, 0)]
 
-            if shader is None:
-                return
+        batch = batch_for_shader(shader, 'TRIS', {"pos": vertices}, indices=indices)
 
-            batch = batch_for_shader(shader, 'TRIS', {"pos": vertices}, indices=indices)
-
-            gpu.state.blend_set('ALPHA')
-            shader.bind()
-            shader.uniform_float("color", color)
-            batch.draw(shader)
-            gpu.state.blend_set('NONE')
-
-        except Exception:
-            pass
+        gpu.state.blend_set('ALPHA')
+        shader.bind()
+        shader.uniform_float("color", color)
+        batch.draw(shader)
+        gpu.state.blend_set('NONE')
 
 
 # ── Registration ────────────────────────────────────────────────
@@ -419,16 +388,21 @@ def register():
 
 
 def unregister():
-    global _active_quick_mode_instance
+    global _active_quick_mode_instance, _cached_shader
 
     # Close active instance if running
     if _active_quick_mode_instance is not None:
-        try:
-            _active_quick_mode_instance._is_finished = True
-            _active_quick_mode_instance.finish_modal(bpy.context)
-        except Exception:
-            pass
+        prev = _active_quick_mode_instance
+        prev._is_finished = True
+        if prev._handle:
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(prev._handle, 'WINDOW')
+            except Exception:
+                pass
+            prev._handle = None
         _active_quick_mode_instance = None
+
+    _cached_shader = None
 
     # Remove keymaps
     for km, kmi in addon_keymaps:

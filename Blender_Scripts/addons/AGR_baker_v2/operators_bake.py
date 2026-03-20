@@ -747,7 +747,7 @@ class AGR_OT_SimpleBake(Operator):
             # Bake textures from plane (no source objects = simple mode)
             self.bake_material_simple(
                 context, bake_plane, active_material, material_name,
-                set_folder, diffuse_res, pbr_res, normal_res, bake_with_alpha, settings
+                set_folder, diffuse_res, pbr_res, normal_res, bake_with_alpha
             )
             
             # Save texture set info
@@ -805,7 +805,7 @@ class AGR_OT_SimpleBake(Operator):
 
     @staticmethod
     def bake_material_simple(context, bake_plane, material, material_name,
-                            set_folder, diffuse_res, pbr_res, normal_res, bake_with_alpha, settings):
+                            set_folder, diffuse_res, pbr_res, normal_res, bake_with_alpha):
         """Bake all textures from material on plane"""
 
         # Validate single Principled BSDF
@@ -925,33 +925,25 @@ class AGR_OT_SimpleBake(Operator):
                 os.path.join(set_folder, f"T_{material_name}_Emit.png")
             )
             
-            # Bake Normal
+            # Bake Normal (determined by material, not by bake_normal_enabled setting)
             print(f"  📸 Baking Normal at {normal_res}px...")
-            if settings.bake_normal_enabled:
-                # Check if Normal Map exists without texture
-                if baking.check_normal_map_without_texture(material):
-                    # Create 256px stub when Normal Map has no texture
-                    img_normal = baking.create_flat_normal_image(
-                        f"T_{material_name}_Normal", 256
-                    )
-                    print(f"  🔄 Created flat normal stub 256px (Normal Map without texture)")
-                else:
-                    # Bake normally when texture exists or no Normal Map
-                    img_normal = baking.create_texture_image(
-                        f"T_{material_name}_Normal", normal_res
-                    )
-                    img_normal.colorspace_settings.name = 'Non-Color'
-                    baking.bake_texture(
-                        context, bake_plane, [], img_normal,
-                        'NORMAL', 0
-                    )
-                    print(f"  ✅ Baked normal at {normal_res}px")
-            else:
-                # Create flat normal stub when baking disabled
+            if baking.check_normal_map_without_texture(material):
+                # Create 256px stub when Normal Map has no texture
                 img_normal = baking.create_flat_normal_image(
                     f"T_{material_name}_Normal", 256
                 )
-                print(f"  🔄 Created flat normal stub 256px (baking disabled)")
+                print(f"  🔄 Created flat normal stub 256px (Normal Map without texture)")
+            else:
+                # Bake normally when texture exists or no Normal Map
+                img_normal = baking.create_texture_image(
+                    f"T_{material_name}_Normal", normal_res
+                )
+                img_normal.colorspace_settings.name = 'Non-Color'
+                baking.bake_texture(
+                    context, bake_plane, [], img_normal,
+                    'NORMAL', 0
+                )
+                print(f"  ✅ Baked normal at {normal_res}px")
             
             baking.save_texture(
                 img_normal,
@@ -1381,7 +1373,7 @@ class AGR_OT_SimpleBakeAll(Operator):
                     # Bake textures from plane - call static method directly
                     AGR_OT_SimpleBake.bake_material_simple(
                         context, bake_plane, material, material_name,
-                        set_folder, diffuse_res, pbr_res, normal_res, bake_with_alpha, settings
+                        set_folder, diffuse_res, pbr_res, normal_res, bake_with_alpha
                     )
                     
                     # Save texture set info
