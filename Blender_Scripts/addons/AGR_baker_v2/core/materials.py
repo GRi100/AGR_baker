@@ -95,10 +95,25 @@ def validate_high_mode(texture_set_path, material_name):
 
 
 def validate_regular_mode(texture_set_path, material_name):
-    """Check if ALL regular textures exist. Returns list of missing texture names."""
+    """Check if at least one regular texture exists. Returns list of missing texture names."""
     tex_types = ["Diffuse", "Roughness", "Metallic", "Opacity", "Normal"]
     missing = [t for t in tex_types if not os.path.exists(os.path.join(texture_set_path, f"T_{material_name}_{t}.png"))]
     return missing
+
+
+def validate_all_high_mode(selected_sets):
+    """Validate ALL sets have complete HIGH mode textures.
+    Returns (is_valid, error_message). If is_valid=False, error_message lists missing textures."""
+    errors = {}
+    for tex_set in selected_sets:
+        missing = validate_high_mode(tex_set.folder_path, tex_set.material_name)
+        if missing:
+            errors[tex_set.material_name] = missing
+
+    if errors:
+        names = ', '.join(f"{name} (no {', '.join(m)})" for name, m in errors.items())
+        return False, f"Missing HIGH textures: {names}"
+    return True, ""
 
 
 def connect_texture_set_to_material(material, texture_set_path, material_name):
@@ -165,9 +180,10 @@ def connect_regular_texture_set_to_material(material, texture_set_path, material
     Uses individual Diffuse, Roughness, Metallic, Opacity, Normal files.
     Returns None if no regular textures found.
     """
-    # Validate BEFORE clearing nodes
-    if validate_regular_mode(texture_set_path, material_name):
-        print(f"❌ No regular textures found for {material_name}")
+    # Validate BEFORE clearing nodes — ALL textures must exist
+    missing = validate_regular_mode(texture_set_path, material_name)
+    if missing:
+        print(f"❌ Missing regular textures for {material_name}: {missing}")
         return None
 
     print(f"🔧 Connecting regular textures for {material_name}")
@@ -223,3 +239,11 @@ def connect_regular_texture_set_to_material(material, texture_set_path, material
 
     print(f"✅ Regular textures connected to material: {material.name}")
     return material
+
+
+def connect_best_texture_set_to_material(material, texture_set_path, material_name):
+    """Try HIGH mode first, fallback to regular (separate) textures."""
+    result = connect_texture_set_to_material(material, texture_set_path, material_name)
+    if result is None:
+        result = connect_regular_texture_set_to_material(material, texture_set_path, material_name)
+    return result

@@ -61,9 +61,15 @@ class AGR_OT_ResizeTextureSet(Operator):
             self.report({'ERROR'}, "PIL/Pillow not available. Install with: pip install Pillow")
             return {'CANCELLED'}
         
+        # Validate ALL sets have HIGH textures BEFORE any resize
+        is_valid, error_msg = materials.validate_all_high_mode(selected_sets)
+        if not is_valid:
+            self.report({'ERROR'}, error_msg)
+            return {'CANCELLED'}
+
         resized_count = 0
         error_count = 0
-        
+
         for tex_set in selected_sets:
             material_name = tex_set.material_name
             folder_path = tex_set.folder_path
@@ -120,9 +126,8 @@ class AGR_OT_ResizeTextureSet(Operator):
             if material_name in bpy.data.materials:
                 material = bpy.data.materials[material_name]
                 print(f"🔗 Reconnecting textures to material {material_name}...")
-                if not materials.connect_texture_set_to_material(material, folder_path, material_name):
-                    materials.connect_regular_texture_set_to_material(material, folder_path, material_name)
-        
+                materials.connect_texture_set_to_material(material, folder_path, material_name)
+
         # Refresh texture sets list
         texture_sets.refresh_texture_sets_list(context)
         
@@ -165,16 +170,10 @@ class AGR_OT_ConnectSetToMaterial(Operator):
             self.report({'WARNING'}, "No texture sets selected")
             return {'CANCELLED'}
 
-        # Validate ALL sets before making any changes
-        errors = {}
-        for tex_set in selected_sets:
-            missing = materials.validate_high_mode(tex_set.folder_path, tex_set.material_name)
-            if missing:
-                errors[tex_set.material_name] = missing
-
-        if errors:
-            names = ', '.join(f"{name} (no {', '.join(m)})" for name, m in errors.items())
-            self.report({'ERROR'}, f"Missing HIGH textures: {names}")
+        # Validate ALL sets have HIGH textures BEFORE any changes
+        is_valid, error_msg = materials.validate_all_high_mode(selected_sets)
+        if not is_valid:
+            self.report({'ERROR'}, error_msg)
             return {'CANCELLED'}
 
         # All validated — now connect
@@ -253,22 +252,27 @@ class AGR_OT_AssignSetToActiveObject(Operator):
         if len(selected_sets) == 0:
             self.report({'WARNING'}, "No texture sets selected")
             return {'CANCELLED'}
-        
+
+        # Validate ALL sets have HIGH textures BEFORE any changes
+        is_valid, error_msg = materials.validate_all_high_mode(selected_sets)
+        if not is_valid:
+            self.report({'ERROR'}, error_msg)
+            return {'CANCELLED'}
+
         assigned_count = 0
         skipped_count = 0
-        
+
         for tex_set in selected_sets:
             material_name = tex_set.material_name
-            
+
             # Find or create material
             if material_name in bpy.data.materials:
                 material = bpy.data.materials[material_name]
             else:
                 material = bpy.data.materials.new(name=material_name)
-                
-            # Connect texture set (try HIGH, fallback to regular)
-            if not materials.connect_texture_set_to_material(material, tex_set.folder_path, material_name):
-                materials.connect_regular_texture_set_to_material(material, tex_set.folder_path, material_name)
+
+            # Connect texture set (HIGH mode)
+            materials.connect_texture_set_to_material(material, tex_set.folder_path, material_name)
 
             # Check if material already on object
             already_assigned = False
@@ -308,23 +312,29 @@ class AGR_OT_LoadSetsFromFolder(Operator):
             return {'CANCELLED'}
         
         settings = context.scene.agr_baker_settings
-        connected_count = 0
-        
-        # Connect each set to its material
-        for tex_set in context.scene.agr_texture_sets:
-            material_name = tex_set.material_name
-            
-            # Check if material exists
-            if material_name in bpy.data.materials:
-                material = bpy.data.materials[material_name]
-                
-                # Connect texture set (try HIGH, fallback to regular)
-                if not materials.connect_texture_set_to_material(material, tex_set.folder_path, material_name):
-                    materials.connect_regular_texture_set_to_material(material, tex_set.folder_path, material_name)
 
-                tex_set.is_assigned = True
-                connected_count += 1
-                print(f"✅ Connected S_{material_name} to existing material")
+        # Validate ALL sets with existing materials have HIGH textures
+        sets_with_materials = [ts for ts in context.scene.agr_texture_sets
+                               if ts.material_name in bpy.data.materials]
+        if sets_with_materials:
+            is_valid, error_msg = materials.validate_all_high_mode(sets_with_materials)
+            if not is_valid:
+                self.report({'ERROR'}, error_msg)
+                return {'CANCELLED'}
+
+        connected_count = 0
+
+        # Connect each set to its material
+        for tex_set in sets_with_materials:
+            material_name = tex_set.material_name
+            material = bpy.data.materials[material_name]
+
+            # Connect texture set (HIGH mode)
+            materials.connect_texture_set_to_material(material, tex_set.folder_path, material_name)
+
+            tex_set.is_assigned = True
+            connected_count += 1
+            print(f"✅ Connected S_{material_name} to existing material")
         
         self.report({'INFO'}, f"Loaded {count} sets, connected {connected_count} to materials")
         return {'FINISHED'}
@@ -840,9 +850,15 @@ class AGR_OT_GaussianBlurSet(Operator):
             self.report({'ERROR'}, "PIL/Pillow not available. Install with: pip install Pillow")
             return {'CANCELLED'}
         
+        # Validate ALL sets have HIGH textures BEFORE any blur
+        is_valid, error_msg = materials.validate_all_high_mode(selected_sets)
+        if not is_valid:
+            self.report({'ERROR'}, error_msg)
+            return {'CANCELLED'}
+
         processed_count = 0
         error_count = 0
-        
+
         for tex_set in selected_sets:
             material_name = tex_set.material_name
             folder_path = tex_set.folder_path
@@ -889,8 +905,7 @@ class AGR_OT_GaussianBlurSet(Operator):
                     if material_name in bpy.data.materials:
                         material = bpy.data.materials[material_name]
                         print(f"  🔗 Reconnecting textures to material...")
-                        if not materials.connect_texture_set_to_material(material, folder_path, material_name):
-                            materials.connect_regular_texture_set_to_material(material, folder_path, material_name)
+                        materials.connect_texture_set_to_material(material, folder_path, material_name)
                         print(f"  ✅ Reconnected textures to material")
                     
                     processed_count += 1
