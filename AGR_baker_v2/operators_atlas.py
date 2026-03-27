@@ -723,7 +723,8 @@ class AGR_OT_CreateAtlasOnly(Operator):
                 with Image.open(filepath) as raw_d:
                     d_img = raw_d.convert('RGB')
                 o_array = np.array(opacity_atlas.pixels[:]).reshape(atlas_size, atlas_size, 4)
-                o_channel = (o_array[:, :, 0] * 255).astype(np.uint8)
+                # Flip vertically: Blender pixels are bottom-to-top, Pillow expects top-to-bottom
+                o_channel = np.flipud((o_array[:, :, 0] * 255).astype(np.uint8))
                 o_pil = Image.fromarray(o_channel, mode='L')
 
                 # Создаем RGBA
@@ -895,7 +896,8 @@ class AGR_OT_CreateAtlasOnly(Operator):
 
                 # Конвертируем Blender image в PIL
                 o_array = np.array(opacity_atlas.pixels[:]).reshape(atlas_size, atlas_size, 4)
-                o_channel = (o_array[:, :, 0] * 255).astype(np.uint8)
+                # Flip vertically: Blender pixels are bottom-to-top, Pillow expects top-to-bottom
+                o_channel = np.flipud((o_array[:, :, 0] * 255).astype(np.uint8))
                 o_pil = Image.fromarray(o_channel, mode='L')
 
                 # Создаем RGBA
@@ -1022,21 +1024,22 @@ class AGR_OT_CreateAtlasOnly(Operator):
                     e_img = raw.convert('L')
                     if e_img.size != (cell_width, cell_height):
                         e_img = e_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                    e_channel = np.array(e_img, dtype=np.float32) / 255.0
+                    # Flip vertically: Pillow is top-to-bottom, Blender pixels are bottom-to-top
+                    e_channel = np.flipud(np.array(e_img, dtype=np.float32) / 255.0)
 
             if roughness_path and os.path.exists(roughness_path):
                 with Image.open(roughness_path) as raw:
                     r_img = raw.convert('L')
                     if r_img.size != (cell_width, cell_height):
                         r_img = r_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                    r_channel = np.array(r_img, dtype=np.float32) / 255.0
+                    r_channel = np.flipud(np.array(r_img, dtype=np.float32) / 255.0)
 
             if metallic_path and os.path.exists(metallic_path):
                 with Image.open(metallic_path) as raw:
                     m_img = raw.convert('L')
                     if m_img.size != (cell_width, cell_height):
                         m_img = m_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                    m_channel = np.array(m_img, dtype=np.float32) / 255.0
+                    m_channel = np.flipud(np.array(m_img, dtype=np.float32) / 255.0)
 
             if e_channel is None:
                 e_channel = np.zeros((cell_height, cell_width), dtype=np.float32)
@@ -1137,36 +1140,37 @@ class AGR_OT_CreateAtlasOnly(Operator):
                         pil_img = raw_img
                     if pil_img.mode != 'RGBA':
                         pil_img = pil_img.convert('RGBA')
-                    tex_array = np.array(pil_img, dtype=np.float32) / 255.0
+                    # Flip vertically: Pillow is top-to-bottom, Blender pixels are bottom-to-top
+                    tex_array = np.flipud(np.array(pil_img, dtype=np.float32) / 255.0)
 
             else:
-                # Fallback: загружаем через Blender
+                # Fallback: загружаем через Blender (already bottom-to-top)
                 temp_img = bpy.data.images.load(texture_path)
                 temp_img.update()
                 _ = temp_img.pixels[0]
-                
+
                 tex_width = temp_img.size[0]
                 tex_height = temp_img.size[1]
                 tex_array = np.array(temp_img.pixels[:]).reshape(tex_height, tex_width, 4)
-                
+
                 # Простое масштабирование через numpy
                 if tex_width != cell_width or tex_height != cell_height:
                     indices_y = np.round(np.linspace(0, tex_height - 1, cell_height)).astype(int)
                     indices_x = np.round(np.linspace(0, tex_width - 1, cell_width)).astype(int)
                     tex_array = tex_array[np.ix_(indices_y, indices_x)]
-                
+
                 # Удаляем временное изображение
                 if temp_img.name in bpy.data.images:
                     bpy.data.images.remove(temp_img)
-            
+
             # Размещаем в атласе
             x = layout_item['x']
             y = layout_item['y']
             atlas_array[y:y+cell_height, x:x+cell_width, :] = tex_array
-            
+
         except Exception as e:
             print(f"  ❌ Ошибка размещения {texture_path}: {e}")
-    
+
     def save_atlas_image(self, image, filepath, texture_type):
         """Сохраняет изображение атласа"""
         scene = bpy.context.scene
@@ -1704,7 +1708,8 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                     with Image.open(d_filepath) as raw_d:
                         d_img = raw_d.convert('RGB')
                     o_array = np.array(opacity_atlas.pixels[:]).reshape(atlas_size, atlas_size, 4)
-                    o_channel = (o_array[:, :, 0] * 255).astype(np.uint8)
+                    # Flip vertically: Blender pixels are bottom-to-top, Pillow expects top-to-bottom
+                    o_channel = np.flipud((o_array[:, :, 0] * 255).astype(np.uint8))
                     o_pil = Image.fromarray(o_channel, mode='L')
 
                     do_img = Image.new('RGBA', (atlas_size, atlas_size))
@@ -1854,21 +1859,22 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                     e_img = raw.convert('L')
                     if e_img.size != (cell_width, cell_height):
                         e_img = e_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                    e_channel = np.array(e_img, dtype=np.float32) / 255.0
+                    # Flip vertically: Pillow is top-to-bottom, Blender pixels are bottom-to-top
+                    e_channel = np.flipud(np.array(e_img, dtype=np.float32) / 255.0)
 
             if roughness_path and os.path.exists(roughness_path):
                 with Image.open(roughness_path) as raw:
                     r_img = raw.convert('L')
                     if r_img.size != (cell_width, cell_height):
                         r_img = r_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                    r_channel = np.array(r_img, dtype=np.float32) / 255.0
+                    r_channel = np.flipud(np.array(r_img, dtype=np.float32) / 255.0)
 
             if metallic_path and os.path.exists(metallic_path):
                 with Image.open(metallic_path) as raw:
                     m_img = raw.convert('L')
                     if m_img.size != (cell_width, cell_height):
                         m_img = m_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
-                    m_channel = np.array(m_img, dtype=np.float32) / 255.0
+                    m_channel = np.flipud(np.array(m_img, dtype=np.float32) / 255.0)
 
             if e_channel is None:
                 e_channel = np.zeros((cell_height, cell_width), dtype=np.float32)
@@ -1964,9 +1970,11 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                         pil_img = raw_img
                     if pil_img.mode != 'RGBA':
                         pil_img = pil_img.convert('RGBA')
-                    tex_array = np.array(pil_img, dtype=np.float32) / 255.0
+                    # Flip vertically: Pillow is top-to-bottom, Blender pixels are bottom-to-top
+                    tex_array = np.flipud(np.array(pil_img, dtype=np.float32) / 255.0)
 
             else:
+                # Fallback: загружаем через Blender (already bottom-to-top)
                 temp_img = bpy.data.images.load(texture_path)
                 temp_img.update()
                 _ = temp_img.pixels[0]

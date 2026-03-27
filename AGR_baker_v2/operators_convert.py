@@ -280,7 +280,9 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
             temp_path = agr_bake_dir / f"_packed_temp_{safe_name}"
 
             original_filepath_raw = img.filepath_raw
+            original_file_format = img.file_format
             try:
+                img.file_format = 'PNG'
                 img.filepath_raw = str(temp_path)
                 img.save()
                 print(f"  📦 Extracted packed image to temp: {temp_path.name}")
@@ -289,6 +291,7 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                 print(f"  ⚠️ Failed to save packed image {img.name}: {e}")
             finally:
                 img.filepath_raw = original_filepath_raw
+                img.file_format = original_file_format
 
         print(f"  ⚠️ Could not resolve path for image: {img.name}")
         return None
@@ -316,7 +319,8 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
             try:
                 import numpy as np
                 pixels = np.array(img.pixels[:]).reshape(img.size[1], img.size[0], 4)
-                arr = (pixels * 255).astype('uint8')
+                # Flip vertically: Blender pixels are bottom-to-top, Pillow expects top-to-bottom
+                arr = (np.flipud(pixels) * 255).astype('uint8')
                 return Image.fromarray(arr, 'RGBA')
             except Exception as e:
                 print(f"  ⚠️ Failed to load image via pixel buffer {img.name}: {e}")
@@ -632,7 +636,7 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                 pil_img = self.load_pil_image(textures['normal'])
                 if pil_img:
                     normal_path = set_folder / f"T_{material_name}_Normal.png"
-                    pil_img.save(str(normal_path))
+                    pil_img.convert('RGB').save(str(normal_path))
                     print(f"  💾 Saved Normal: {normal_path.name}")
 
             except Exception as e:

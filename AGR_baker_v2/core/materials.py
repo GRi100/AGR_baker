@@ -6,6 +6,36 @@ import bpy
 import os
 
 
+_BSDF_DEFAULTS = {
+    'Base Color': (1.0, 1.0, 1.0, 1.0),
+    'Metallic': 0.0,
+    'Roughness': 0.8,
+    'IOR': 1.5,
+    'Alpha': 1.0,
+    'Emission Color': (1.0, 1.0, 1.0, 1.0),
+    'Emission Strength': 0.0,
+}
+
+
+def capture_bsdf_values(material):
+    """Capture Principled BSDF default_values before node cleanup.
+    Returns dict or None if no BSDF found."""
+    if not material.use_nodes or not material.node_tree:
+        return None
+    for node in material.node_tree.nodes:
+        if node.type == 'BSDF_PRINCIPLED':
+            values = {}
+            for key in _BSDF_DEFAULTS:
+                if key in node.inputs:
+                    val = node.inputs[key].default_value
+                    if hasattr(val, '__len__'):
+                        values[key] = tuple(val)
+                    else:
+                        values[key] = float(val)
+            return values
+    return None
+
+
 def connect_normal_map(nodes, links, tex_normal, bsdf, location):
     """Connect normal map (OpenGL only)"""
     normal_map = nodes.new(type='ShaderNodeNormalMap')
@@ -52,7 +82,10 @@ def load_texture_from_disk(nodes, texture_path, texture_name, label, location, c
 
 
 def _setup_material_nodes(material):
-    """Clear material nodes and create base BSDF setup. Returns (nodes, links, bsdf)."""
+    """Clear material nodes and create base BSDF setup.
+    Returns (nodes, links, bsdf, saved_bsdf_values)."""
+    saved_values = capture_bsdf_values(material)
+
     material.use_nodes = True
     nodes = material.node_tree.nodes
     links = material.node_tree.links
@@ -67,21 +100,17 @@ def _setup_material_nodes(material):
 
     links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
 
-    return nodes, links, bsdf
+    return nodes, links, bsdf, saved_values
 
 
-def _finalize_material(material, bsdf):
-    """Apply default BSDF values, material settings, and update viewport."""
+def _finalize_material(material, bsdf, saved_values=None):
+    """Apply BSDF values (saved or default), material settings, and update viewport."""
     material.blend_method = 'HASHED'
     material.use_backface_culling = False
 
-    bsdf.inputs['Base Color'].default_value = (1.0, 1.0, 1.0, 1.0)
-    bsdf.inputs['Metallic'].default_value = 0.0
-    bsdf.inputs['Roughness'].default_value = 0.8
-    bsdf.inputs['IOR'].default_value = 1.5
-    bsdf.inputs['Alpha'].default_value = 1.0
-    bsdf.inputs['Emission Color'].default_value = (1.0, 1.0, 1.0, 1.0)
-    bsdf.inputs['Emission Strength'].default_value = 0.0
+    for key, default_val in _BSDF_DEFAULTS.items():
+        val = saved_values.get(key, default_val) if saved_values else default_val
+        bsdf.inputs[key].default_value = val
 
     bpy.context.view_layer.update()
     material.node_tree.update_tag()
@@ -131,7 +160,7 @@ def connect_texture_set_to_material(material, texture_set_path, material_name):
 
     print(f"🔧 Connecting in HIGH mode (ERM + DiffuseOpacity)")
 
-    nodes, links, bsdf = _setup_material_nodes(material)
+    nodes, links, bsdf, saved_values = _setup_material_nodes(material)
 
     # DiffuseOpacity
     tex_diffuse_opacity = load_texture_from_disk(
@@ -168,7 +197,7 @@ def connect_texture_set_to_material(material, texture_set_path, material_name):
         links.new(separate_color.outputs['Green'], bsdf.inputs['Roughness'])
         links.new(separate_color.outputs['Blue'], bsdf.inputs['Metallic'])
 
-    _finalize_material(material, bsdf)
+    _finalize_material(material, bsdf, saved_values)
 
     print(f"✅ Texture set connected to material: {material.name}")
     return material
@@ -188,7 +217,7 @@ def connect_regular_texture_set_to_material(material, texture_set_path, material
 
     print(f"🔧 Connecting regular textures for {material_name}")
 
-    nodes, links, bsdf = _setup_material_nodes(material)
+    nodes, links, bsdf, saved_values = _setup_material_nodes(material)
 
     # Diffuse -> Base Color only (no Emission Color)
     tex_diffuse = load_texture_from_disk(
@@ -235,7 +264,7 @@ def connect_regular_texture_set_to_material(material, texture_set_path, material
     if tex_normal:
         connect_normal_map(nodes, links, tex_normal, bsdf, (-400, -600))
 
-    _finalize_material(material, bsdf)
+    _finalize_material(material, bsdf, saved_values)
 
     print(f"✅ Regular textures connected to material: {material.name}")
     return material
