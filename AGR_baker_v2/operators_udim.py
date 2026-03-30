@@ -58,9 +58,9 @@ def get_udim_texture_name(address, obj_type, tex_type, udim_number):
 def get_udim_material_name(address, obj_type):
     """Generate UDIM material name based on object type"""
     if obj_type == 'Main':
-        return f"M_{address}"
+        return f"M_{address}_Main_1"
     else:  # Ground
-        return f"M_{address}_Ground"
+        return f"M_{address}_Ground_1"
 
 
 def _get_output_folder():

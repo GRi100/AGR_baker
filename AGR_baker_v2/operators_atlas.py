@@ -92,7 +92,7 @@ def get_texture_filename(atlas_name, texture_type, use_low_naming, address=None,
             'ERM': 'erm'
         }
         suffix = type_map.get(texture_type, texture_type.lower())
-        return f"T_{address}_{obj_type}_{suffix}.png"
+        return f"T_{address}_{obj_type}_{suffix}_1.png"
     else:
         # HIGH naming: T_AtlasName_Diffuse/DiffuseOpacity/Emit/Roughness/Metallic/ERM/Normal.png
         type_map = {
