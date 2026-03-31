@@ -1,0 +1,38 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "ObjectFeature",
+      "properties": {
+        "address": "",
+        "okrug": "",
+        "rajon": "",
+        "name": "",
+        "developer": "",
+        "designer": "",
+        "cadNum": "",
+        "FNO_code": "",
+        "FNO_name": "",
+        "ZU_area": 0,
+        "h_relief": 0,
+        "h_otn": "",
+        "h_abs": "",
+        "s_obsh": "",
+        "s_naz": "",
+        "s_podz": "",
+        "spp_gns": "",
+        "act_AGR": "",
+        "imageBase64": "",
+        "other": ""
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0,
+          0
+        ]
+      },
+      "Glasses": []
+    }
+  ]
+}

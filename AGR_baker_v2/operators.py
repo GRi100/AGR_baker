@@ -12,6 +12,7 @@ from . import operators_frame
 from . import operators_rename
 from . import operators_rename_project
 from . import operators_quick
+from . import operators_json
 
 def register():
     operators_bake.register()
@@ -24,8 +25,10 @@ def register():
     operators_rename.register()
     operators_rename_project.register()
     operators_quick.register()
+    operators_json.register()
 
 def unregister():
+    operators_json.unregister()
     operators_quick.unregister()
     operators_rename_project.unregister()
     operators_rename.unregister()

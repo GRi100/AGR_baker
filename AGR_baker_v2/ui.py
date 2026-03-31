@@ -561,12 +561,145 @@ class AGR_PT_SettingsPanel(Panel):
             box.label(text="Save blend file to see path", icon='ERROR')
 
 
+class AGR_PT_JsonPanel(Panel):
+    """GeoJSON management panel"""
+    bl_label = "AGR JSON"
+    bl_idname = "AGR_PT_json_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'AGR Baker'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        settings = scene.agr_baker_settings
+        folders = scene.agr_geojson_folders
+
+        # Load JSON button (scans folders + loads all data)
+        layout.operator("agr.load_all_geojson", icon='FILE_REFRESH')
+
+        # Folder list (only shown after scan)
+        if len(folders) > 0:
+            box = layout.box()
+            box.template_list(
+                "AGR_UL_geojson_folder_list", "",
+                scene, "agr_geojson_folders",
+                scene, "agr_geojson_folders_index",
+                rows=5,
+            )
+
+            # Create buttons
+            row = box.row(align=True)
+            active_folder = None
+            idx = scene.agr_geojson_folders_index
+            if 0 <= idx < len(folders):
+                active_folder = folders[idx]
+
+            sub = row.row(align=True)
+            sub.enabled = active_folder is not None and not active_folder.has_geojson
+            sub.operator("agr.create_geojson", text="Создать GeoJSON", icon='FILE_NEW')
+
+            sub = row.row(align=True)
+            sub.enabled = any(not f.has_geojson for f in folders)
+            sub.operator("agr.create_all_geojson", text="Создать все", icon='DOCUMENTS')
+
+        # ── Shared fields section ──
+        box = layout.box()
+        row = box.row()
+        row.prop(
+            settings, "show_json_fields",
+            icon='TRIA_DOWN' if settings.show_json_fields else 'TRIA_RIGHT',
+            text="Общие поля", emboss=False,
+        )
+
+        if settings.show_json_fields:
+            props = scene.agr_geojson_props
+            col = box.column(align=True)
+            col.prop(props, "address")
+            col.prop(props, "okrug")
+            col.prop(props, "rajon")
+            col.prop(props, "name")
+            col.prop(props, "name_ground")
+            col.separator()
+            col.prop(props, "developer")
+            col.prop(props, "designer")
+            col.prop(props, "cadNum")
+            col.separator()
+            col.prop(props, "ZU_area")
+            col.prop(props, "h_otn")
+            col.prop(props, "h_abs")
+            col.separator()
+            col.prop(props, "s_obsh")
+            col.prop(props, "s_naz")
+            col.prop(props, "s_podz")
+            col.prop(props, "spp_gns")
+            col.separator()
+            col.prop(props, "act_AGR")
+            col.prop(props, "other")
+
+        # ── Individual fields per folder ──
+        box = layout.box()
+        row = box.row()
+        row.prop(
+            settings, "show_json_file_props",
+            icon='TRIA_DOWN' if settings.show_json_file_props else 'TRIA_RIGHT',
+            text="Индивидуальные поля", emboss=False,
+        )
+
+        if settings.show_json_file_props and len(folders) > 0:
+            # FNO_code per folder
+            col = box.column(align=True)
+            col.label(text="Код ФНО:", icon='TEXT')
+            for folder in folders:
+                suffix = folder.label_suffix
+                label = f"Код ФНО {suffix}" if suffix else "Код ФНО"
+                col.prop(folder, "FNO_code", text=label)
+
+            col.separator()
+
+            # FNO_name per folder
+            col.label(text="Название ФНО:", icon='TEXT')
+            for folder in folders:
+                suffix = folder.label_suffix
+                label = f"Название ФНО {suffix}" if suffix else "Название ФНО"
+                col.prop(folder, "FNO_name", text=label)
+
+            col.separator()
+
+            # h_relief per folder
+            col.label(text="Высота рельефа:", icon='TEXT')
+            for folder in folders:
+                suffix = folder.label_suffix
+                label = f"Высота рельефа {suffix}" if suffix else "Высота рельефа"
+                col.prop(folder, "h_relief", text=label)
+
+        # ── Save button ──
+        if len(folders) > 0 and any(f.has_geojson for f in folders):
+            layout.operator("agr.save_all_geojson", text="Сохранить JSON", icon='FILE_TICK')
+
+        # ── Utilities section ──
+        box = layout.box()
+        row = box.row()
+        row.prop(
+            settings, "show_json_utils",
+            icon='TRIA_DOWN' if settings.show_json_utils else 'TRIA_RIGHT',
+            text="Утилиты", emboss=False,
+        )
+        if settings.show_json_utils:
+            col = box.column(align=True)
+            col.operator("agr.add_glass_to_geojson", icon='NODE_MATERIAL')
+            col.operator("agr.add_coords_to_geojson", icon='PIVOT_CURSOR')
+            col.operator("agr.add_image_to_geojson", icon='IMAGE_DATA')
+
+
 classes = (
     AGR_UL_TextureSetsList,
     AGR_PT_MainPanel,
     AGR_PT_TextureSetsPanel,
     AGR_PT_RenamePanel,
     AGR_PT_SettingsPanel,
+    AGR_PT_JsonPanel,
 )
 
 

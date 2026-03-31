@@ -212,6 +212,31 @@ class AGR_BakerSettings(PropertyGroup):
         default=False
     )
 
+    # JSON panel collapsible sections
+    show_json_fields: BoolProperty(
+        name="GeoJSON Fields",
+        description="Show GeoJSON editable fields",
+        default=False
+    )
+
+    show_json_ground: BoolProperty(
+        name="Ground Fields",
+        description="Show Ground-specific fields",
+        default=False
+    )
+
+    show_json_file_props: BoolProperty(
+        name="File Properties",
+        description="Show individual file properties",
+        default=False
+    )
+
+    show_json_utils: BoolProperty(
+        name="GeoJSON Utilities",
+        description="Show GeoJSON utility operations",
+        default=False
+    )
+
     # Output settings
     output_folder: StringProperty(
         name="Output Folder",
