@@ -638,6 +638,41 @@ class AGR_PT_JsonPanel(Panel):
             col.prop(props, "act_AGR")
             col.prop(props, "other")
 
+        # ── Image preview section ──
+        box = layout.box()
+        row = box.row()
+        row.prop(
+            settings, "show_json_image",
+            icon='TRIA_DOWN' if settings.show_json_image else 'TRIA_RIGHT',
+            text="Изображение", emboss=False,
+        )
+
+        if settings.show_json_image:
+            props = scene.agr_geojson_props
+            col = box.column(align=True)
+
+            # Preview image via template_icon
+            preview_name = "__agr_geojson_preview__"
+            if preview_name in bpy.data.images:
+                img = bpy.data.images[preview_name]
+                icon_id = img.preview.icon_id if img.preview else 0
+                if icon_id:
+                    col.template_icon(icon_value=icon_id, scale=8.0)
+                    col.label(text="Изображение загружено", icon='CHECKMARK')
+                else:
+                    # preview not ready yet, force it
+                    col.label(text="Превью обновляется...", icon='INFO')
+                    col.operator("agr.refresh_image_preview", icon='FILE_REFRESH')
+            else:
+                if props.has_image:
+                    col.label(text="Превью не загружено", icon='INFO')
+                    col.operator("agr.refresh_image_preview", icon='FILE_REFRESH')
+                else:
+                    col.label(text="Нет изображения", icon='ERROR')
+
+            col.separator()
+            col.operator("agr.add_image_to_geojson", icon='IMAGE_DATA')
+
         # ── Individual fields per folder ──
         box = layout.box()
         row = box.row()
@@ -665,17 +700,69 @@ class AGR_PT_JsonPanel(Panel):
                 label = f"Название ФНО {suffix}" if suffix else "Название ФНО"
                 col.prop(folder, "FNO_name", text=label)
 
-            col.separator()
+        # ── Coordinates + h_relief per folder ──
+        box = layout.box()
+        row = box.row()
+        row.prop(
+            settings, "show_json_coords",
+            icon='TRIA_DOWN' if settings.show_json_coords else 'TRIA_RIGHT',
+            text="Координаты", emboss=False,
+        )
 
-            # h_relief per folder
-            col.label(text="Высота рельефа:", icon='TEXT')
+        if settings.show_json_coords and len(folders) > 0:
+            col = box.column(align=True)
             for folder in folders:
                 suffix = folder.label_suffix
-                label = f"Высота рельефа {suffix}" if suffix else "Высота рельефа"
-                col.prop(folder, "h_relief", text=label)
+                label = suffix if suffix else folder.name
+                row = col.row(align=True)
+                row.label(text=label, icon='PIVOT_CURSOR')
+                row.prop(folder, "coord_x", text="X")
+                row.prop(folder, "coord_y", text="Y")
+                row.prop(folder, "h_relief", text="H")
+
+        # ── Glasses per folder ──
+        box = layout.box()
+        row = box.row()
+        row.prop(
+            settings, "show_json_glasses",
+            icon='TRIA_DOWN' if settings.show_json_glasses else 'TRIA_RIGHT',
+            text="Стёкла", emboss=False,
+        )
+
+        if settings.show_json_glasses and len(folders) > 0:
+            for fi, folder in enumerate(folders):
+                suffix = folder.label_suffix
+                folder_label = suffix if suffix else folder.name
+
+                # Folder header with add button
+                header_row = box.row(align=True)
+                header_row.label(text=folder_label, icon='NODE_MATERIAL')
+                op_add = header_row.operator("agr.add_glass_entry", text="", icon='ADD')
+                op_add.folder_index = fi
+
+                # Compact glass entries
+                for gi, glass in enumerate(folder.glasses):
+                    # Material name + delete on one row
+                    row = box.row(align=True)
+                    row.prop(glass, "mat_name", text="")
+                    op_del = row.operator("agr.remove_glass_entry", text="", icon='X')
+                    op_del.folder_index = fi
+                    op_del.glass_index = gi
+
+                    # RGB + properties in two compact rows
+                    row = box.row(align=True)
+                    row.prop(glass, "color_r", text="R")
+                    row.prop(glass, "color_g", text="G")
+                    row.prop(glass, "color_b", text="B")
+                    row.prop(glass, "transparency", text="T")
+
+                    row = box.row(align=True)
+                    row.prop(glass, "refraction", text="IOR")
+                    row.prop(glass, "roughness", text="Rough")
+                    row.prop(glass, "metallicity", text="Met")
 
         # ── Save button ──
-        if len(folders) > 0 and any(f.has_geojson for f in folders):
+        if len(folders) > 0:
             layout.operator("agr.save_all_geojson", text="Сохранить JSON", icon='FILE_TICK')
 
         # ── Utilities section ──
@@ -690,7 +777,6 @@ class AGR_PT_JsonPanel(Panel):
             col = box.column(align=True)
             col.operator("agr.add_glass_to_geojson", icon='NODE_MATERIAL')
             col.operator("agr.add_coords_to_geojson", icon='PIVOT_CURSOR')
-            col.operator("agr.add_image_to_geojson", icon='IMAGE_DATA')
 
 
 classes = (

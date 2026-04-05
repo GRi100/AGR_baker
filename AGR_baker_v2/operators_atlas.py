@@ -1192,11 +1192,11 @@ class AGR_OT_CreateAtlasOnly(Operator):
         scene.display_settings.display_device = 'sRGB'
         
         # Определяем режим цвета
-        if texture_type in ['DIFFUSE_OPACITY', 'OPACITY']:
+        if texture_type == 'DIFFUSE_OPACITY':
             scene.render.image_settings.color_mode = 'RGBA'
         else:
             scene.render.image_settings.color_mode = 'RGB'
-        
+
         try:
             image.filepath_raw = filepath
             image.save_render(filepath)
@@ -1211,7 +1211,7 @@ class AGR_OT_CreateAtlasOnly(Operator):
             scene.view_settings.view_transform = original_view_settings
             scene.view_settings.look = original_look
             scene.display_settings.display_device = original_display_device
-    
+
     def save_atlas_mapping(self, output_path, atlas_name, atlas_type, atlas_size, layout, created_atlases):
         """Сохраняет информацию о раскладке атласа в JSON"""
         try:
@@ -2016,11 +2016,11 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         scene.view_settings.look = 'None'
         scene.display_settings.display_device = 'sRGB'
         
-        if texture_type in ['DIFFUSE_OPACITY', 'OPACITY']:
+        if texture_type == 'DIFFUSE_OPACITY':
             scene.render.image_settings.color_mode = 'RGBA'
         else:
             scene.render.image_settings.color_mode = 'RGB'
-        
+
         try:
             image.filepath_raw = filepath
             image.save_render(filepath)

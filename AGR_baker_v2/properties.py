@@ -237,6 +237,24 @@ class AGR_BakerSettings(PropertyGroup):
         default=False
     )
 
+    show_json_glasses: BoolProperty(
+        name="Glass Materials",
+        description="Show glass materials per folder",
+        default=False
+    )
+
+    show_json_coords: BoolProperty(
+        name="Coordinates",
+        description="Show coordinates per folder",
+        default=False
+    )
+
+    show_json_image: BoolProperty(
+        name="Image Preview",
+        description="Show image preview section",
+        default=False
+    )
+
     # Output settings
     output_folder: StringProperty(
         name="Output Folder",

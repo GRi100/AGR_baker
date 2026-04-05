@@ -22,6 +22,18 @@ from bpy.props import (
 # PropertyGroups
 # ────────────────────────────────────────────
 
+class AGR_GeoJsonGlassEntry(PropertyGroup):
+    """Single glass material entry with BSDF-derived properties"""
+    mat_name: StringProperty(name="Material", default="M_Glass")
+    color_r: IntProperty(name="Red", default=255, min=0, max=255)
+    color_g: IntProperty(name="Green", default=255, min=0, max=255)
+    color_b: IntProperty(name="Blue", default=255, min=0, max=255)
+    transparency: FloatProperty(name="Transparency", default=0.0, min=0.0, max=1.0, step=1, precision=3)
+    refraction: FloatProperty(name="Refraction", default=1.5, min=1.0, max=3.0, step=1, precision=3)
+    roughness: FloatProperty(name="Roughness", default=0.0, min=0.0, max=1.0, step=1, precision=3)
+    metallicity: FloatProperty(name="Metallicity", default=0.0, min=0.0, max=1.0, step=1, precision=3)
+
+
 class AGR_GeoJsonFolder(PropertyGroup):
     """Entry in the GeoJSON folder list, including per-file individual fields"""
     name: StringProperty(name="Folder Name", default="")
@@ -32,9 +44,17 @@ class AGR_GeoJsonFolder(PropertyGroup):
     label_suffix: StringProperty(name="Label Suffix", default="")
 
     # Individual fields per folder/file
-    FNO_code: StringProperty(name="Код ФНО", default="")
-    FNO_name: StringProperty(name="Название ФНО", default="")
-    h_relief: FloatProperty(name="Высота рельефа", default=0.0, step=1, precision=6)
+    FNO_code: StringProperty(name="FNO Code", default="")
+    FNO_name: StringProperty(name="FNO Name", default="")
+    h_relief: FloatProperty(name="H Relief", default=0.0, step=1, precision=2)
+
+    # Coordinates
+    coord_x: FloatProperty(name="X", default=0.0, step=1, precision=3)
+    coord_y: FloatProperty(name="Y", default=0.0, step=1, precision=3)
+
+    # Glass materials
+    glasses: CollectionProperty(type=AGR_GeoJsonGlassEntry)
+    glasses_index: IntProperty(default=0)
 
 
 class AGR_GeoJsonProperties(PropertyGroup):
@@ -47,15 +67,19 @@ class AGR_GeoJsonProperties(PropertyGroup):
     developer: StringProperty(name="Застройщик", default="")
     designer: StringProperty(name="Проектировщик", default="")
     cadNum: StringProperty(name="Кадастровый номер", default="")
-    ZU_area: FloatProperty(name="Площадь ЗУ", default=0.0, step=1, precision=6)
-    h_otn: FloatProperty(name="Высота отн.", default=0.0, step=1, precision=6)
-    h_abs: FloatProperty(name="Высота абс.", default=0.0, step=1, precision=6)
-    s_obsh: FloatProperty(name="Площадь общая", default=0.0, step=1, precision=6)
-    s_naz: FloatProperty(name="Площадь наземная", default=0.0, step=1, precision=6)
-    s_podz: FloatProperty(name="Площадь подземная", default=0.0, step=1, precision=6)
-    spp_gns: FloatProperty(name="СПП ГНС", default=0.0, step=1, precision=6)
+    ZU_area: FloatProperty(name="Площадь ЗУ", default=0.0, step=1, precision=4)
+    h_otn: FloatProperty(name="Высота отн.", default=0.0, step=1, precision=2)
+    h_abs: FloatProperty(name="Высота абс.", default=0.0, step=1, precision=2)
+    s_obsh: FloatProperty(name="Площадь общая", default=0.0, step=1, precision=2)
+    s_naz: FloatProperty(name="Площадь наземная", default=0.0, step=1, precision=2)
+    s_podz: FloatProperty(name="Площадь подземная", default=0.0, step=1, precision=2)
+    spp_gns: FloatProperty(name="СПП ГНС", default=0.0, step=1, precision=2)
     act_AGR: StringProperty(name="Акт АГР", default="")
     other: StringProperty(name="Прочее", default="")
+
+    # Image base64 (not editable in UI directly)
+    imageBase64: StringProperty(name="Image Base64", default="", options={'HIDDEN'})
+    has_image: BoolProperty(name="Has Image", default=False)
 
 
 # ────────────────────────────────────────────
@@ -140,10 +164,16 @@ def _load_geojson(filepath):
         return json.load(f)
 
 
+_JFLOAT_RE = re.compile(r'"##JF:([^"#]+)##"')
+
+
 def _save_geojson(filepath, data):
-    """Save GeoJSON data to file"""
+    """Save GeoJSON data to file, restoring formatted floats from sentinels."""
+    json_str = json.dumps(data, ensure_ascii=False, indent=2)
+    # Replace sentinel strings with raw numbers: "##JF:215.20##" -> 215.20
+    json_str = _JFLOAT_RE.sub(r'\1', json_str)
     with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write(json_str)
 
 
 def _get_active_folder(context):
@@ -182,6 +212,34 @@ def _linear_to_srgb(c):
     return max(0, min(255, int(round(srgb * 255))))
 
 
+# Decimal places per field for JSON output
+DECIMAL_PLACES = {
+    'ZU_area': 4,
+    'h_relief': 2, 'h_otn': 2, 'h_abs': 2,
+    's_obsh': 2, 's_naz': 2, 's_podz': 2, 'spp_gns': 2,
+    'coord': 3,
+    'transparency': 3, 'refraction': 3, 'roughness': 3, 'metallicity': 3,
+}
+
+# Fields where 0 should NOT become "" (always write as number)
+ALWAYS_NUMERIC_FIELDS = {'coord', 'transparency', 'refraction', 'roughness', 'metallicity'}
+
+
+def _fmt(field, value):
+    """Format a float for JSON output with trailing zeros.
+    Returns a sentinel string '##JF:215.20##' that _save_geojson converts
+    to a raw number in the JSON output.
+    If value is 0 and field is not in ALWAYS_NUMERIC_FIELDS, returns "".
+    """
+    decimals = DECIMAL_PLACES.get(field)
+    if decimals is None:
+        return value
+    if value == 0.0 and field not in ALWAYS_NUMERIC_FIELDS:
+        return ""
+    formatted = f"{round(value, decimals):.{decimals}f}"
+    return f"##JF:{formatted}##"
+
+
 # Ground-specific fields that are written as empty strings
 GROUND_EMPTY_FIELDS = {'h_otn', 'h_abs', 's_obsh', 's_naz', 's_podz', 'spp_gns', 'FNO_code'}
 
@@ -196,6 +254,108 @@ SHARED_FIELDS = [
 SHARED_FLOAT_FIELDS = {
     'ZU_area', 'h_otn', 'h_abs', 's_obsh', 's_naz', 's_podz', 'spp_gns',
 }
+
+
+def _update_image_preview(b64_string):
+    """Decode base64 string and load as Blender preview image."""
+    preview_name = "__agr_geojson_preview__"
+
+    # Remove old preview
+    if preview_name in bpy.data.images:
+        bpy.data.images.remove(bpy.data.images[preview_name])
+
+    if not b64_string:
+        return
+
+    tmp_path = None
+    try:
+        image_bytes = base64.b64decode(b64_string)
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.jpg')
+        os.close(tmp_fd)
+
+        with open(tmp_path, 'wb') as f:
+            f.write(image_bytes)
+
+        img = bpy.data.images.load(tmp_path)
+        img.name = preview_name
+        img.pack()
+        # Force preview generation so icon_id is available immediately
+        img.preview_ensure()
+        print(f"🖼️ Image preview loaded: {len(b64_string)} chars, icon_id={img.preview.icon_id}")
+    except Exception as e:
+        print(f"⚠️ Error loading image preview: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _create_geojson_for_folder(folder):
+    """Create a GeoJSON file from template for the given folder. Returns True on success."""
+    template_path = _get_template_path(folder.is_ground)
+    if not os.path.isfile(template_path):
+        print(f"⚠️ Template not found: {template_path}")
+        return False
+
+    target_filename = folder.name + ".geojson"
+    target_path = os.path.join(folder.folder_path, target_filename)
+
+    try:
+        shutil.copy2(template_path, target_path)
+        folder.has_geojson = True
+        folder.geojson_filename = target_filename
+        print(f"📄 Created GeoJSON: {target_path}")
+        return True
+    except OSError as e:
+        print(f"⚠️ Error creating {target_path}: {e}")
+        return False
+
+
+def _build_glasses_list(folder):
+    """Build Glasses array: single object with material names as keys.
+    Format: [{"M_Glass_1": {...}, "M_Glass_2": {...}}]
+    """
+    if not folder.glasses:
+        return []
+    combined = {}
+    for entry in folder.glasses:
+        combined[entry.mat_name] = {
+            "color_RGB": {
+                "Red": entry.color_r,
+                "Green": entry.color_g,
+                "Blue": entry.color_b,
+            },
+            "transparency": _fmt('transparency', entry.transparency),
+            "refraction": _fmt('refraction', entry.refraction),
+            "roughness": _fmt('roughness', entry.roughness),
+            "metallicity": _fmt('metallicity', entry.metallicity),
+        }
+    return [combined]
+
+
+def _load_glasses_into_folder(folder, glasses_list):
+    """Load Glasses from JSON into folder's glass CollectionProperty.
+    Supports both formats:
+    - Combined: [{"M_Glass_1": {...}, "M_Glass_2": {...}}]
+    - Legacy:   [{"M_Name": {...}}, {"M_Name2": {...}}]
+    """
+    folder.glasses.clear()
+    if not glasses_list:
+        return
+    # Flatten: merge all dicts in the array into one iteration
+    for glass_dict in glasses_list:
+        for key, params in glass_dict.items():
+            if not isinstance(params, dict):
+                continue
+            entry = folder.glasses.add()
+            entry.mat_name = key
+            color = params.get('color_RGB', {})
+            entry.color_r = int(color.get('Red', 255))
+            entry.color_g = int(color.get('Green', 255))
+            entry.color_b = int(color.get('Blue', 255))
+            entry.transparency = float(params.get('transparency', 0.0))
+            entry.refraction = float(params.get('refraction', 1.5))
+            entry.roughness = float(params.get('roughness', 0.0))
+            entry.metallicity = float(params.get('metallicity', 0.0))
 
 
 # ────────────────────────────────────────────
@@ -279,6 +439,14 @@ class AGR_OT_load_all_geojson(Operator):
                             setattr(props, field, str(val) if val is not None else "")
 
                     props.name = str(feature_props.get('name', ''))
+
+                    # Load imageBase64
+                    img_b64 = feature_props.get('imageBase64', '')
+                    props.imageBase64 = str(img_b64) if img_b64 else ""
+                    props.has_image = bool(props.imageBase64)
+                    if props.has_image:
+                        _update_image_preview(props.imageBase64)
+
                     print(f"📄 Loaded shared props from {filepath}")
                 except (json.JSONDecodeError, OSError) as e:
                     print(f"⚠️ Error loading shared props: {e}")
@@ -294,7 +462,7 @@ class AGR_OT_load_all_geojson(Operator):
                 except (json.JSONDecodeError, OSError):
                     pass
 
-        # ── Step 3: Load individual fields per folder ──
+        # ── Step 3: Load individual fields, coordinates, glasses per folder ──
         for folder in folders:
             if not folder.has_geojson:
                 continue
@@ -303,17 +471,32 @@ class AGR_OT_load_all_geojson(Operator):
                 continue
             try:
                 data = _load_geojson(filepath)
-                feature_props = data.get('features', [{}])[0].get('properties', {})
+                feature = data.get('features', [{}])[0]
+                feature_props = feature.get('properties', {})
 
+                # Individual fields
                 folder.FNO_code = str(feature_props.get('FNO_code', ''))
                 folder.FNO_name = str(feature_props.get('FNO_name', ''))
 
                 h_relief = feature_props.get('h_relief', 0)
                 folder.h_relief = float(h_relief) if not isinstance(h_relief, str) or h_relief else 0.0
 
-                print(f"📄 Loaded individual props from {folder.name}")
+                # Coordinates
+                geometry = feature.get('geometry', {})
+                coords = geometry.get('coordinates', [0, 0])
+                if isinstance(coords, list) and len(coords) >= 2:
+                    folder.coord_x = float(coords[0]) if coords[0] else 0.0
+                    folder.coord_y = float(coords[1]) if coords[1] else 0.0
+
+                # Glasses
+                glasses_list = feature.get('Glasses', [])
+                _load_glasses_into_folder(folder, glasses_list)
+
+                print(f"📄 Loaded props from {folder.name}: "
+                      f"coords=[{folder.coord_x}, {folder.coord_y}], "
+                      f"glasses={len(folder.glasses)}")
             except (json.JSONDecodeError, OSError) as e:
-                print(f"⚠️ Error loading individual props for {folder.name}: {e}")
+                print(f"⚠️ Error loading props for {folder.name}: {e}")
 
         has_geojson = sum(1 for f in folders if f.has_geojson)
         self.report({'INFO'}, f"Найдено {count} папок, загружено {has_geojson} JSON")
@@ -321,15 +504,14 @@ class AGR_OT_load_all_geojson(Operator):
 
 
 class AGR_OT_save_all_geojson(Operator):
-    """Save shared + individual properties to ALL GeoJSON files"""
+    """Save all properties to ALL GeoJSON files, creating missing ones from templates"""
     bl_idname = "agr.save_all_geojson"
     bl_label = "Сохранить JSON"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        folders = context.scene.agr_geojson_folders
-        return any(f.has_geojson for f in folders)
+        return len(context.scene.agr_geojson_folders) > 0
 
     def execute(self, context):
         scene = context.scene
@@ -337,8 +519,10 @@ class AGR_OT_save_all_geojson(Operator):
         saved_count = 0
 
         for folder in scene.agr_geojson_folders:
+            # Create geojson from template if missing
             if not folder.has_geojson:
-                continue
+                if not _create_geojson_for_folder(folder):
+                    continue
 
             filepath = _get_geojson_path(folder)
             if not filepath:
@@ -361,7 +545,7 @@ class AGR_OT_save_all_geojson(Operator):
 
                 val = getattr(props, field)
                 if field in SHARED_FLOAT_FIELDS:
-                    feature_props[field] = val
+                    feature_props[field] = _fmt(field, val)
                 else:
                     feature_props[field] = val
 
@@ -371,14 +555,26 @@ class AGR_OT_save_all_geojson(Operator):
             else:
                 feature_props['name'] = props.name
 
-            # Write individual fields from folder item
+            # Write individual fields
             if is_ground:
                 feature_props['FNO_code'] = ""
             else:
                 feature_props['FNO_code'] = folder.FNO_code
 
             feature_props['FNO_name'] = folder.FNO_name
-            feature_props['h_relief'] = folder.h_relief
+            feature_props['h_relief'] = _fmt('h_relief', folder.h_relief)
+
+            # Write imageBase64
+            feature_props['imageBase64'] = props.imageBase64
+
+            # Write coordinates
+            data['features'][0]['geometry']['coordinates'] = [
+                _fmt('coord', folder.coord_x),
+                _fmt('coord', folder.coord_y),
+            ]
+
+            # Write glasses
+            data['features'][0]['Glasses'] = _build_glasses_list(folder)
 
             try:
                 _save_geojson(filepath, data)
@@ -408,26 +604,12 @@ class AGR_OT_create_geojson(Operator):
             self.report({'ERROR'}, "Папка не выбрана")
             return {'CANCELLED'}
 
-        template_path = _get_template_path(folder.is_ground)
-        if not os.path.isfile(template_path):
-            self.report({'ERROR'}, f"Шаблон не найден: {template_path}")
+        if _create_geojson_for_folder(folder):
+            self.report({'INFO'}, f"Создан {folder.geojson_filename}")
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, "Ошибка создания GeoJSON")
             return {'CANCELLED'}
-
-        target_filename = folder.name + ".geojson"
-        target_path = os.path.join(folder.folder_path, target_filename)
-
-        try:
-            shutil.copy2(template_path, target_path)
-        except OSError as e:
-            self.report({'ERROR'}, f"Ошибка копирования: {e}")
-            return {'CANCELLED'}
-
-        folder.has_geojson = True
-        folder.geojson_filename = target_filename
-
-        self.report({'INFO'}, f"Создан {target_filename}")
-        print(f"📄 Created GeoJSON: {target_path}")
-        return {'FINISHED'}
 
 
 class AGR_OT_create_all_geojson(Operator):
@@ -446,21 +628,8 @@ class AGR_OT_create_all_geojson(Operator):
         for folder in context.scene.agr_geojson_folders:
             if folder.has_geojson:
                 continue
-
-            template_path = _get_template_path(folder.is_ground)
-            if not os.path.isfile(template_path):
-                continue
-
-            target_filename = folder.name + ".geojson"
-            target_path = os.path.join(folder.folder_path, target_filename)
-
-            try:
-                shutil.copy2(template_path, target_path)
-                folder.has_geojson = True
-                folder.geojson_filename = target_filename
+            if _create_geojson_for_folder(folder):
                 created += 1
-            except OSError as e:
-                print(f"⚠️ Error creating {target_path}: {e}")
 
         self.report({'INFO'}, f"Создано {created} файлов GeoJSON")
         print(f"📄 Created {created} GeoJSON files")
@@ -470,7 +639,7 @@ class AGR_OT_create_all_geojson(Operator):
 class AGR_OT_add_glass_to_geojson(Operator):
     """Scan Glass objects and write material data to GeoJSON Glasses array"""
     bl_idname = "agr.add_glass_to_geojson"
-    bl_label = "Добавить стёкла"
+    bl_label = "Записать стёкла из сцены"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -482,7 +651,7 @@ class AGR_OT_add_glass_to_geojson(Operator):
         scene = context.scene
         folders = scene.agr_geojson_folders
 
-        # Build a mapping: folder_name -> geojson filepath
+        # Build a mapping: folder_name -> data
         folder_map = {}
         for folder in folders:
             if folder.has_geojson:
@@ -508,7 +677,6 @@ class AGR_OT_add_glass_to_geojson(Operator):
             if obj.type != 'MESH':
                 continue
 
-            # Skip objects in LOW collections (4-digit prefix)
             if _is_in_low_collection(obj):
                 continue
 
@@ -519,7 +687,7 @@ class AGR_OT_add_glass_to_geojson(Operator):
             base_address = match.group(1)
             glass_type = match.group(2)
 
-            # Determine which folder this glass belongs to
+            # Determine target folder
             target_folder_name = None
             if glass_type == "GroundGlass":
                 candidate = f"SM_{base_address}"
@@ -539,7 +707,7 @@ class AGR_OT_add_glass_to_geojson(Operator):
                 print(f"⚠️ No matching folder for glass object: {obj.name}")
                 continue
 
-            # Extract material properties from each material slot
+            # Extract material properties
             for slot in obj.material_slots:
                 mat = slot.material
                 if not mat or not mat.use_nodes:
@@ -564,39 +732,41 @@ class AGR_OT_add_glass_to_geojson(Operator):
                 g = _linear_to_srgb(base_color[1])
                 b = _linear_to_srgb(base_color[2])
 
-                mat_key = mat.name
-
-                glass_entry = {
-                    mat_key: {
-                        "color_RGB": {
-                            "Red": r,
-                            "Green": g,
-                            "Blue": b,
-                        },
-                        "transparency": round(1.0 - alpha, 3),
-                        "refraction": round(ior, 3),
-                        "roughness": round(roughness, 3),
-                        "metallicity": round(metallic, 3),
-                    }
+                glass_params = {
+                    "color_RGB": {"Red": r, "Green": g, "Blue": b},
+                    "transparency": _fmt('transparency', 1.0 - alpha),
+                    "refraction": _fmt('refraction', ior),
+                    "roughness": _fmt('roughness', roughness),
+                    "metallicity": _fmt('metallicity', metallic),
                 }
 
-                folder_map[target_folder_name]['glasses'].append(glass_entry)
+                folder_map[target_folder_name]['glasses'].append((mat.name, glass_params))
                 total_glasses += 1
-                print(f"🪟 Glass: {mat_key} -> {target_folder_name}")
+                print(f"🪟 Glass: {mat.name} -> {target_folder_name}")
 
-        # Write glasses to GeoJSON files
+        # Write glasses to GeoJSON files and sync to UI
         written = 0
         for folder_name, info in folder_map.items():
             if not info['glasses']:
                 continue
 
+            # Build combined dict: {"M_Glass_1": {...}, "M_Glass_2": {...}}
+            combined = {mat_name: params for mat_name, params in info['glasses']}
+            glasses_json = [combined]
+
             try:
                 data = _load_geojson(info['path'])
-                data['features'][0]['Glasses'] = info['glasses']
+                data['features'][0]['Glasses'] = glasses_json
                 _save_geojson(info['path'], data)
                 written += 1
             except (json.JSONDecodeError, OSError) as e:
                 print(f"⚠️ Error writing glasses to {info['path']}: {e}")
+
+            # Sync to folder's glasses CollectionProperty
+            for folder in folders:
+                if folder.name == folder_name:
+                    _load_glasses_into_folder(folder, glasses_json)
+                    break
 
         self.report({'INFO'}, f"Добавлено {total_glasses} стёкол в {written} файлов")
         print(f"🪟 Added {total_glasses} glass entries to {written} GeoJSON files")
@@ -606,7 +776,7 @@ class AGR_OT_add_glass_to_geojson(Operator):
 class AGR_OT_add_coords_to_geojson(Operator):
     """Write object world coordinates to GeoJSON geometry"""
     bl_idname = "agr.add_coords_to_geojson"
-    bl_label = "Добавить координаты"
+    bl_label = "Записать координаты из сцены"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -634,7 +804,6 @@ class AGR_OT_add_coords_to_geojson(Operator):
             if obj.type != 'MESH':
                 continue
 
-            # Skip objects in LOW collections (4-digit prefix)
             if _is_in_low_collection(obj):
                 continue
 
@@ -659,16 +828,24 @@ class AGR_OT_add_coords_to_geojson(Operator):
             filepath = folder_map[folder_name]
 
             loc = obj.matrix_world.translation
-            coords = [round(loc.x, 3), round(loc.y, 3)]
+            cx = _fmt('coord', loc.x)
+            cy = _fmt('coord', loc.y)
 
             try:
                 data = _load_geojson(filepath)
-                data['features'][0]['geometry']['coordinates'] = coords
+                data['features'][0]['geometry']['coordinates'] = [cx, cy]
                 _save_geojson(filepath, data)
                 updated += 1
-                print(f"📍 Coords {coords} -> {folder_name}")
+                print(f"📍 Coords [{cx}, {cy}] -> {folder_name}")
             except (json.JSONDecodeError, OSError, KeyError) as e:
                 print(f"⚠️ Error writing coords to {filepath}: {e}")
+
+            # Sync to folder CollectionProperty
+            for folder in folders:
+                if folder.name == folder_name:
+                    folder.coord_x = loc.x
+                    folder.coord_y = loc.y
+                    break
 
         self.report({'INFO'}, f"Координаты записаны в {updated} файлов")
         print(f"📍 Updated coordinates in {updated} GeoJSON files")
@@ -678,7 +855,7 @@ class AGR_OT_add_coords_to_geojson(Operator):
 class AGR_OT_add_image_to_geojson(Operator):
     """Select a JPG file, resize to 256px, encode as base64, write to all GeoJSON"""
     bl_idname = "agr.add_image_to_geojson"
-    bl_label = "Добавить изображение"
+    bl_label = "Загрузить изображение"
     bl_options = {'REGISTER', 'UNDO'}
 
     filepath: StringProperty(
@@ -755,6 +932,12 @@ class AGR_OT_add_image_to_geojson(Operator):
 
             b64_string = base64.b64encode(image_bytes).decode('ascii')
 
+            # Store in shared props and update preview
+            props = context.scene.agr_geojson_props
+            props.imageBase64 = b64_string
+            props.has_image = True
+            _update_image_preview(b64_string)
+
             written = 0
             for folder in context.scene.agr_geojson_folders:
                 if not folder.has_geojson:
@@ -786,11 +969,88 @@ class AGR_OT_add_image_to_geojson(Operator):
         return {'FINISHED'}
 
 
+class AGR_OT_add_glass_entry(Operator):
+    """Add an empty glass material entry to the specified folder"""
+    bl_idname = "agr.add_glass_entry"
+    bl_label = "Добавить стекло"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    folder_index: IntProperty(name="Folder Index", default=0)
+
+    def execute(self, context):
+        folders = context.scene.agr_geojson_folders
+        if not (0 <= self.folder_index < len(folders)):
+            self.report({'ERROR'}, "Неверный индекс папки")
+            return {'CANCELLED'}
+
+        folder = folders[self.folder_index]
+        entry = folder.glasses.add()
+        entry.mat_name = f"M_{folder.label_suffix or 'Glass'}_{len(folder.glasses)}"
+        entry.color_r = 255
+        entry.color_g = 255
+        entry.color_b = 255
+        entry.transparency = 0.5
+        entry.refraction = 1.52
+        entry.roughness = 0.057
+        entry.metallicity = 0.8
+        folder.glasses_index = len(folder.glasses) - 1
+
+        self.report({'INFO'}, f"Добавлено стекло в {folder.name}")
+        return {'FINISHED'}
+
+
+class AGR_OT_remove_glass_entry(Operator):
+    """Remove a glass material entry from the specified folder"""
+    bl_idname = "agr.remove_glass_entry"
+    bl_label = "Удалить стекло"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    folder_index: IntProperty(name="Folder Index", default=0)
+    glass_index: IntProperty(name="Glass Index", default=0)
+
+    def execute(self, context):
+        folders = context.scene.agr_geojson_folders
+        if not (0 <= self.folder_index < len(folders)):
+            self.report({'ERROR'}, "Неверный индекс папки")
+            return {'CANCELLED'}
+
+        folder = folders[self.folder_index]
+        if not (0 <= self.glass_index < len(folder.glasses)):
+            self.report({'ERROR'}, "Неверный индекс стекла")
+            return {'CANCELLED'}
+
+        removed_name = folder.glasses[self.glass_index].mat_name
+        folder.glasses.remove(self.glass_index)
+
+        if folder.glasses_index >= len(folder.glasses) and len(folder.glasses) > 0:
+            folder.glasses_index = len(folder.glasses) - 1
+
+        self.report({'INFO'}, f"Удалено {removed_name} из {folder.name}")
+        return {'FINISHED'}
+
+
+class AGR_OT_refresh_image_preview(Operator):
+    """Refresh image preview from current imageBase64 data"""
+    bl_idname = "agr.refresh_image_preview"
+    bl_label = "Обновить превью"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = context.scene.agr_geojson_props
+        if props.imageBase64:
+            _update_image_preview(props.imageBase64)
+            self.report({'INFO'}, "Превью обновлено")
+        else:
+            self.report({'WARNING'}, "Нет данных изображения")
+        return {'FINISHED'}
+
+
 # ────────────────────────────────────────────
 # Registration
 # ────────────────────────────────────────────
 
 classes = (
+    AGR_GeoJsonGlassEntry,
     AGR_GeoJsonFolder,
     AGR_GeoJsonProperties,
     AGR_UL_GeoJsonFolderList,
@@ -801,6 +1061,9 @@ classes = (
     AGR_OT_add_glass_to_geojson,
     AGR_OT_add_coords_to_geojson,
     AGR_OT_add_image_to_geojson,
+    AGR_OT_add_glass_entry,
+    AGR_OT_remove_glass_entry,
+    AGR_OT_refresh_image_preview,
 )
 
 
