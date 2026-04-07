@@ -508,7 +508,11 @@ class AGR_OT_rename_textures(Operator):
         match = re.match(r'^SM_(.+?)_(\d{3})_(Main|MainGlass)$', obj_name_clean)
         if match:
             return match.group(1), match.group(2), 'Main'
-        
+
+        match = re.match(r'^SM_(.+?)_(Main|MainGlass)$', obj_name_clean)
+        if match:
+            return match.group(1), None, 'Main'
+
         match = re.match(r'^SM_(.+?)_(Ground|GroundGlass)$', obj_name_clean)
         if match:
             return match.group(1), None, 'Ground'
@@ -684,19 +688,20 @@ class AGR_OT_rename_textures(Operator):
         return textures if textures else None
     
     def get_texture_type_from_filename(self, filename):
-        filename_lower = filename.lower()
-        if 'diffuse' in filename_lower or '_d.' in filename_lower or '_d_' in filename_lower:
+        # Regular (non-UDIM) textures use only short single-letter codes.
+        # Anchor to end of filename to avoid false match on address parts like Volkhonka_D_5 → _d_
+        if re.search(r'_d_\d+\.png$', filename) or filename.endswith('_d.png'):
             return 'Diffuse'
-        if 'normal' in filename_lower or '_n.' in filename_lower or '_n_' in filename_lower:
+        if re.search(r'_n_\d+\.png$', filename) or filename.endswith('_n.png'):
             return 'Normal'
-        if 'erm' in filename_lower or 'orm' in filename_lower:
-            return 'ERM'
-        if 'roughness' in filename_lower or '_r.' in filename_lower or '_r_' in filename_lower:
+        if re.search(r'_r_\d+\.png$', filename) or filename.endswith('_r.png'):
             return 'Roughness'
-        if 'metallic' in filename_lower or '_m.' in filename_lower or '_m_' in filename_lower:
+        if re.search(r'_m_\d+\.png$', filename) or filename.endswith('_m.png'):
             return 'Metallic'
-        if 'opacity' in filename_lower or '_o.' in filename_lower or '_o_' in filename_lower:
+        if re.search(r'_o_\d+\.png$', filename) or filename.endswith('_o.png'):
             return 'Opacity'
+        if re.search(r'_e_\d+\.png$', filename) or filename.endswith('_e.png'):
+            return 'Emit'
         return None
     
     def rename_udim_textures(self, folder_path, new_address, number, obj_type):
@@ -1153,13 +1158,17 @@ class AGR_OT_rename_geojson(Operator):
         match = re.match(r'^SM_(.+?)_(\d{3})_(Main|MainGlass)$', obj_name_clean)
         if match:
             return match.group(1), match.group(2), 'Main'
-        
+
+        match = re.match(r'^SM_(.+?)_(Main|MainGlass)$', obj_name_clean)
+        if match:
+            return match.group(1), None, 'Main'
+
         match = re.match(r'^SM_(.+?)_(Ground|GroundGlass|GroundEl|GroundElGlass)$', obj_name_clean)
         if match:
             return match.group(1), None, 'Ground'
-        
+
         return None
-    
+
     def get_texture_folder_from_material(self, obj):
         for mat_slot in obj.data.materials:
             if mat_slot and mat_slot.use_nodes:
@@ -1285,86 +1294,109 @@ class AGR_OT_rename_geojson(Operator):
         return renamed_count
 
 
-# ============= Rename Lights =============
+# ============= Rename Lights Root =============
 
-class AGR_OT_rename_lights(Operator):
-    """Переименование Empty объекта и привязанных источников света - вызывает диалог"""
-    bl_idname = "agr.rename_lights"
-    bl_label = "Переименовать свет"
+def _rename_child_lights_root(root_obj, address, number, obj_type):
+    """Rename LIGHT children of a Root EMPTY using project naming convention."""
+    spot_counter = 1
+    point_counter = 1
+    light_objects = [child for child in root_obj.children if child.type == 'LIGHT']
+    light_objects.sort(key=lambda x: x.name)
+    for light_obj in light_objects:
+        light_type = light_obj.data.type
+        if light_type == 'SPOT':
+            lighttype_name = 'Spot'
+            counter = spot_counter
+            spot_counter += 1
+        elif light_type == 'POINT':
+            lighttype_name = 'Point'
+            counter = point_counter
+            point_counter += 1
+        else:
+            continue
+        if obj_type == 'Ground':
+            new_light_name = f"{address}_Ground_{lighttype_name}_{counter:03d}"
+        elif obj_type == 'Main' and number:
+            new_light_name = f"{address}_{number}_{lighttype_name}_{counter:03d}"
+        else:
+            new_light_name = f"{address}_{lighttype_name}_{counter:03d}"
+        light_obj.name = new_light_name
+
+
+class AGR_OT_rename_lights_root(Operator):
+    """Переименование Root Empty и дочерних источников света по проектному соглашению"""
+    bl_idname = "agr.rename_lights_root"
+    bl_label = "Переименовать Root свет"
     bl_options = {'REGISTER', 'UNDO'}
-    
+
     @classmethod
     def poll(cls, context):
         obj = context.active_object
         if not obj or obj.type != 'EMPTY':
             return False
-        for child in context.scene.objects:
-            if child.type == 'LIGHT' and child.parent == obj:
-                return True
-        return False
-    
+        if not re.search(r'_Root$', obj.name):
+            return False
+        return any(child.type == 'LIGHT' for child in obj.children)
+
     def execute(self, context):
         new_address = _get_new_address(context.scene)
         if not new_address:
             self.report({'ERROR'}, "Введите Address в панели AGR_rename")
             return {'CANCELLED'}
-        
-        bpy.ops.agr.rename_lights_dialog('INVOKE_DEFAULT')
+        bpy.ops.agr.rename_lights_root_dialog('INVOKE_DEFAULT')
         return {'FINISHED'}
 
 
-class AGR_OT_rename_lights_dialog(Operator):
-    """Диалог выбора типа для света"""
-    bl_idname = "agr.rename_lights_dialog"
-    bl_label = "Выберите тип объекта"
+class AGR_OT_rename_lights_root_dialog(Operator):
+    """Диалог выбора типа для Root-света"""
+    bl_idname = "agr.rename_lights_root_dialog"
+    bl_label = "Тип Root объекта"
     bl_options = {'REGISTER', 'UNDO'}
-    
+
     light_type: EnumProperty(
         name="Тип объекта",
         items=[
-            ('Main', "Main", "Основной объект с номером"),
+            ('Main', "Main", "Основной объект (с номером или без)"),
             ('Ground', "Ground", "Земля без номера"),
         ],
         default='Main'
     )
-    
+
     light_number: IntProperty(
         name="Номер объекта",
-        description="Номер объекта от 0 до 999 (0 = без номера)",
+        description="Номер 001-999 (0 = без номера)",
         default=1,
         min=0,
         max=999
     )
-    
+
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
-    
+
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "light_type", text="Тип")
         if self.light_type == 'Main':
             layout.prop(self, "light_number", text="Номер")
             layout.label(text="0 = без номера")
-    
+
     def execute(self, context):
         obj = context.active_object
         new_address = _get_new_address(context.scene)
-        
-        if self.light_type == 'Main' and self.light_number > 0:
-            obj.name = f"SM_{new_address}_{self.light_number:03d}_Light"
+
+        if self.light_type == 'Ground':
+            obj.name = f"{new_address}_Ground_Root"
+            _rename_child_lights_root(obj, new_address, None, 'Ground')
+        elif self.light_type == 'Main' and self.light_number > 0:
+            number_str = f"{self.light_number:03d}"
+            obj.name = f"{new_address}_{number_str}_Root"
+            _rename_child_lights_root(obj, new_address, number_str, 'Main')
         else:
-            obj.name = f"SM_{new_address}_{self.light_type}_Light"
-        
-        renamed_lights = 0
-        for child in context.scene.objects:
-            if child.type == 'LIGHT' and child.parent == obj:
-                if self.light_type == 'Main' and self.light_number > 0:
-                    child.name = f"Light_{new_address}_{self.light_number:03d}"
-                else:
-                    child.name = f"Light_{new_address}_{self.light_type}"
-                renamed_lights += 1
-        
-        self.report({'INFO'}, f"Empty переименован, источников света: {renamed_lights}")
+            obj.name = f"{new_address}_Root"
+            _rename_child_lights_root(obj, new_address, None, 'Main')
+
+        light_count = sum(1 for c in obj.children if c.type == 'LIGHT')
+        self.report({'INFO'}, f"Root переименован, источников света: {light_count}")
         return {'FINISHED'}
 
 
@@ -1393,8 +1425,8 @@ classes = (
     AGR_OT_rename_ucx_dialog,
     AGR_OT_rename_textures,
     AGR_OT_rename_geojson,
-    AGR_OT_rename_lights,
-    AGR_OT_rename_lights_dialog,
+    AGR_OT_rename_lights_root,
+    AGR_OT_rename_lights_root_dialog,
 )
 
 

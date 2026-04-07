@@ -368,17 +368,11 @@ class AGR_RP_OT_rename_project(Operator):
         return textures if textures else None
 
     def get_texture_type_from_filename(self, filename):
-        filename_lower = filename.lower()
-        if '_d_' in filename_lower or filename_lower.endswith('_d.png'):
-            return 'd'
-        if '_o_' in filename_lower or filename_lower.endswith('_o.png'):
-            return 'o'
-        if '_m_' in filename_lower or filename_lower.endswith('_m.png'):
-            return 'm'
-        if '_n_' in filename_lower or filename_lower.endswith('_n.png'):
-            return 'n'
-        if '_r_' in filename_lower or filename_lower.endswith('_r.png'):
-            return 'r'
+        # Anchor to end of filename — prevents false match on address parts like Volkhonka_D_5
+        # Check longer codes first (erm before r, do before d/o)
+        for tex_type in ('erm', 'do', 'd', 'o', 'm', 'n', 'r', 'e'):
+            if re.search(rf'_{tex_type}_\d+\.png$', filename) or filename.endswith(f'_{tex_type}.png'):
+                return tex_type
         return None
 
     def process_udim_textures(self, obj, address, number, obj_type):

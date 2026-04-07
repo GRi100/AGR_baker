@@ -497,28 +497,23 @@ class AGR_PT_RenamePanel(Panel):
             else:
                 row.operator("agr.rename_geojson", text="Выберите объект Main/Ground")
 
-        # Rename Lights
+        # Rename Lights Root
         row = col.row()
         row.scale_y = 1.4
-        if active_obj and active_obj.type == 'EMPTY' and scene.agr_rename_address:
-            # Check if has child lights
-            has_lights = False
-            for obj in context.scene.objects:
-                if obj.type == 'LIGHT' and obj.parent == active_obj:
-                    has_lights = True
-                    break
-
+        is_root = active_obj and active_obj.type == 'EMPTY' and bool(re.search(r'_Root$', active_obj.name)) and scene.agr_rename_address
+        if is_root:
+            has_lights = any(child.type == 'LIGHT' for child in active_obj.children)
             if has_lights:
-                row.operator("agr.rename_lights", text="Переименовать свет", icon='LIGHT')
+                row.operator("agr.rename_lights_root", text="Переименовать Root свет", icon='LIGHT')
             else:
                 row.enabled = False
-                row.operator("agr.rename_lights", text="Empty без источников света")
+                row.operator("agr.rename_lights_root", text="Root без источников света")
         else:
             row.enabled = False
             if not scene.agr_rename_address:
-                row.operator("agr.rename_lights", text="Введите Address")
+                row.operator("agr.rename_lights_root", text="Введите Address")
             else:
-                row.operator("agr.rename_lights", text="Выберите Empty со светом")
+                row.operator("agr.rename_lights_root", text="Выберите Root Empty со светом")
 
         layout.separator()
 
