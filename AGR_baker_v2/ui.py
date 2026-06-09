@@ -248,6 +248,8 @@ class AGR_PT_TextureSetsPanel(Panel):
 
                 batch_box.operator("agr.create_frame_on_sets", text="Create Frame", icon='IMAGE_PLANE')
                 batch_box.operator("agr.create_frame_on_files", text="Create Frame on Files...", icon='FILEBROWSER')
+                batch_box.operator("agr.apply_overlay_to_files", text="Apply Overlay to Files...", icon='NODE_COMPOSITING')
+                batch_box.operator("agr.add_frame_overlay", text="Import Frame Overlay...", icon='IMPORT')
 
                 # --- Delete Operations (collapsible, nested) ---
                 batch_box.separator()

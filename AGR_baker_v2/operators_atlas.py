@@ -2272,16 +2272,24 @@ class AGR_OT_CreateAtlasFromObject(Operator):
 
 # ===== APPLY EXISTING ATLAS TO OBJECT OPERATOR =====
 
+# Module-level cache: Blender's EnumProperty callback stores only pointers to
+# the identifier/name/description strings. Without keeping a Python reference
+# alive, the GC frees them and reading the property yields garbage bytes
+# (UnicodeDecodeError on 0x90 / 0xf0).
+_atlas_enum_cache = []
+
+
 def get_available_atlases(self, context):
     """Получает список доступных атласов для EnumProperty (сканирует A_* папки напрямую)"""
+    global _atlas_enum_cache
     items = []
     settings = context.scene.agr_baker_settings
-    
+
     # Получаем путь к AGR_BAKE
     blend_path = bpy.path.abspath("//")
     if blend_path:
         agr_bake_path = os.path.join(blend_path, settings.output_folder)
-        
+
         if os.path.exists(agr_bake_path):
             # Сканируем A_* папки
             for item in os.listdir(agr_bake_path):
@@ -2306,10 +2314,11 @@ def get_available_atlases(self, context):
                                 item,
                                 f"Atlas: {item}"
                             ))
-    
+
     if not items:
         items.append(('NONE', "No atlases", "No atlases available"))
-    
+
+    _atlas_enum_cache = items
     return items
 
 

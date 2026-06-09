@@ -10,7 +10,9 @@ To disable this feature: comment out the operators_share import in operators.py.
 
 import bpy
 import os
+import sys
 import json
+import subprocess
 import threading
 import tempfile
 import urllib.request
@@ -25,18 +27,17 @@ from bpy.props import (
     CollectionProperty,
 )
 
+from .operators_bake import sanitize_material_name
 
-# ---------------------------------------------------------------------------
-# Module-level cache for all items (used to re-filter without network call)
-# ---------------------------------------------------------------------------
 
-_cached_items = []  # list of dicts from index, set by Refresh
+_ALL_PROJECTS = "All"
+
+_cached_items = []
 
 
 def _apply_project_filter(scene):
-    """Re-populate scene.agr_share_items from cache based on active project."""
     active = scene.agr_share_active_project
-    show_all = (active == "All")
+    show_all = (active == _ALL_PROJECTS)
     scene.agr_share_items.clear()
     for entry in _cached_items:
         if not show_all and entry.get("project", "") != active:
@@ -49,7 +50,7 @@ def _apply_project_filter(scene):
         item.objects_count = entry.get("objects_count", 0)
         item.project = entry.get("project", "")
     count = len(scene.agr_share_items)
-    label = "All" if show_all else active
+    label = _ALL_PROJECTS if show_all else active
     scene.agr_share_status = f"{count} item(s) in '{label}'"
 
 
@@ -64,22 +65,47 @@ def _on_active_project_changed(self, context):
 
 _CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".agr_baker_share.json")
 
+_config_cache = None
+
 
 def _load_config() -> dict:
-    """Read config from disk. Returns empty dict on any error."""
-    if os.path.isfile(_CONFIG_PATH):
-        try:
-            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    """Read config from disk. Cached across UI redraws; invalidated by _save_config."""
+    global _config_cache
+    if _config_cache is not None:
+        return _config_cache
+    try:
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            _config_cache = json.load(f)
+    except FileNotFoundError:
+        _config_cache = {}
+    except (OSError, ValueError) as e:
+        print(f"⚠️ AGR Share: failed to read config: {e}")
+        _config_cache = {}
+    return _config_cache
 
 
 def _save_config(data: dict):
-    """Write config to disk."""
+    global _config_cache
     with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    _config_cache = dict(data)
+
+
+_config_lock = threading.Lock()
+
+
+def _update_config(**kwargs):
+    """Atomic read-modify-write on the config file.
+
+    Watcher thread persists `last_seen_ts` while the main thread persists
+    `yandex_token`, `sender_name`, etc. Without a merge step they would
+    clobber each other. The lock additionally protects against two writers
+    racing the same file.
+    """
+    with _config_lock:
+        cfg = dict(_load_config())
+        cfg.update(kwargs)
+        _save_config(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +117,24 @@ _YADISK_FOLDER = "app:/AGR_Share"
 _YADISK_INDEX = "app:/AGR_Share/agr_clipboard.json"
 _USER_AGENT = "AGR-Baker-Addon"
 _TIMEOUT = 60
+
+
+# Datablock categories shown in the Share dialog summary.
+# Each tuple: (data_from attribute, display label, Blender icon).
+# Order here = display order in the dialog.
+_CLIPBOARD_CATEGORIES = (
+    ("objects", "Objects", "OBJECT_DATA"),
+    ("collections", "Collections", "OUTLINER_COLLECTION"),
+    ("meshes", "Meshes", "MESH_DATA"),
+    ("curves", "Curves", "CURVE_DATA"),
+    ("armatures", "Armatures", "ARMATURE_DATA"),
+    ("lights", "Lights", "LIGHT_DATA"),
+    ("cameras", "Cameras", "CAMERA_DATA"),
+    ("materials", "Materials", "MATERIAL"),
+    ("images", "Images", "IMAGE_DATA"),
+    ("textures", "Textures", "TEXTURE"),
+    ("node_groups", "Node Groups", "NODETREE"),
+)
 
 
 def _get_clipboard_path():
@@ -112,46 +156,34 @@ def _get_clipboard_path():
     return None
 
 
-def _yadisk_ensure_folder(ya_token: str):
-    """Create AGR_Share folder on Yandex.Disk if it doesn't exist."""
-    path = urllib.parse.quote(_YADISK_FOLDER)
-    req = urllib.request.Request(
-        f"{_YADISK_API}?path={path}",
-        method="PUT",
-    )
+def _yadisk_mkdir(ya_token: str, path: str):
+    """Create a folder on Yandex.Disk. Idempotent — treats 409 as success."""
+    encoded = urllib.parse.quote(path)
+    req = urllib.request.Request(f"{_YADISK_API}?path={encoded}", method="PUT")
     req.add_header("Authorization", f"OAuth {ya_token}")
     try:
         urllib.request.urlopen(req, timeout=_TIMEOUT)
     except urllib.error.HTTPError as e:
-        if e.code == 409:  # folder already exists
-            pass
-        else:
+        if e.code != 409:
             raise
 
 
-def _yadisk_ensure_subfolder(ya_token: str, project: str):
-    """Create project subfolder under AGR_Share if it doesn't exist."""
-    folder_path = f"{_YADISK_FOLDER}/{project}"
-    encoded = urllib.parse.quote(folder_path)
+def _yadisk_delete(ya_token: str, path: str):
+    """Delete a resource on Yandex.Disk permanently. Raises on HTTP/URL errors."""
+    encoded = urllib.parse.quote(path)
     req = urllib.request.Request(
-        f"{_YADISK_API}?path={encoded}",
-        method="PUT",
+        f"{_YADISK_API}?path={encoded}&permanently=true",
+        method="DELETE",
     )
     req.add_header("Authorization", f"OAuth {ya_token}")
-    try:
-        urllib.request.urlopen(req, timeout=_TIMEOUT)
-    except urllib.error.HTTPError as e:
-        if e.code == 409:
-            pass
-        else:
-            raise
+    urllib.request.urlopen(req, timeout=_TIMEOUT)
 
 
 def _upload_file(file_bytes: bytes, ya_token: str, filename: str,
-                 project: str = "") -> str:
+                 project: str) -> str:
     """Upload file to Yandex.Disk AGR_Share/project/ folder. Returns disk path."""
-    _yadisk_ensure_folder(ya_token)
-    _yadisk_ensure_subfolder(ya_token, project)
+    _yadisk_mkdir(ya_token, _YADISK_FOLDER)
+    _yadisk_mkdir(ya_token, f"{_YADISK_FOLDER}/{project}")
 
     disk_path = f"{_YADISK_FOLDER}/{project}/{filename}"
     encoded_path = urllib.parse.quote(disk_path)
@@ -193,7 +225,7 @@ def _read_index(ya_token: str) -> dict:
 
 def _write_index(ya_token: str, index_data: dict):
     """Write agr_clipboard.json to Yandex.Disk (overwrite)."""
-    _yadisk_ensure_folder(ya_token)
+    _yadisk_mkdir(ya_token, _YADISK_FOLDER)
     encoded = urllib.parse.quote(_YADISK_INDEX)
     req = urllib.request.Request(f"{_YADISK_API}/upload?path={encoded}&overwrite=true")
     req.add_header("Authorization", f"OAuth {ya_token}")
@@ -293,6 +325,226 @@ def _format_relative_time(iso_str: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Notification helpers — Windows toast via PowerShell + WinRT (no pip deps)
+# ---------------------------------------------------------------------------
+
+def _show_windows_toast(title: str, body: str):
+    """Fire a Windows 10/11 toast via PowerShell + WinRT.
+
+    No-op on non-Windows. Uses CREATE_NO_WINDOW so no console flashes.
+    Title/body are wrapped in single-quoted PowerShell strings; ' is escaped
+    by doubling (standard PS rule). No variable interpolation happens inside
+    single-quoted strings, so this is safe against PS injection.
+    """
+    if sys.platform != "win32":
+        return
+
+    title_esc = title.replace("'", "''")
+    body_esc = body.replace("'", "''")
+
+    ps_script = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]|Out-Null;"
+        "[Windows.UI.Notifications.ToastNotification,Windows.UI.Notifications,ContentType=WindowsRuntime]|Out-Null;"
+        "[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime]|Out-Null;"
+        "$tpl=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+        "$texts=$tpl.GetElementsByTagName('text');"
+        f"$texts.Item(0).AppendChild($tpl.CreateTextNode('{title_esc}'))|Out-Null;"
+        f"$texts.Item(1).AppendChild($tpl.CreateTextNode('{body_esc}'))|Out-Null;"
+        "$toast=[Windows.UI.Notifications.ToastNotification]::new($tpl);"
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('AGR Baker').Show($toast)"
+    )
+
+    try:
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-WindowStyle", "Hidden", "-Command", ps_script],
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"⚠️ AGR Share toast: {e}")
+
+
+def _diff_new_items(items, last_seen_iso, my_sender):
+    """Return (new_items, latest_ts_iso) given the index and baseline.
+
+    `latest_ts_iso` is the max timestamp across all items (used to advance
+    the baseline). `new_items` is empty on first run (`last_seen_iso=None`)
+    — that prevents 30+ toasts on initial enable.
+
+    Items with no/invalid timestamp are skipped from both new and latest.
+    """
+    def parse(iso_str):
+        try:
+            return datetime.fromisoformat(iso_str)
+        except (ValueError, TypeError):
+            return None
+
+    parsed = []
+    for it in items or []:
+        ts = parse(it.get("timestamp", ""))
+        if ts is not None:
+            parsed.append((ts, it))
+
+    if not parsed:
+        return [], last_seen_iso or ""
+
+    latest_dt = max(ts for ts, _ in parsed)
+    latest_iso = latest_dt.isoformat()
+
+    last_seen_dt = parse(last_seen_iso) if last_seen_iso else None
+    if last_seen_dt is None:
+        return [], latest_iso
+
+    new = []
+    for ts, it in parsed:
+        if ts <= last_seen_dt:
+            continue
+        # Skip own shares unless sender_name is unset (then we can't tell).
+        if my_sender and it.get("sender", "") == my_sender:
+            continue
+        new.append(it)
+    return new, latest_iso
+
+
+def _persist_last_seen(ts_iso: str):
+    """Save last_seen_ts via the merge-aware updater."""
+    try:
+        _update_config(last_seen_ts=ts_iso)
+    except OSError as e:
+        print(f"⚠️ AGR Share: failed to persist last_seen_ts: {e}")
+
+
+def _on_new_items_main_thread(items):
+    """Main-thread callback scheduled via bpy.app.timers.register.
+
+    Refreshes module cache, re-applies the project filter into every scene
+    that owns share props, and forces a redraw of the AGR panel.
+    Returns None so the timer is one-shot.
+    """
+    global _cached_items
+    _cached_items = list(items)
+    for scene in bpy.data.scenes:
+        if hasattr(scene, "agr_share_items"):
+            try:
+                _apply_project_filter(scene)
+            except Exception as e:
+                print(f"⚠️ AGR Share refresh: {e}")
+    wm = bpy.context.window_manager
+    if wm:
+        for window in wm.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    for region in area.regions:
+                        if region.type == 'UI':
+                            region.tag_redraw()
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Background watcher — polls the index and fires Windows toast notifications
+# ---------------------------------------------------------------------------
+
+class _ShareWatcher:
+    """Singleton background thread that polls the shared index.
+
+    Lifecycle: started in register() (if a token is configured and
+    notifications are enabled), stopped in unregister() and restarted on
+    Settings save (token / interval / enabled may have changed).
+
+    The thread NEVER touches bpy.* directly — UI updates are bridged via
+    bpy.app.timers.register() which is one of the few thread-safe bpy APIs.
+    """
+
+    _thread = None
+    _stop_event = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def start(cls):
+        with cls._lock:
+            if cls._thread is not None and cls._thread.is_alive():
+                return
+            cfg = _load_config()
+            if not cfg.get("yandex_token"):
+                return
+            if not cfg.get("notifications_enabled", True):
+                return
+            if sys.platform != "win32":
+                # Toasts are Windows-only; on other platforms the watcher
+                # has no useful side-effect, so we don't burn API quota.
+                return
+            cls._stop_event = threading.Event()
+            cls._thread = threading.Thread(
+                target=cls._loop,
+                args=(cls._stop_event,),
+                daemon=True,
+                name="AGR-Share-Watcher",
+            )
+            cls._thread.start()
+            print("✅ AGR Share watcher started")
+
+    @classmethod
+    def stop(cls):
+        with cls._lock:
+            if cls._stop_event is not None:
+                cls._stop_event.set()
+            thread = cls._thread
+        if thread is not None:
+            thread.join(timeout=5.0)
+        with cls._lock:
+            cls._thread = None
+            cls._stop_event = None
+
+    @classmethod
+    def restart(cls):
+        cls.stop()
+        cls.start()
+
+    @staticmethod
+    def _loop(stop_event):
+        while not stop_event.is_set():
+            try:
+                cfg = _load_config()
+                token = cfg.get("yandex_token", "")
+                if not token:
+                    break
+                if not cfg.get("notifications_enabled", True):
+                    break
+                my_sender = cfg.get("sender_name", "")
+                last_seen = cfg.get("last_seen_ts")
+
+                items = _read_items(token)
+                new_items, latest_ts = _diff_new_items(items, last_seen, my_sender)
+
+                if last_seen is None and latest_ts:
+                    # Baseline on first run — record, but don't notify.
+                    _persist_last_seen(latest_ts)
+                elif new_items:
+                    _persist_last_seen(latest_ts)
+                    for entry in new_items:
+                        title = f"AGR Share: {entry.get('sender', '?')}"
+                        desc = entry.get("description") or ""
+                        body = desc if desc and desc != "No description" \
+                            else f"{entry.get('objects_count', 0)} objects shared"
+                        _show_windows_toast(title, body)
+                    bpy.app.timers.register(
+                        lambda items=items: _on_new_items_main_thread(items),
+                        first_interval=0.1,
+                    )
+            except Exception as e:
+                print(f"⚠️ AGR Share watcher: {e}")
+
+            interval = max(10, int(cfg.get("poll_interval", 30)) if cfg else 30)
+            if stop_event.wait(interval):
+                break
+        print("AGR Share watcher stopped")
+
+
+# ---------------------------------------------------------------------------
 # PropertyGroup — one shared item in the pool
 # ---------------------------------------------------------------------------
 
@@ -305,6 +557,8 @@ class AGR_ShareItem(PropertyGroup):
     """Single entry in the shared clipboard pool."""
     sender: StringProperty(name="Sender", default="")
     timestamp: StringProperty(name="Time", default="")
+    # `url` stores the Yandex.Disk resource path (e.g. "app:/AGR_Share/P/file.blend"),
+    # not an HTTP URL — kept for backwards-compatibility with existing index data.
     url: StringProperty(name="URL", default="")
     description: StringProperty(name="Description", default="")
     objects_count: IntProperty(name="Objects", default=0)
@@ -354,23 +608,51 @@ class AGR_OT_SaveShareConfig(Operator):
 
     yandex_token: StringProperty(name="Yandex.Disk Token", default="", subtype='PASSWORD')
     sender_name: StringProperty(name="Your Name", default="")
+    notifications_enabled: BoolProperty(
+        name="Windows Notifications",
+        description="Show a Windows toast when teammates share new items",
+        default=True,
+    )
+    poll_interval: IntProperty(
+        name="Poll Interval (sec)",
+        description="How often to check Yandex.Disk for new items",
+        default=30,
+        min=10,
+        max=600,
+    )
 
     def invoke(self, context, event):
         cfg = _load_config()
         self.yandex_token = cfg.get("yandex_token", "")
         self.sender_name = cfg.get("sender_name", "")
+        self.notifications_enabled = cfg.get("notifications_enabled", True)
+        self.poll_interval = int(cfg.get("poll_interval", 30))
         return context.window_manager.invoke_props_dialog(self, width=400)
 
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "yandex_token")
         layout.prop(self, "sender_name")
+        layout.separator()
+        layout.prop(self, "notifications_enabled")
+        row = layout.row()
+        row.enabled = self.notifications_enabled
+        row.prop(self, "poll_interval")
+        if sys.platform != "win32":
+            info = layout.box()
+            info.label(
+                text="Toast notifications are Windows-only.",
+                icon='INFO',
+            )
 
     def execute(self, context):
-        _save_config({
-            "yandex_token": self.yandex_token.strip(),
-            "sender_name": self.sender_name.strip(),
-        })
+        _update_config(
+            yandex_token=self.yandex_token.strip(),
+            sender_name=self.sender_name.strip(),
+            notifications_enabled=bool(self.notifications_enabled),
+            poll_interval=int(self.poll_interval),
+        )
+        _ShareWatcher.restart()
         self.report({'INFO'}, "Share settings saved")
         print("✅ AGR Share config saved")
         return {'FINISHED'}
@@ -451,7 +733,6 @@ class AGR_OT_CreateShareProject(Operator):
         name = self.project_name.strip()
         scene.agr_share_active_project = name
 
-        # Update local projects list
         existing = [p.name for p in scene.agr_share_projects]
         if name not in existing:
             p = scene.agr_share_projects.add()
@@ -464,22 +745,9 @@ class AGR_OT_CreateShareProject(Operator):
     @staticmethod
     def _do_create(state, ya_token, name):
         try:
-            # Create subfolder on Yandex.Disk
-            _yadisk_ensure_folder(ya_token)
-            folder_path = f"{_YADISK_FOLDER}/{name}"
-            encoded = urllib.parse.quote(folder_path)
-            req = urllib.request.Request(
-                f"{_YADISK_API}?path={encoded}",
-                method="PUT",
-            )
-            req.add_header("Authorization", f"OAuth {ya_token}")
-            try:
-                urllib.request.urlopen(req, timeout=_TIMEOUT)
-            except urllib.error.HTTPError as e:
-                if e.code != 409:
-                    raise
+            _yadisk_mkdir(ya_token, _YADISK_FOLDER)
+            _yadisk_mkdir(ya_token, f"{_YADISK_FOLDER}/{name}")
 
-            # Add project to index
             index_data = _read_index(ya_token)
             projects = index_data.get("projects", [])
             if name not in projects:
@@ -510,18 +778,71 @@ class AGR_OT_ShareClipboard(Operator):
 
     _timer = None
     _thread = None
-    _state = None  # shared dict: {"result": ..., "error": ...}
+    _state = None
 
     @classmethod
     def poll(cls, context):
         return not context.scene.agr_share_is_busy
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=350)
+        self._clipboard_contents = self._read_clipboard_contents()
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    @staticmethod
+    def _read_clipboard_contents():
+        """Peek into copybuffer.blend and return a dict of datablock names.
+
+        Returns None when no clipboard file exists, {} when it exists but
+        cannot be read. Uses libraries.load() in metadata-only mode — does
+        not import any datablocks into the current scene.
+
+        The returned dict maps each attribute from _CLIPBOARD_CATEGORIES
+        to a list of names (possibly empty).
+        """
+        clip_path = _get_clipboard_path()
+        if not clip_path:
+            return None
+        try:
+            with bpy.data.libraries.load(clip_path, link=False) as (data_from, data_to):
+                return {
+                    attr: list(getattr(data_from, attr, []) or [])
+                    for attr, _, _ in _CLIPBOARD_CATEGORIES
+                }
+        except Exception as e:
+            print(f"⚠️ AGR Share: failed to peek clipboard: {e}")
+            return {}
 
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "description_text", text="Description")
+
+        contents = getattr(self, "_clipboard_contents", None)
+        box = layout.box()
+        if contents is None:
+            box.label(text="Clipboard is empty (Ctrl+C first)", icon='ERROR')
+            return
+        if not contents or not any(contents.values()):
+            box.label(text="Could not read clipboard contents", icon='ERROR')
+            return
+
+        total = sum(len(v) for v in contents.values())
+        box.label(
+            text=f"Clipboard contents — {total} datablock(s):",
+            icon='PACKAGE',
+        )
+
+        per_section_max = 6
+        for attr, label, icon in _CLIPBOARD_CATEGORIES:
+            names = contents.get(attr, [])
+            if not names:
+                continue
+            section = box.column(align=True)
+            section.label(text=f"{label} ({len(names)})", icon=icon)
+            for name in names[:per_section_max]:
+                section.label(text=f"    {name}")
+            remaining = len(names) - per_section_max
+            if remaining > 0:
+                section.label(text=f"    ... and {remaining} more")
 
     def execute(self, context):
         scene = context.scene
@@ -546,14 +867,17 @@ class AGR_OT_ShareClipboard(Operator):
         with open(clip_path, "rb") as f:
             file_bytes = f.read()
 
-        obj_count = len(context.selected_objects)
+        contents = getattr(self, "_clipboard_contents", None)
+        if contents is None:
+            contents = self._read_clipboard_contents() or {}
+        obj_count = len(contents.get("objects", []))
         desc = self.description_text.strip() or "No description"
         project = scene.agr_share_active_project
-        if not project or project == "All":
-            self.report({'ERROR'}, "Select a project folder first (not 'All')")
+        if not project or project == _ALL_PROJECTS:
+            self.report({'ERROR'}, f"Select a project folder first (not '{_ALL_PROJECTS}')")
             return {'CANCELLED'}
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"clip_{sender}_{timestamp}.blend"
+        filename = f"clip_{sanitize_material_name(sender)}_{timestamp}.blend"
 
         self._state = {"result": None, "error": None}
         self._thread = threading.Thread(
@@ -611,7 +935,7 @@ class AGR_OT_ShareClipboard(Operator):
             state["result"] = disk_path
         except urllib.error.HTTPError as e:
             if e.code == 401:
-                state["error"] = "Invalid token (GitHub or Yandex)"
+                state["error"] = "Invalid Yandex.Disk token"
             elif e.code == 404:
                 state["error"] = "Index not found on Yandex.Disk"
             else:
@@ -675,24 +999,20 @@ class AGR_OT_RefreshShareList(Operator):
             self.report({'ERROR'}, error)
             return {'CANCELLED'}
 
-        # Update module cache
         global _cached_items
         _cached_items = self._state.get("items") or []
 
-        # Populate projects list with "All" virtual folder first
         scene.agr_share_projects.clear()
         p = scene.agr_share_projects.add()
-        p.name = "All"
+        p.name = _ALL_PROJECTS
         projects = self._state.get("projects") or []
         for pname in projects:
             p = scene.agr_share_projects.add()
             p.name = pname
 
-        # Set active project if empty
         if not scene.agr_share_active_project:
-            scene.agr_share_active_project = "All"
+            scene.agr_share_active_project = _ALL_PROJECTS
 
-        # Filter and populate items from cache
         _apply_project_filter(scene)
 
         count = len(scene.agr_share_items)
@@ -757,7 +1077,7 @@ class AGR_OT_ReceiveShared(Operator):
     def execute(self, context):
         scene = context.scene
         item = scene.agr_share_items[scene.agr_share_items_index]
-        disk_path = item.url  # stores Yandex.Disk path
+        disk_path = item.url
         if not disk_path:
             self.report({'ERROR'}, "No path for this item")
             return {'CANCELLED'}
@@ -842,11 +1162,14 @@ class AGR_OT_ReceiveShared(Operator):
             state["error"] = str(e)
 
     def _cleanup_tmp(self):
+        if not self._tmp_path:
+            return
         try:
-            if self._tmp_path and os.path.isfile(self._tmp_path):
-                os.remove(self._tmp_path)
-        except Exception:
+            os.remove(self._tmp_path)
+        except FileNotFoundError:
             pass
+        except OSError as e:
+            print(f"⚠️ AGR Share: failed to remove tmp file: {e}")
 
 
 # -- Delete own item --------------------------------------------------------
@@ -867,7 +1190,7 @@ class AGR_OT_DeleteShareProject(Operator):
         if scene.agr_share_is_busy:
             return False
         proj = scene.agr_share_active_project
-        return proj and proj != "All"
+        return proj and proj != _ALL_PROJECTS
 
     def invoke(self, context, event):
         return context.window_manager.invoke_confirm(self, event)
@@ -912,7 +1235,7 @@ class AGR_OT_DeleteShareProject(Operator):
             self.report({'ERROR'}, error)
             return {'CANCELLED'}
 
-        scene.agr_share_active_project = "All"
+        scene.agr_share_active_project = _ALL_PROJECTS
         scene.agr_share_status = "Project deleted. Refreshing..."
         bpy.ops.agr.refresh_share_list()
         return {'FINISHED'}
@@ -920,20 +1243,12 @@ class AGR_OT_DeleteShareProject(Operator):
     @staticmethod
     def _do_delete_project(state, ya_token, project):
         try:
-            # Delete folder from Yandex.Disk (with all files)
             try:
-                folder_path = f"{_YADISK_FOLDER}/{project}"
-                encoded = urllib.parse.quote(folder_path)
-                req = urllib.request.Request(
-                    f"{_YADISK_API}?path={encoded}&permanently=true",
-                    method="DELETE",
-                )
-                req.add_header("Authorization", f"OAuth {ya_token}")
-                urllib.request.urlopen(req, timeout=_TIMEOUT)
-            except urllib.error.HTTPError:
-                pass  # folder may not exist
+                _yadisk_delete(ya_token, f"{_YADISK_FOLDER}/{project}")
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    print(f"⚠️ AGR Share: delete folder '{project}' failed: HTTP {e.code}")
 
-            # Remove project and its items from index
             index_data = _read_index(ya_token)
             projects = index_data.get("projects", [])
             index_data["projects"] = [p for p in projects if p != project]
@@ -949,7 +1264,7 @@ class AGR_OT_DeleteShareProject(Operator):
 
 
 class AGR_OT_DeleteShared(Operator):
-    """Delete your own shared item from the pool"""
+    """Delete a shared item from the pool"""
     bl_idname = "agr.delete_shared"
     bl_label = "Delete Shared"
     bl_options = {'REGISTER'}
@@ -966,19 +1281,63 @@ class AGR_OT_DeleteShared(Operator):
         if len(scene.agr_share_items) == 0:
             return False
         idx = scene.agr_share_items_index
-        if not (0 <= idx < len(scene.agr_share_items)):
-            return False
-        cfg = _load_config()
-        sender = cfg.get("sender_name", "")
-        return sender != "" and scene.agr_share_items[idx].sender == sender
+        return 0 <= idx < len(scene.agr_share_items)
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_confirm(self, event)
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        scene = context.scene
+        layout = self.layout
+        if not (0 <= scene.agr_share_items_index < len(scene.agr_share_items)):
+            layout.label(text="No item selected", icon='ERROR')
+            return
+
+        item = scene.agr_share_items[scene.agr_share_items_index]
+        cfg = _load_config()
+        sender_name = cfg.get("sender_name", "")
+        is_own = bool(sender_name) and item.sender == sender_name
+
+        if is_own:
+            layout.label(text="Delete your shared item?", icon='TRASH')
+        else:
+            layout.label(text="Delete SOMEONE ELSE'S shared item?", icon='ERROR')
+
+        box = layout.box()
+        row = box.row()
+        row.label(text="Sender:")
+        row.label(text=item.sender or "?",
+                  icon='USER' if is_own else 'COMMUNITY')
+
+        row = box.row()
+        row.label(text="Description:")
+        row.label(text=item.description if item.description else "—")
+
+        row = box.row()
+        row.label(text="Shared:")
+        row.label(text=f"{_format_relative_time(item.timestamp)} ago")
+
+        row = box.row()
+        row.label(text="Project:")
+        row.label(text=item.project or "—")
+
+        row = box.row()
+        row.label(text="Objects:")
+        row.label(text=str(item.objects_count))
+
+        if not is_own:
+            layout.separator()
+            warn = layout.box()
+            warn.alert = True
+            warn.label(
+                text=f"This file belongs to {item.sender or 'someone else'}. Confirm deletion.",
+                icon='ERROR',
+            )
 
     def execute(self, context):
         scene = context.scene
         item = scene.agr_share_items[scene.agr_share_items_index]
-        disk_path = item.url  # stores Yandex.Disk path
+        disk_path = item.url
 
         cfg = _load_config()
         ya_token = cfg.get("yandex_token", "")
@@ -1016,7 +1375,6 @@ class AGR_OT_DeleteShared(Operator):
             self.report({'ERROR'}, error)
             return {'CANCELLED'}
 
-        # Trigger a refresh
         scene.agr_share_status = "Deleted. Refreshing..."
         bpy.ops.agr.refresh_share_list()
         return {'FINISHED'}
@@ -1024,20 +1382,13 @@ class AGR_OT_DeleteShared(Operator):
     @staticmethod
     def _do_delete(state, ya_token, disk_path):
         try:
-            # Remove file from Yandex.Disk (best-effort)
             if disk_path:
                 try:
-                    encoded = urllib.parse.quote(disk_path)
-                    req = urllib.request.Request(
-                        f"{_YADISK_API}?path={encoded}&permanently=true",
-                        method="DELETE",
-                    )
-                    req.add_header("Authorization", f"OAuth {ya_token}")
-                    urllib.request.urlopen(req, timeout=_TIMEOUT)
-                except Exception:
-                    pass  # file may already be gone
+                    _yadisk_delete(ya_token, disk_path)
+                except urllib.error.HTTPError as e:
+                    if e.code != 404:
+                        print(f"⚠️ AGR Share: delete file failed: HTTP {e.code}")
 
-            # Remove entry from index
             items = _read_items(ya_token)
             items = [i for i in items if i.get("disk_path") != disk_path]
             _write_items(ya_token, items)
@@ -1060,6 +1411,7 @@ class AGR_PT_SharePanel(Panel):
     bl_region_type = 'UI'
     bl_category = 'AGR Baker'
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 100
 
     def draw(self, context):
         layout = self.layout
@@ -1087,7 +1439,7 @@ class AGR_PT_SharePanel(Panel):
         sub.enabled = not is_busy
         sub.operator("agr.create_share_project", text="", icon='ADD')
         sub = row.row(align=True)
-        sub.enabled = not is_busy and scene.agr_share_active_project not in ("All", "")
+        sub.enabled = not is_busy and scene.agr_share_active_project not in (_ALL_PROJECTS, "")
         sub.operator("agr.delete_share_project", text="", icon='REMOVE')
 
         # --- Action buttons ---
@@ -1161,7 +1513,7 @@ def register():
     bpy.types.Scene.agr_share_active_project = StringProperty(
         name="Project",
         description="Active project folder (All = show everything)",
-        default="All",
+        default=_ALL_PROJECTS,
         update=_on_active_project_changed,
     )
     bpy.types.Scene.agr_share_items = CollectionProperty(type=AGR_ShareItem)
@@ -1170,9 +1522,16 @@ def register():
     bpy.types.Scene.agr_share_is_busy = BoolProperty(default=False)
 
     print("✅ AGR Share registered")
+    _ShareWatcher.start()
 
 
 def unregister():
+    _ShareWatcher.stop()
+
+    global _cached_items, _config_cache
+    _cached_items.clear()
+    _config_cache = None
+
     props = [
         "agr_share_is_busy",
         "agr_share_status",
