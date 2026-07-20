@@ -1,9 +1,10 @@
 """
-Material utilities for AGR Baker v2
+Material utilities for AGR Tools
 """
 
 import bpy
 import os
+import re
 
 
 _BSDF_DEFAULTS = {
@@ -51,12 +52,12 @@ def load_texture_from_disk(nodes, texture_path, texture_name, label, location, c
         return None
 
     try:
-        # Remove existing images with same name
-        if texture_name in bpy.data.images:
-            bpy.data.images.remove(bpy.data.images[texture_name])
-
+        # Remove the existing image and its numbered duplicates only.
+        # Substring matching is unsafe here: "T_X_Diffuse" is contained in
+        # "T_X_DiffuseOpacity" and would delete the wrong image.
+        dup_pattern = re.compile(re.escape(texture_name) + r'(\.\d{3})?')
         for img_name in list(bpy.data.images.keys()):
-            if texture_name in img_name:
+            if dup_pattern.fullmatch(img_name):
                 bpy.data.images.remove(bpy.data.images[img_name])
 
         # Load image
@@ -105,7 +106,9 @@ def _setup_material_nodes(material):
 
 def _finalize_material(material, bsdf, saved_values=None):
     """Apply BSDF values (saved or default), material settings, and update viewport."""
-    material.blend_method = 'HASHED'
+    # blend_method is deprecated since 4.2 — guard for 5.x where it may be gone
+    if hasattr(material, 'blend_method'):
+        material.blend_method = 'HASHED'
     material.use_backface_culling = False
 
     for key, default_val in _BSDF_DEFAULTS.items():

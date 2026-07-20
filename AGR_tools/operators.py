@@ -1,5 +1,5 @@
 """
-Operators package for AGR Baker v2
+Operators package for AGR Tools
 """
 
 from . import operators_bake
@@ -13,6 +13,10 @@ from . import operators_rename
 from . import operators_rename_project
 from . import operators_quick
 from . import operators_json
+from . import operators_lights
+from . import operators_sync
+from . import operators_easteregg
+from . import operators_library
 from . import operators_share
 
 def register():
@@ -27,9 +31,18 @@ def register():
     operators_rename_project.register()
     operators_quick.register()
     operators_json.register()
+    operators_lights.register()
+    operators_sync.register()
+    operators_easteregg.register()
+    operators_library.register()
     operators_share.register()
 
 def unregister():
+    operators_share.unregister()
+    operators_library.unregister()
+    operators_easteregg.unregister()
+    operators_sync.unregister()
+    operators_lights.unregister()
     operators_json.unregister()
     operators_quick.unregister()
     operators_rename_project.unregister()
@@ -41,4 +54,3 @@ def unregister():
     operators_utils.unregister()
     operators_sets.unregister()
     operators_bake.unregister()
-    operators_share.unregister()

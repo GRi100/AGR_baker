@@ -8,6 +8,42 @@ from bpy.props import EnumProperty, IntProperty
 import os
 
 from .core import texture_sets, materials
+from .log import agr_report
+
+
+def strip_useless_alpha_in_folders(folders):
+    """Convert every RGBA PNG whose alpha channel is fully white to RGB.
+    Returns the number of converted files. Requires Pillow (caller checks)."""
+    from PIL import Image
+    from .core.texture_sets import png_has_alpha
+
+    converted = 0
+    for folder in folders:
+        if not folder or not os.path.isdir(folder):
+            continue
+        for fname in os.listdir(folder):
+            if not fname.lower().endswith('.png'):
+                continue
+            path = os.path.join(folder, fname)
+            if not png_has_alpha(path):
+                continue
+            try:
+                with Image.open(path) as img:
+                    if 'A' not in img.getbands():
+                        continue
+                    # getextrema is a C pass — no python-list materialization
+                    if img.getchannel('A').getextrema()[0] < 254:
+                        continue
+                    rgb = img.convert('RGB')
+                try:
+                    rgb.save(path, 'PNG')
+                    converted += 1
+                    print(f"  🧹 {fname}: useless white alpha stripped (RGBA → RGB)")
+                finally:
+                    rgb.close()
+            except Exception as e:
+                print(f"  ⚠️ strip alpha failed for {fname}: {e}")
+    return converted
 
 
 class AGR_OT_RefreshTextureSets(Operator):
@@ -15,10 +51,59 @@ class AGR_OT_RefreshTextureSets(Operator):
     bl_idname = "agr.refresh_texture_sets"
     bl_label = "Refresh Texture Sets"
     bl_options = {'REGISTER'}
-    
+
     def execute(self, context):
+        # Thumbnails may reference replaced/deleted files after a rescan
+        from . import ui
+        ui.invalidate_set_thumbnails()
+
         count = texture_sets.refresh_texture_sets_list(context)
-        self.report({'INFO'}, f"Found {count} texture sets")
+
+        # Optional auto-cleanup: RGBA files with a fully white alpha come
+        # from external/legacy sources and only skew alpha detection
+        settings = context.scene.agr_baker_settings
+        if getattr(settings, 'auto_strip_alpha', False):
+            try:
+                from PIL import Image  # noqa: F401
+            except ImportError:
+                pass
+            else:
+                folders = [ts.folder_path for ts in context.scene.agr_texture_sets if ts.has_alpha]
+                converted = strip_useless_alpha_in_folders(folders)
+                if converted:
+                    bpy.ops.agr.check_alpha_on_all_sets()
+                    agr_report(self, 'INFO', f"Found {count} sets, stripped useless alpha in {converted} file(s)")
+                    return {'FINISHED'}
+
+        agr_report(self, 'INFO', f"Found {count} texture sets")
+        return {'FINISHED'}
+
+
+class AGR_OT_StripUselessAlpha(Operator):
+    """Convert RGBA textures with a fully white alpha channel to RGB (smaller files, honest alpha detection)"""
+    bl_idname = "agr.strip_useless_alpha"
+    bl_label = "Strip Useless Alpha"
+    # No UNDO: rewrites PNG files in place, Ctrl+Z cannot revert them
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        if not any(ts.is_selected for ts in context.scene.agr_texture_sets):
+            cls.poll_message_set("Выберите текстурные сеты кликом по строкам списка")
+            return False
+        return True
+
+    def execute(self, context):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.report({'ERROR'}, "PIL/Pillow not available. Install with: pip install Pillow")
+            return {'CANCELLED'}
+
+        folders = [ts.folder_path for ts in context.scene.agr_texture_sets if ts.is_selected]
+        converted = strip_useless_alpha_in_folders(folders)
+        bpy.ops.agr.check_alpha_on_all_sets()
+        agr_report(self, 'INFO', f"Converted {converted} file(s) RGBA → RGB")
         return {'FINISHED'}
 
 
@@ -26,7 +111,8 @@ class AGR_OT_ResizeTextureSet(Operator):
     """Resize all textures in selected sets using LANCZOS algorithm"""
     bl_idname = "agr.resize_texture_set"
     bl_label = "Resize Texture Set"
-    bl_options = {'REGISTER', 'UNDO'}
+    # No UNDO: rewrites PNG files in place, Ctrl+Z cannot revert them
+    bl_options = {'REGISTER'}
     
     target_resolution: EnumProperty(
         name="Target Resolution",
@@ -406,22 +492,24 @@ class AGR_OT_DeleteSelectedSets(Operator):
 
 
 class AGR_OT_ToggleSetSelection(Operator):
-    """Toggle texture set selection"""
+    """Toggle texture set selection (click on a row/card; selected entries are highlighted blue)"""
     bl_idname = "agr.toggle_set_selection"
     bl_label = "Toggle Selection"
     bl_options = {'REGISTER'}
-    
+
     set_index: bpy.props.IntProperty()
-    
+
     def execute(self, context):
         texture_sets_list = context.scene.agr_texture_sets
-        
+
         if self.set_index < 0 or self.set_index >= len(texture_sets_list):
             return {'CANCELLED'}
-        
+
         tex_set = texture_sets_list[self.set_index]
         tex_set.is_selected = not tex_set.is_selected
-        
+        # The clicked entry also becomes the active one
+        context.scene.agr_texture_sets_index = self.set_index
+
         return {'FINISHED'}
 
 
@@ -554,63 +642,35 @@ class AGR_OT_CheckAlphaOnAllSets(Operator):
     bl_options = {'REGISTER'}
     
     def execute(self, context):
-        import struct
+        from .core.texture_sets import read_png_ihdr
         texture_sets_list = context.scene.agr_texture_sets
-        
+
         checked_count = 0
         alpha_count = 0
-        
+
         for tex_set in texture_sets_list:
             # Default to False
             tex_set.has_alpha = False
-            
+
             if tex_set.has_diffuse_opacity:
                 material_name = tex_set.material_name
                 folder_path = tex_set.folder_path
                 do_path = os.path.join(folder_path, f"T_{material_name}_DiffuseOpacity.png")
-                
+
                 if os.path.exists(do_path):
-                    try:
-                        # Check PNG format by reading file header
-                        with open(do_path, 'rb') as f:
-                            # Read PNG signature
-                            signature = f.read(8)
-                            if signature != b'\x89PNG\r\n\x1a\n':
-                                print(f"⚠️ {material_name}: Not a valid PNG file")
-                                continue
-                            
-                            # Read IHDR chunk (should be first chunk)
-                            chunk_length_bytes = f.read(4)
-                            if len(chunk_length_bytes) < 4:
-                                print(f"⚠️ {material_name}: Cannot read chunk length")
-                                continue
-                            
-                            chunk_type = f.read(4)
-                            if chunk_type != b'IHDR':
-                                print(f"⚠️ {material_name}: IHDR chunk not found")
-                                continue
-                            
-                            # Read IHDR data (13 bytes)
-                            ihdr_data = f.read(13)
-                            if len(ihdr_data) < 13:
-                                print(f"⚠️ {material_name}: Cannot read IHDR data")
-                                continue
-                            
-                            color_type = ihdr_data[9]
-                            
-                            # Color types with alpha: 4 (grayscale+alpha) or 6 (RGBA)
-                            has_alpha = color_type in (4, 6)
-                            tex_set.has_alpha = has_alpha
-                            checked_count += 1
-                            if has_alpha:
-                                alpha_count += 1
-                            print(f"✅ Checked {material_name}: alpha={has_alpha}, color_type={color_type}")
-                        
-                    except Exception as e:
-                        print(f"❌ Error checking {do_path}: {e}")
-                        import traceback
-                        traceback.print_exc()
-        
+                    _, _, color_type = read_png_ihdr(do_path)
+                    if color_type < 0:
+                        print(f"⚠️ {material_name}: Not a readable PNG file")
+                        continue
+
+                    # Color types with alpha: 4 (grayscale+alpha) or 6 (RGBA)
+                    has_alpha = color_type in (4, 6)
+                    tex_set.has_alpha = has_alpha
+                    checked_count += 1
+                    if has_alpha:
+                        alpha_count += 1
+                    print(f"✅ Checked {material_name}: alpha={has_alpha}, color_type={color_type}")
+
         self.report({'INFO'}, f"Checked {checked_count} sets, {alpha_count} have alpha")
         return {'FINISHED'}
 
@@ -823,7 +883,8 @@ class AGR_OT_GaussianBlurSet(Operator):
     """Apply Gaussian blur to all textures in selected sets"""
     bl_idname = "agr.gaussian_blur_set"
     bl_label = "Gaussian Blur on Selected Sets"
-    bl_options = {'REGISTER', 'UNDO'}
+    # No UNDO: rewrites PNG files in place, Ctrl+Z cannot revert them
+    bl_options = {'REGISTER'}
     
     blur_radius: bpy.props.FloatProperty(
         name="Blur Radius (px)",
@@ -945,6 +1006,172 @@ class AGR_OT_GaussianBlurSet(Operator):
         layout.label(text="• Reconnects textures to material")
 
 
+class AGR_OT_MirrorTextureSet(Operator):
+    """Create mirrored copies of selected texture sets (new S_*_mirrorX/_mirrorY folders)"""
+    bl_idname = "agr.mirror_texture_set"
+    bl_label = "Mirror Selected Sets"
+    # No UNDO: writes new PNG folders on disk, Ctrl+Z cannot revert them
+    bl_options = {'REGISTER'}
+
+    mirror_axis: bpy.props.EnumProperty(
+        name="Mirror Axis",
+        description="Axis to mirror textures across",
+        items=[
+            ('X', "X (horizontal)", "Flip left-right, creates _mirrorX set"),
+            ('Y', "Y (vertical)", "Flip top-bottom, creates _mirrorY set"),
+        ],
+        default='X'
+    )
+
+    def execute(self, context):
+        texture_sets_list = context.scene.agr_texture_sets
+
+        # Get selected sets (atlases excluded - mirror only regular sets)
+        selected_sets = [tex_set for tex_set in texture_sets_list
+                         if tex_set.is_selected and not tex_set.is_atlas]
+
+        if len(selected_sets) == 0:
+            self.report({'WARNING'}, "No texture sets selected")
+            return {'CANCELLED'}
+
+        try:
+            from PIL import Image
+        except ImportError:
+            self.report({'ERROR'}, "PIL/Pillow not available. Install with: pip install Pillow")
+            return {'CANCELLED'}
+
+        suffix = f"mirror{self.mirror_axis}"
+        flip_method = Image.FLIP_LEFT_RIGHT if self.mirror_axis == 'X' else Image.FLIP_TOP_BOTTOM
+        # Flipping a normal map inverts one normal component:
+        # X flip -> invert R channel, Y flip -> invert G channel (OpenGL)
+        invert_channel = 0 if self.mirror_axis == 'X' else 1
+
+        processed_count = 0
+        error_count = 0
+
+        for tex_set in selected_sets:
+            material_name = tex_set.material_name
+            folder_path = tex_set.folder_path
+
+            try:
+                print(f"\n🔄 Mirroring {material_name} ({self.mirror_axis})...")
+
+                parent_folder = os.path.dirname(folder_path)
+                new_folder_name = f"S_{material_name}_{suffix}"
+                new_folder_path = os.path.join(parent_folder, new_folder_name)
+                if not os.path.exists(new_folder_path):
+                    os.makedirs(new_folder_path)
+
+                texture_types = [
+                    ('Diffuse', f"T_{material_name}_Diffuse.png"),
+                    ('DiffuseOpacity', f"T_{material_name}_DiffuseOpacity.png"),
+                    ('Roughness', f"T_{material_name}_Roughness.png"),
+                    ('Metallic', f"T_{material_name}_Metallic.png"),
+                    ('Emit', f"T_{material_name}_Emit.png"),
+                    ('Opacity', f"T_{material_name}_Opacity.png"),
+                    ('ERM', f"T_{material_name}_ERM.png"),
+                    ('Normal', f"T_{material_name}_Normal.png"),
+                ]
+
+                mirrored_count = 0
+                failed_count = 0
+
+                for tex_type, filename in texture_types:
+                    tex_path = os.path.join(folder_path, filename)
+
+                    if os.path.exists(tex_path):
+                        try:
+                            with Image.open(tex_path) as img:
+                                img_mirrored = img.transpose(flip_method)
+
+                            if tex_type == 'Normal':
+                                if img_mirrored.mode not in ('RGB', 'RGBA'):
+                                    img_mirrored = img_mirrored.convert('RGB')
+                                channels = list(img_mirrored.split())
+                                channels[invert_channel] = channels[invert_channel].point(lambda v: 255 - v)
+                                img_mirrored = Image.merge(img_mirrored.mode, channels)
+
+                            new_filename = f"T_{material_name}_{suffix}_{tex_type}.png"
+                            output_path = os.path.join(new_folder_path, new_filename)
+                            img_mirrored.save(output_path, 'PNG')
+                            img_mirrored.close()
+                            print(f"  🪞 Mirrored {tex_type}")
+                            mirrored_count += 1
+
+                        except Exception as e:
+                            print(f"  ⚠️ Error mirroring {tex_type}: {e}")
+                            failed_count += 1
+
+                if failed_count > 0:
+                    error_count += 1
+
+                if mirrored_count > 0:
+                    print(f"  ✅ Created {new_folder_name} with {mirrored_count} textures")
+                    processed_count += 1
+                else:
+                    print(f"  ⚠️ No textures found to mirror")
+                    # Don't leave an empty S_*_mirror* folder behind
+                    try:
+                        os.rmdir(new_folder_path)
+                    except OSError:
+                        pass
+
+            except Exception as e:
+                print(f"  ❌ Error processing {material_name}: {e}")
+                error_count += 1
+
+        # Refresh texture sets list so new _mirror* sets appear
+        texture_sets.refresh_texture_sets_list(context)
+
+        if error_count > 0:
+            self.report({'WARNING'}, f"Mirrored {processed_count} sets, {error_count} errors")
+        else:
+            self.report({'INFO'}, f"Created {processed_count} mirrored set(s) (_{suffix})")
+
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        selected_count = sum(1 for tex_set in context.scene.agr_texture_sets
+                             if tex_set.is_selected and not tex_set.is_atlas)
+        if selected_count == 0:
+            self.report({'WARNING'}, "No sets selected")
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        layout = self.layout
+        selected_count = sum(1 for tex_set in context.scene.agr_texture_sets
+                             if tex_set.is_selected and not tex_set.is_atlas)
+
+        layout.label(text=f"Mirror {selected_count} texture set(s)", icon='MOD_MIRROR')
+        layout.separator()
+        layout.prop(self, "mirror_axis", expand=True)
+        layout.separator()
+        layout.label(text="• Creates new S_*_mirrorX/_mirrorY sets", icon='INFO')
+        layout.label(text="• Normal maps get channel inversion")
+
+
+class AGR_OT_SelectMirroredSets(Operator):
+    """Select all texture sets with _mirrorX/_mirrorY suffix"""
+    bl_idname = "agr.select_mirrored_sets"
+    bl_label = "Select Mirrored Sets"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        texture_sets_list = context.scene.agr_texture_sets
+        selected_count = 0
+
+        for tex_set in texture_sets_list:
+            if tex_set.name.endswith("_mirrorX") or tex_set.name.endswith("_mirrorY"):
+                tex_set.is_selected = True
+                selected_count += 1
+            else:
+                tex_set.is_selected = False
+
+        self.report({'INFO'}, f"Selected {selected_count} mirrored sets")
+        return {'FINISHED'}
+
+
 # List of all operator classes for registration
 classes = (
     AGR_OT_RefreshTextureSets,
@@ -967,6 +1194,9 @@ classes = (
     AGR_OT_SortSetsByResolution,
     AGR_OT_SortSetsByAlpha,
     AGR_OT_GaussianBlurSet,
+    AGR_OT_MirrorTextureSet,
+    AGR_OT_SelectMirroredSets,
+    AGR_OT_StripUselessAlpha,
 )
 
 

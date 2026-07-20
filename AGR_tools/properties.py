@@ -1,5 +1,5 @@
 """
-Property definitions for AGR Baker v2
+Property definitions for AGR Tools
 """
 
 import bpy
@@ -168,92 +168,16 @@ class AGR_BakerSettings(PropertyGroup):
         description="Use denoising during baking",
         default=False
     )
-    
-    # UI collapsible sections
-    show_sets_list: BoolProperty(
-        name="Texture Sets List",
-        description="Show texture sets list",
+
+    auto_strip_alpha: BoolProperty(
+        name="Auto Strip Useless Alpha",
+        description="On Refresh: convert RGBA textures whose alpha is fully white to RGB",
         default=False
     )
 
-    show_batch_ops: BoolProperty(
-        name="Batch Operations",
-        description="Show batch operations section",
-        default=False
-    )
-
-    show_delete_ops: BoolProperty(
-        name="Delete Operations",
-        description="Show delete operations",
-        default=False
-    )
-
-    show_atlas_ops: BoolProperty(
-        name="Atlas Operations",
-        description="Show atlas operations section",
-        default=False
-    )
-
-    show_atlas_from_selected: BoolProperty(
-        name="Atlas from Selected Sets",
-        description="Show preview/create atlas from selected sets",
-        default=False
-    )
-
-    show_udim_ops: BoolProperty(
-        name="UDIM Operations",
-        description="Show UDIM operations section",
-        default=False
-    )
-
-    show_sort_select: BoolProperty(
-        name="Sort & Select",
-        description="Show sort and selection controls",
-        default=False
-    )
-
-    # JSON panel collapsible sections
-    show_json_fields: BoolProperty(
-        name="GeoJSON Fields",
-        description="Show GeoJSON editable fields",
-        default=False
-    )
-
-    show_json_ground: BoolProperty(
-        name="Ground Fields",
-        description="Show Ground-specific fields",
-        default=False
-    )
-
-    show_json_file_props: BoolProperty(
-        name="File Properties",
-        description="Show individual file properties",
-        default=False
-    )
-
-    show_json_utils: BoolProperty(
-        name="GeoJSON Utilities",
-        description="Show GeoJSON utility operations",
-        default=False
-    )
-
-    show_json_glasses: BoolProperty(
-        name="Glass Materials",
-        description="Show glass materials per folder",
-        default=False
-    )
-
-    show_json_coords: BoolProperty(
-        name="Coordinates",
-        description="Show coordinates per folder",
-        default=False
-    )
-
-    show_json_image: BoolProperty(
-        name="Image Preview",
-        description="Show image preview section",
-        default=False
-    )
+    # NOTE: the old show_* section toggles are gone — every collapsible
+    # section is now a real Blender sub-panel (bl_parent_id) and Blender
+    # stores the open/closed state itself.
 
     # Output settings
     output_folder: StringProperty(
@@ -263,6 +187,24 @@ class AGR_BakerSettings(PropertyGroup):
     )
     
     # Texture sets list settings
+    sets_view_mode: EnumProperty(
+        name="View",
+        description="How the texture sets are displayed",
+        items=[
+            ('LIST', "List", "Compact rows with small thumbnails", 'COLLAPSEMENU', 0),
+            ('GALLERY', "Gallery", "Library-style cards with large previews", 'IMGDISPLAY', 1),
+        ],
+        default='LIST'
+    )
+
+    gallery_columns: IntProperty(
+        name="Columns",
+        description="Number of cards per row in gallery view",
+        default=2,
+        min=1,
+        max=4
+    )
+
     sets_sort_mode: EnumProperty(
         name="Sort By",
         description="Sort texture sets list",

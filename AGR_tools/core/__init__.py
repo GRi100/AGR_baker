@@ -1,5 +1,5 @@
 """
-Core utilities package for AGR Baker v2
+Core utilities package for AGR Tools
 """
 
 from . import baking

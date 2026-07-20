@@ -318,7 +318,9 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
         if img.size[0] > 0 and img.size[1] > 0:
             try:
                 import numpy as np
-                pixels = np.array(img.pixels[:]).reshape(img.size[1], img.size[0], 4)
+                pixels = np.empty(img.size[0] * img.size[1] * 4, dtype=np.float32)
+                img.pixels.foreach_get(pixels)
+                pixels = pixels.reshape(img.size[1], img.size[0], 4)
                 # Flip vertically: Blender pixels are bottom-to-top, Pillow expects top-to-bottom
                 arr = (np.flipud(pixels) * 255).astype('uint8')
                 return Image.fromarray(arr, 'RGBA')

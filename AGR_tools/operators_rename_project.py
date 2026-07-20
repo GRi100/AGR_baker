@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """
-AGR Rename Project operator for AGR Baker v2
+AGR Rename Project operator for AGR Tools
 Based on rename_project.py - handles full project renaming
 """
 
@@ -583,7 +583,8 @@ class AGR_RP_OT_rename_project(Operator):
             obj, textures, low_texture_folder, address, number, obj_type
         )
         if renamed_count > 0 and new_texture_paths:
-            self._pack_textures_and_cleanup(low_texture_folder, loaded_images)
+            self._pack_textures_and_cleanup(low_texture_folder, loaded_images,
+                                            new_texture_paths.values())
             return True
         return False
 
@@ -665,7 +666,7 @@ class AGR_RP_OT_rename_project(Operator):
 
         return renamed_count, new_texture_paths, loaded_images
 
-    def _pack_textures_and_cleanup(self, folder_path, images):
+    def _pack_textures_and_cleanup(self, folder_path, images, created_paths=None):
         """Pack textures and cleanup folder"""
         packed_any = False
         seen_paths = set()
@@ -688,20 +689,19 @@ class AGR_RP_OT_rename_project(Operator):
             except Exception:
                 continue
 
+        # Remove only the files this operator created — low_texture may
+        # contain foreign user files that must survive the cleanup.
+        for path in (created_paths or []):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+        # rmdir succeeds only when the folder is empty
         try:
-            for root, dirs, files in os.walk(folder_path, topdown=False):
-                for filename in files:
-                    try:
-                        os.remove(os.path.join(root, filename))
-                    except Exception:
-                        pass
-                for dirname in dirs:
-                    try:
-                        os.rmdir(os.path.join(root, dirname))
-                    except Exception:
-                        pass
             os.rmdir(folder_path)
-        except Exception:
+        except OSError:
             pass
 
         if packed_any:
@@ -962,7 +962,8 @@ class AGR_RP_OT_rename_project(Operator):
                 counter = spot_counter
                 spot_counter += 1
             elif light_type == 'POINT':
-                lighttype_name = 'Point'
+                # Project convention: point lights are named "Omni" (3ds Max style)
+                lighttype_name = 'Omni'
                 counter = point_counter
                 point_counter += 1
             else:
@@ -1014,7 +1015,8 @@ class AGR_RP_OT_rename_project(Operator):
                         collections_data[coll_name].append(child)
                 continue
 
-            match = re.match(r'^' + re.escape(address) + r'_(\d{3})_(Spot|Point)_\d+$', obj_name)
+            # 'Point' kept for legacy scenes renamed before the Omni convention
+            match = re.match(r'^' + re.escape(address) + r'_(\d{3})_(Spot|Omni|Point)_\d+$', obj_name)
             if match:
                 continue
 
@@ -1039,7 +1041,7 @@ class AGR_RP_OT_rename_project(Operator):
                         collections_data[coll_name].append(child)
                 continue
 
-            match = re.match(r'^' + re.escape(address) + r'_(Spot|Point)_\d+$', obj_name)
+            match = re.match(r'^' + re.escape(address) + r'_(Spot|Omni|Point)_\d+$', obj_name)
             if match:
                 continue
 
@@ -1064,7 +1066,7 @@ class AGR_RP_OT_rename_project(Operator):
                         collections_data[coll_name].append(child)
                 continue
 
-            match = re.match(r'^' + re.escape(address) + r'_Ground_(Spot|Point)_\d+$', obj_name)
+            match = re.match(r'^' + re.escape(address) + r'_Ground_(Spot|Omni|Point)_\d+$', obj_name)
             if match:
                 continue
 

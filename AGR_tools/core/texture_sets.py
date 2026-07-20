@@ -1,9 +1,10 @@
 """
-Texture set management for AGR Baker v2
+Texture set management for AGR Tools
 """
 
 import bpy
 import os
+import json
 import struct
 from pathlib import Path
 
@@ -56,9 +57,42 @@ def ensure_texture_set_folder(context, material_name):
     return set_folder
 
 
+def read_png_ihdr(filepath):
+    """Parse a PNG IHDR without loading the image — the ONE shared parser
+    (operators_sets / operators_udim reuse it; do not add local copies).
+    Returns (width, height, color_type); (0, 0, -1) for unreadable files.
+    Color types: 0=grayscale, 2=RGB, 3=indexed, 4=gray+alpha, 6=RGBA."""
+    try:
+        with open(filepath, 'rb') as f:
+            if f.read(8) != b'\x89PNG\r\n\x1a\n':
+                return 0, 0, -1
+            f.read(4)  # chunk length
+            if f.read(4) != b'IHDR':
+                return 0, 0, -1
+            ihdr_data = f.read(10)  # width(4) + height(4) + bit_depth(1) + color_type(1)
+            if len(ihdr_data) != 10:
+                return 0, 0, -1
+            width, height = struct.unpack('>II', ihdr_data[:8])
+            return width, height, ihdr_data[9]
+    except Exception:
+        return 0, 0, -1
+
+
+def png_has_alpha(filepath):
+    """True when the PNG stores an alpha channel (color_type 4 or 6)."""
+    return read_png_ihdr(filepath)[2] in (4, 6)
+
+
+def _read_png_max_dimension(filepath):
+    """Read max(width, height) from a PNG IHDR without loading the image.
+    Returns 0 when the file is not a readable PNG."""
+    width, height, _ = read_png_ihdr(filepath)
+    return max(width, height)
+
+
 def scan_texture_sets(context):
     """
-    Scan AGR_BAKE folder for texture sets (S_material_name folders)
+    Scan AGR_BAKE folder for texture sets (S_* folders) and atlases (A_* folders)
     Returns list of found texture sets
     """
     agr_bake_path = get_agr_bake_folder(context)
@@ -68,16 +102,16 @@ def scan_texture_sets(context):
     
     texture_sets = []
     
-    # Scan for S_* folders (regular texture sets)
+    # Scan for S_* folders (regular texture sets) and A_* folders (atlases)
     for item in os.listdir(agr_bake_path):
         item_path = os.path.join(agr_bake_path, item)
-        
+
         if os.path.isdir(item_path) and item.startswith("S_"):
             material_name = item[2:]  # Remove "S_" prefix
-            
+
             # Check for textures in folder
             texture_info = scan_texture_set_folder(item_path, material_name)
-            
+
             if texture_info['has_any']:
                 texture_sets.append({
                     'name': item,
@@ -86,7 +120,47 @@ def scan_texture_sets(context):
                     'textures': texture_info,
                     'is_atlas': False
                 })
-    
+
+        elif os.path.isdir(item_path) and item.startswith("A_"):
+            atlas_name = item[2:]  # Remove "A_" prefix
+
+            # HIGH atlases use full-type filenames (T_<name>_Diffuse.png ...)
+            texture_info = scan_texture_set_folder(item_path, atlas_name)
+
+            atlas_type = 'HIGH'
+            mapping_path = os.path.join(item_path, 'atlas_mapping.json')
+            if os.path.exists(mapping_path):
+                try:
+                    with open(mapping_path, 'r', encoding='utf-8') as f:
+                        atlas_type = json.load(f).get('atlas_type', 'HIGH')
+                except Exception as e:
+                    print(f"  ⚠️ Could not read atlas_mapping.json in {item}: {e}")
+
+            if not texture_info['has_any']:
+                # LOW atlases use short-suffix filenames (T_X_d.png ...) —
+                # fall back to any READABLE PNG in the folder; unreadable
+                # files must not surface a set with resolution 0
+                max_res = 0
+                for fname in os.listdir(item_path):
+                    if fname.lower().endswith('.png'):
+                        res = _read_png_max_dimension(os.path.join(item_path, fname))
+                        if res > max_res:
+                            max_res = res
+                if max_res > 0:
+                    texture_info['has_any'] = True
+                    texture_info['resolution'] = max_res
+
+            if texture_info['has_any']:
+                texture_sets.append({
+                    'name': item,
+                    'material_name': atlas_name,
+                    'folder_path': item_path,
+                    'textures': texture_info,
+                    'is_atlas': True,
+                    'atlas_type': atlas_type,
+                    'object_name': '',
+                })
+
     print(f"🔍 Found {len(texture_sets)} texture sets in AGR_BAKE")
     return texture_sets
 
@@ -129,23 +203,11 @@ def scan_texture_set_folder(folder_path, material_name):
             texture_info[key] = True
             texture_info['has_any'] = True
             
-            # Get resolution from PNG IHDR chunk (first 33 bytes) without loading full image
-            try:
-                with open(filepath, 'rb') as f:
-                    signature = f.read(8)
-                    if signature == b'\x89PNG\r\n\x1a\n':
-                        chunk_length_bytes = f.read(4)
-                        chunk_type = f.read(4)
-                        if chunk_type == b'IHDR' and len(chunk_length_bytes) == 4:
-                            ihdr_data = f.read(8)  # width(4) + height(4)
-                            if len(ihdr_data) == 8:
-                                width, height = struct.unpack('>II', ihdr_data)
-                                current_resolution = max(width, height)
-                                if current_resolution > max_resolution:
-                                    max_resolution = current_resolution
-                                    print(f"  📏 {filename}: {current_resolution}px (new max)")
-            except Exception as e:
-                print(f"  ⚠️ Could not read resolution from {filename}: {e}")
+            # Get resolution from PNG IHDR without loading the full image
+            current_resolution = _read_png_max_dimension(filepath)
+            if current_resolution > max_resolution:
+                max_resolution = current_resolution
+                print(f"  📏 {filename}: {current_resolution}px (new max)")
     
     # Set resolution to maximum found, or keep default 1024
     if max_resolution > 0:
@@ -161,44 +223,29 @@ def refresh_texture_sets_list(context):
     """Refresh texture sets list in scene properties"""
     texture_sets_collection = context.scene.agr_texture_sets
     settings = context.scene.agr_baker_settings
-    
+
+    # Keep checkbox selection across refresh — batch ops call refresh at the
+    # end, and losing the selection after every operation is hostile
+    previous_selection = {ts.folder_path: ts.is_selected for ts in texture_sets_collection}
+
     # Clear existing
     texture_sets_collection.clear()
-    
+
     # Scan and add
     found_sets = scan_texture_sets(context)
-    
+
     # Check alpha on all sets BEFORE sorting (to preserve alpha info)
-    import struct
     for set_data in found_sets:
         set_data['textures']['has_alpha'] = False
-        
+
         if set_data['textures']['has_diffuse_opacity']:
             material_name = set_data['material_name']
             folder_path = set_data['folder_path']
             do_path = os.path.join(folder_path, f"T_{material_name}_DiffuseOpacity.png")
-            
-            if os.path.exists(do_path):
-                try:
-                    with open(do_path, 'rb') as f:
-                        signature = f.read(8)
-                        if signature == b'\x89PNG\r\n\x1a\n':
-                            chunk_length_bytes = f.read(4)
-                            if len(chunk_length_bytes) == 4:
-                                chunk_type = f.read(4)
-                                if chunk_type == b'IHDR':
-                                    ihdr_data = f.read(13)
-                                    if len(ihdr_data) == 13:
-                                        # IHDR structure: width(4) + height(4) + bit_depth(1) + color_type(1) + ...
-                                        color_type = ihdr_data[9]  # Color type is at byte 9, not 8
-                                        print(f"  🔍 {material_name}: PNG color_type = {color_type}")
-                                        if color_type in (4, 6):  # Grayscale+Alpha or RGBA
-                                            set_data['textures']['has_alpha'] = True
-                                            print(f"  ✅ {material_name}: Has alpha channel!")
-                                        else:
-                                            print(f"  ⚠️ {material_name}: No alpha (color_type {color_type})")
-                except Exception as e:
-                    print(f"  ❌ {material_name}: Error checking alpha: {e}")
+
+            if os.path.exists(do_path) and png_has_alpha(do_path):
+                set_data['textures']['has_alpha'] = True
+                print(f"  ✅ {material_name}: Has alpha channel!")
     
     # Sort based on settings
     if settings.sets_sort_mode == 'NAME':
@@ -232,7 +279,7 @@ def refresh_texture_sets_list(context):
         
         # Copy alpha flag (already checked above)
         tex_set.has_alpha = textures.get('has_alpha', False)
-        tex_set.is_selected = False
+        tex_set.is_selected = previous_selection.get(set_data['folder_path'], False)
         
         # Atlas-specific properties
         tex_set.is_atlas = set_data.get('is_atlas', False)
@@ -301,15 +348,19 @@ def check_if_set_assigned(context, material_name):
     # Check if material exists with this name
     if material_name in bpy.data.materials:
         material = bpy.data.materials[material_name]
-        
-        # Check if material has texture nodes
+
+        # Check if material has texture nodes. Match the FULL filename
+        # prefix with a valid type — a bare "T_Wall_" substring would also
+        # match derived sets (T_Wall_Frame_*, T_Wall_mirrorX_*).
         if material.use_nodes:
+            valid_types = ('Diffuse', 'DiffuseOpacity', 'Emit', 'Roughness',
+                           'Metallic', 'Opacity', 'Normal', 'ERM')
+            prefixes = tuple(f"T_{material_name}_{t}" for t in valid_types)
             for node in material.node_tree.nodes:
                 if node.type == 'TEX_IMAGE' and node.image:
-                    # Check if image name matches texture set
-                    if f"T_{material_name}_" in node.image.name:
+                    if node.image.name.startswith(prefixes):
                         return True
-    
+
     return False
 
 

@@ -1,5 +1,5 @@
 """
-Atlas creation operators for AGR Baker v2
+Atlas creation operators for AGR Tools
 """
 
 import bpy
@@ -18,6 +18,7 @@ except ImportError:
 
 # Import material utilities
 from .core.materials import connect_texture_set_to_material, connect_regular_texture_set_to_material, validate_all_high_mode
+from .log import agr_report
 
 
 # ===== HELPER FUNCTIONS =====
@@ -43,41 +44,49 @@ def process_object_name(obj_name):
     
     # ADDRESS - это всё между SM_ и _ObjectType
     address = '_'.join(name_parts[:-1])
-    
+
     return address, obj_type
 
 
-def get_atlas_naming(context, atlas_type, atlas_size, texture_sets_count):
-    """
-    Определяет именование атласа на основе активного объекта
-    Returns: (atlas_name, material_name, use_low_naming)
-    """
-    active_obj = context.active_object
-    
-    # Пытаемся определить тип объекта для LOW атласов
-    if atlas_type == 'LOW' and active_obj:
-        try:
-            address, obj_type = process_object_name(active_obj.name)
-            # LOW атлас с специальным именованием
-            atlas_name = f"A_{address}_{obj_type}"
-            material_name = f"M_{address}_{obj_type}_1"
-            return atlas_name, material_name, True
-        except Exception:
-            pass
-    
-    # HIGH атлас или объект не подходит под LOW схему
-    if active_obj:
-        atlas_name = f"A_{active_obj.name}"
-    else:
-        atlas_name = f"A_Atlas_{atlas_type}_{atlas_size}"
-    
-    material_name = f"M_{atlas_name}"
-    return atlas_name, material_name, False
+def count_faces_with_uvs_outside_unit(obj, tolerance=0.001):
+    """Count faces whose UVs leave the 0..1 square — tiled UVs cannot be
+    linearly remapped into an atlas cell without bleeding into neighbours."""
+    mesh = obj.data
+    if not mesh.uv_layers.active:
+        return 0
+    uv_data = mesh.uv_layers.active.data
+    bad = 0
+    lo, hi = -tolerance, 1.0 + tolerance
+    for poly in mesh.polygons:
+        for li in poly.loop_indices:
+            u, v = uv_data[li].uv
+            if u < lo or u > hi or v < lo or v > hi:
+                bad += 1
+                break
+    return bad
 
 
-def get_texture_filename(atlas_name, texture_type, use_low_naming, address=None, obj_type=None):
+def check_atlas_uv_preconditions(op, obj):
+    """Shared guard for all atlas-apply operators: no double apply (the
+    linear UV remap is not idempotent) and no tiled UVs. Returns True when
+    the object is safe to remap; reports the reason and returns False otherwise."""
+    applied = obj.get('agr_atlas_applied')
+    if applied:
+        op.report({'ERROR'}, f"Атлас уже применён к объекту ({applied}) — повторный ремап исказит UV. Сначала Unpack Atlas.")
+        return False
+
+    bad_faces = count_faces_with_uvs_outside_unit(obj)
+    if bad_faces:
+        op.report({'ERROR'}, f"UV выходят за пределы 0..1 у {bad_faces} полигонов (тайлинг) — сначала приведите развёртку в 0..1.")
+        return False
+
+    return True
+
+
+def get_texture_filename(atlas_name, texture_type, use_low_naming, address=None, obj_type=None, index=1):
     """
-    Генерирует имя файла текстуры для атласа
+    Генерирует имя файла текстуры для атласа.
+    index - номер атласа/материала в LOW схеме (T_..._d_1.png, T_..._d_2.png)
     """
     if use_low_naming and address and obj_type:
         # LOW naming: T_Address_ObjectType_d/r/m/o/n/e.png
@@ -92,7 +101,7 @@ def get_texture_filename(atlas_name, texture_type, use_low_naming, address=None,
             'ERM': 'erm'
         }
         suffix = type_map.get(texture_type, texture_type.lower())
-        return f"T_{address}_{obj_type}_{suffix}_1.png"
+        return f"T_{address}_{obj_type}_{suffix}_{index}.png"
     else:
         # HIGH naming: T_AtlasName_Diffuse/DiffuseOpacity/Emit/Roughness/Metallic/ERM/Normal.png
         type_map = {
@@ -239,13 +248,48 @@ def calculate_atlas_packing_layout(texture_sets, atlas_size):
         raise Exception(f"Общая площадь текстур ({total_area}px²) превышает площадь атласа ({atlas_area}px²)")
     
     sorted_sets = sorted(texture_sets, key=lambda x: x.resolution * x.resolution, reverse=True)
-    
+
     layout = pack_atlas_rectangles(sorted_sets, atlas_size)
-    
+
     if not layout:
         raise Exception("Не удалось разместить все текстуры в атласе")
-    
+
     return layout
+
+
+def calculate_multi_atlas_packing(texture_sets, atlas_size):
+    """
+    Упаковывает сеты в НЕСКОЛЬКО атласов заданного размера (First-Fit-Decreasing).
+    Returns: list of layouts (один layout на атлас)
+    """
+    for tex_set in texture_sets:
+        if tex_set.resolution > atlas_size:
+            raise Exception(
+                f"Текстура {tex_set.name} ({tex_set.resolution}px) больше атласа {atlas_size}px"
+            )
+
+    remaining = sorted(texture_sets, key=lambda x: x.resolution, reverse=True)
+    bin_layouts = []
+
+    while remaining:
+        # Greedily grow the current bin: keep the trial layout of the largest
+        # subset that still packs into one atlas
+        placed_sets = []
+        layout = None
+        for tex_set in remaining:
+            trial_layout = pack_atlas_rectangles(placed_sets + [tex_set], atlas_size)
+            if trial_layout is not None:
+                placed_sets.append(tex_set)
+                layout = trial_layout
+
+        if not placed_sets:
+            raise Exception("Не удалось разместить текстуры в атласе")
+
+        bin_layouts.append(layout)
+        placed_ids = {id(ts) for ts in placed_sets}
+        remaining = [ts for ts in remaining if id(ts) not in placed_ids]
+
+    return bin_layouts
 
 
 
@@ -256,7 +300,14 @@ class AGR_OT_PreviewAtlasLayout(Operator):
     bl_idname = "agr.preview_atlas_layout"
     bl_label = "Preview Atlas Layout"
     bl_options = {'REGISTER'}
-    
+
+    @classmethod
+    def poll(cls, context):
+        if not any(ts.is_selected and not ts.is_atlas for ts in context.scene.agr_texture_sets):
+            cls.poll_message_set("Отметьте текстурные сеты галочками в списке")
+            return False
+        return True
+
     def execute(self, context):
         settings = context.scene.agr_baker_settings
         texture_sets_list = context.scene.agr_texture_sets
@@ -381,7 +432,10 @@ class AGR_OT_PreviewAtlasLayoutFromObject(Operator):
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return obj and obj.type == 'MESH' and len(obj.material_slots) > 0
+        if not (obj and obj.type == 'MESH' and len(obj.material_slots) > 0):
+            cls.poll_message_set("Нужен активный MESH-объект с материалами")
+            return False
+        return True
     
     def execute(self, context):
         settings = context.scene.agr_baker_settings
@@ -389,9 +443,11 @@ class AGR_OT_PreviewAtlasLayoutFromObject(Operator):
         obj = context.active_object
         
         # Собираем все материалы объекта
+        # Без дублей: один материал может занимать несколько слотов,
+        # а в атласе ему нужна ровно одна ячейка
         material_names = []
         for slot in obj.material_slots:
-            if slot.material:
+            if slot.material and slot.material.name not in material_names:
                 material_names.append(slot.material.name)
         
         if not material_names:
@@ -529,7 +585,14 @@ class AGR_OT_CreateAtlasOnly(Operator):
     bl_idname = "agr.create_atlas_only"
     bl_label = "Create Atlas Only"
     bl_options = {'REGISTER', 'UNDO'}
-    
+
+    @classmethod
+    def poll(cls, context):
+        if not any(ts.is_selected and not ts.is_atlas for ts in context.scene.agr_texture_sets):
+            cls.poll_message_set("Отметьте текстурные сеты галочками в списке")
+            return False
+        return True
+
     atlas_type: EnumProperty(
         name="Atlas Type",
         description="Type of atlas to create",
@@ -574,8 +637,12 @@ class AGR_OT_CreateAtlasOnly(Operator):
             result = self.create_atlas_textures_only(context, selected_sets, atlas_size, final_atlas_type)
             
             if result:
-                self.report({'INFO'}, f"Атлас создан: {result['atlas_name']}")
-                
+                place_errors = getattr(self, '_place_errors', None)
+                if place_errors:
+                    agr_report(self, 'WARNING', f"Атлас создан, но {len(place_errors)} текстур не разместились (чёрные регионы) — см. лог")
+                else:
+                    agr_report(self, 'INFO', f"Атлас создан: {result['atlas_name']}")
+
                 # Обновляем список сетов
                 bpy.ops.agr.refresh_texture_sets()
                 
@@ -591,18 +658,20 @@ class AGR_OT_CreateAtlasOnly(Operator):
             traceback.print_exc()
             return {'CANCELLED'}
     
-    def generate_procedural_atlas_name(self, context):
-        """Генерирует процедурное имя атласа A_001, A_002, etc."""
+    def generate_procedural_atlas_name(self, context, base_output_path=None):
+        """Генерирует процедурное имя атласа A_001, A_002, etc.
+        base_output_path — папка, куда будет записан атлас (в ней же ищется
+        свободный номер); по умолчанию — папка первого сета сцены."""
         settings = context.scene.agr_baker_settings
-        
-        # Получаем базовую папку
-        if context.scene.agr_texture_sets:
-            first_set = context.scene.agr_texture_sets[0]
-            base_output_path = os.path.dirname(first_set.folder_path)
-        else:
-            blend_file_path = bpy.path.abspath("//")
-            base_output_path = os.path.join(blend_file_path, settings.output_folder)
-        
+
+        if not base_output_path:
+            if context.scene.agr_texture_sets:
+                first_set = context.scene.agr_texture_sets[0]
+                base_output_path = os.path.dirname(first_set.folder_path)
+            else:
+                blend_file_path = bpy.path.abspath("//")
+                base_output_path = os.path.join(blend_file_path, settings.output_folder)
+
         # Ищем существующие атласы с именами A_###
         existing_numbers = []
         if os.path.exists(base_output_path):
@@ -631,32 +700,20 @@ class AGR_OT_CreateAtlasOnly(Operator):
         
         # Проверяем наличие альфа-канала в исходных сетах
         has_alpha = check_sets_have_alpha(texture_sets)
-        
-        # Определяем типы текстур для атласа
-        if atlas_type == 'HIGH':
-            # HIGH: разделяем DO, E, R, M, N
-            texture_types = ['DIFFUSE', 'EMIT', 'ROUGHNESS', 'METALLIC', 'NORMAL']
-            if has_alpha:
-                texture_types.insert(0, 'OPACITY')
-        else:  # LOW
-            # LOW: объединяем в ERM, дублируем D как DO
-            texture_types = ['DIFFUSE', 'ERM', 'NORMAL']
-            if has_alpha:
-                texture_types.insert(0, 'OPACITY')
-        
-        # Получаем именование - процедурное A_001, A_002, etc.
-        atlas_name = self.generate_procedural_atlas_name(context)
-        
-        print(f"📝 Имя атласа: {atlas_name}")
-        print(f"📝 Типы текстур: {texture_types}")
-        print(f"📝 Альфа-канал: {'Да' if has_alpha else 'Нет'}")
-        
-        # Определяем путь для сохранения
+
+        # Определяем путь для сохранения — та же папка, в которой ищется
+        # свободный номер A_### (иначе возможна коллизия имён)
         if texture_sets:
             base_output_path = os.path.dirname(texture_sets[0].folder_path)
         else:
             blend_file_path = bpy.path.abspath("//")
             base_output_path = os.path.join(blend_file_path, settings.output_folder)
+
+        # Получаем именование - процедурное A_001, A_002, etc.
+        atlas_name = self.generate_procedural_atlas_name(context, base_output_path)
+
+        print(f"📝 Имя атласа: {atlas_name}")
+        print(f"📝 Альфа-канал: {'Да' if has_alpha else 'Нет'}")
         
         # Создаем папку для атласа
         atlas_output_path = os.path.join(base_output_path, atlas_name)
@@ -722,7 +779,9 @@ class AGR_OT_CreateAtlasOnly(Operator):
                 # Объединяем D + O в DO через PIL
                 with Image.open(filepath) as raw_d:
                     d_img = raw_d.convert('RGB')
-                o_array = np.array(opacity_atlas.pixels[:]).reshape(atlas_size, atlas_size, 4)
+                o_array = np.empty(atlas_size * atlas_size * 4, dtype=np.float32)
+                opacity_atlas.pixels.foreach_get(o_array)
+                o_array = o_array.reshape(atlas_size, atlas_size, 4)
                 # Flip vertically: Blender pixels are bottom-to-top, Pillow expects top-to-bottom
                 o_channel = np.flipud((o_array[:, :, 0] * 255).astype(np.uint8))
                 o_pil = Image.fromarray(o_channel, mode='L')
@@ -895,7 +954,9 @@ class AGR_OT_CreateAtlasOnly(Operator):
                     d_img = raw_d.convert('RGB')
 
                 # Конвертируем Blender image в PIL
-                o_array = np.array(opacity_atlas.pixels[:]).reshape(atlas_size, atlas_size, 4)
+                o_array = np.empty(atlas_size * atlas_size * 4, dtype=np.float32)
+                opacity_atlas.pixels.foreach_get(o_array)
+                o_array = o_array.reshape(atlas_size, atlas_size, 4)
                 # Flip vertically: Blender pixels are bottom-to-top, Pillow expects top-to-bottom
                 o_channel = np.flipud((o_array[:, :, 0] * 255).astype(np.uint8))
                 o_pil = Image.fromarray(o_channel, mode='L')
@@ -1041,6 +1102,24 @@ class AGR_OT_CreateAtlasOnly(Operator):
                         m_img = m_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
                     m_channel = np.flipud(np.array(m_img, dtype=np.float32) / 255.0)
 
+            # Fallback: unpack missing channels from the packed ERM file —
+            # standard HIGH sets ship only DiffuseOpacity+ERM+Normal, and
+            # without this the atlas silently loses Emission/Metallic.
+            if e_channel is None or r_channel is None or m_channel is None:
+                erm_path = self.get_texture_path(item['texture_set'], 'ERM')
+                if erm_path and os.path.exists(erm_path):
+                    with Image.open(erm_path) as raw:
+                        erm_img = raw.convert('RGB')
+                        if erm_img.size != (cell_width, cell_height):
+                            erm_img = erm_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+                        erm_arr = np.flipud(np.array(erm_img, dtype=np.float32) / 255.0)
+                    if e_channel is None:
+                        e_channel = erm_arr[:, :, 0]
+                    if r_channel is None:
+                        r_channel = erm_arr[:, :, 1]
+                    if m_channel is None:
+                        m_channel = erm_arr[:, :, 2]
+
             if e_channel is None:
                 e_channel = np.zeros((cell_height, cell_width), dtype=np.float32)
             if r_channel is None:
@@ -1092,6 +1171,11 @@ class AGR_OT_CreateAtlasOnly(Operator):
             if texture_path and os.path.exists(texture_path):
                 self.place_texture_in_atlas(atlas_array, texture_path, item)
             else:
+                if texture_type == 'OPACITY':
+                    # Missing Opacity means fully opaque — a black region
+                    # would turn the whole set transparent in the DO atlas
+                    x, y = item['x'], item['y']
+                    atlas_array[y:y+item['height'], x:x+item['width'], 0:3] = 1.0
                 print(f"  ⚠️ Текстура не найдена: {texture_type} для {item['texture_set'].name}")
         
         atlas_image.pixels.foreach_set(atlas_array.ravel())
@@ -1121,7 +1205,16 @@ class AGR_OT_CreateAtlasOnly(Operator):
             filepath = os.path.join(folder_path, filename)
             if os.path.exists(filepath):
                 return filepath
-        
+
+        # Diffuse and DiffuseOpacity are interchangeable colour sources:
+        # HIGH sets may ship only DiffuseOpacity, LOW sets only Diffuse —
+        # never fall through to a black region when the paired map exists.
+        paired = {'DIFFUSE': 'DIFFUSE_OPACITY', 'DIFFUSE_OPACITY': 'DIFFUSE'}.get(texture_type)
+        if paired:
+            filepath = os.path.join(folder_path, texture_file_map[paired])
+            if os.path.exists(filepath):
+                return filepath
+
         return None
     
     def place_texture_in_atlas(self, atlas_array, texture_path, layout_item):
@@ -1151,7 +1244,9 @@ class AGR_OT_CreateAtlasOnly(Operator):
 
                 tex_width = temp_img.size[0]
                 tex_height = temp_img.size[1]
-                tex_array = np.array(temp_img.pixels[:]).reshape(tex_height, tex_width, 4)
+                tex_array = np.empty(tex_width * tex_height * 4, dtype=np.float32)
+                temp_img.pixels.foreach_get(tex_array)
+                tex_array = tex_array.reshape(tex_height, tex_width, 4)
 
                 # Простое масштабирование через numpy
                 if tex_width != cell_width or tex_height != cell_height:
@@ -1169,6 +1264,10 @@ class AGR_OT_CreateAtlasOnly(Operator):
             atlas_array[y:y+cell_height, x:x+cell_width, :] = tex_array
 
         except Exception as e:
+            # Accumulate for the operator's final report — a swallowed error
+            # here means a black hole in the atlas on a "successful" run
+            self._place_errors = getattr(self, '_place_errors', [])
+            self._place_errors.append(f"{os.path.basename(texture_path)}: {e}")
             print(f"  ❌ Ошибка размещения {texture_path}: {e}")
 
     def save_atlas_image(self, image, filepath, texture_type):
@@ -1258,7 +1357,10 @@ class AGR_OT_CreateAtlasFromObject(Operator):
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return obj and obj.type == 'MESH' and len(obj.material_slots) > 0
+        if not (obj and obj.type == 'MESH' and len(obj.material_slots) > 0):
+            cls.poll_message_set("Нужен активный MESH-объект с материалами")
+            return False
+        return True
     
     def execute(self, context):
         obj = context.active_object
@@ -1266,9 +1368,11 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         texture_sets_list = context.scene.agr_texture_sets
         
         # Собираем все материалы объекта
+        # Без дублей: один материал может занимать несколько слотов,
+        # а в атласе ему нужна ровно одна ячейка
         material_names = []
         for slot in obj.material_slots:
-            if slot.material:
+            if slot.material and slot.material.name not in material_names:
                 material_names.append(slot.material.name)
         
         if not material_names:
@@ -1298,14 +1402,19 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             self.report({'WARNING'}, "Не найдено ни одного texture set для материалов объекта")
             return {'CANCELLED'}
         
+        # Повторный ремап и тайлящиеся UV необратимо портят развёртку —
+        # проверяем ДО любых изменений
+        if not check_atlas_uv_preconditions(self, obj):
+            return {'CANCELLED'}
+
         atlas_size = int(settings.atlas_size)
-        
+
         # Проверяем, можно ли упаковать
         total_area = sum(s.resolution * s.resolution for s in object_sets)
         if total_area > atlas_size * atlas_size:
             self.report({'ERROR'}, f"Текстуры не помещаются в атлас {atlas_size}x{atlas_size}")
             return {'CANCELLED'}
-        
+
         # Определяем тип атласа на основе имени объекта
         try:
             address, obj_type = process_object_name(obj.name)
@@ -1332,8 +1441,12 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             result = self.create_and_apply_atlas(context, obj, object_sets, atlas_size, atlas_type, use_low_naming)
             
             if result:
-                self.report({'INFO'}, f"Атлас создан и применен: {result['atlas_name']}")
-                
+                place_errors = getattr(self, '_place_errors', None)
+                if place_errors:
+                    agr_report(self, 'WARNING', f"Атлас применён, но {len(place_errors)} текстур не разместились (чёрные регионы) — см. лог")
+                else:
+                    agr_report(self, 'INFO', f"Атлас создан и применен: {result['atlas_name']}")
+
                 # Обновляем список сетов
                 bpy.ops.agr.refresh_texture_sets()
                 
@@ -1442,6 +1555,8 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 address, obj_type = process_object_name(bpy.context.active_object.name)
             except Exception:
                 pass
+        # Multi-atlas sets this per bin; single atlas keeps the default 1
+        file_index = getattr(self, '_atlas_file_index', 1)
         
         # Создаем DO из DiffuseOpacity текстур
         print(f"\n🖼️ Создание DO атласа")
@@ -1449,7 +1564,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         
         if do_atlas:
             # Сохраняем DO
-            do_filename = get_texture_filename(atlas_name, 'DIFFUSE_OPACITY', use_low_naming, address, obj_type)
+            do_filename = get_texture_filename(atlas_name, 'DIFFUSE_OPACITY', use_low_naming, address, obj_type, index=file_index)
             do_filepath = os.path.join(output_path, do_filename)
             
             if has_alpha:
@@ -1463,24 +1578,24 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 with Image.open(do_filepath) as do_img:
                     # D - RGB часть
                     d_img = do_img.convert('RGB')
-                    d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type)
-                    if not d_filename:
-                        d_filename = f"T_{atlas_name}_Diffuse.png"
-                    d_filepath = os.path.join(output_path, d_filename)
-                    d_img.save(d_filepath)
-                    d_img.close()
+                    try:
+                        d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type, index=file_index)
+                        d_filepath = os.path.join(output_path, d_filename)
+                        d_img.save(d_filepath)
+                    finally:
+                        d_img.close()
                     created_atlases['DIFFUSE'] = d_filepath
                     print(f"  ✅ Создан Diffuse: {d_filename}")
 
                     # O - Alpha канал
                     if do_img.mode in ('RGBA', 'LA'):
                         o_channel = do_img.split()[-1]
-                        o_filename = get_texture_filename(atlas_name, 'OPACITY', use_low_naming, address, obj_type)
-                        if not o_filename:
-                            o_filename = f"T_{atlas_name}_Opacity.png"
-                        o_filepath = os.path.join(output_path, o_filename)
-                        o_channel.save(o_filepath)
-                        o_channel.close()
+                        try:
+                            o_filename = get_texture_filename(atlas_name, 'OPACITY', use_low_naming, address, obj_type, index=file_index)
+                            o_filepath = os.path.join(output_path, o_filename)
+                            o_channel.save(o_filepath)
+                        finally:
+                            o_channel.close()
                         created_atlases['OPACITY'] = o_filepath
                         print(f"  ✅ Создан Opacity: {o_filename}")
             else:
@@ -1492,7 +1607,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 # D - просто копия DO (без альфа)
                 with Image.open(do_filepath) as raw:
                     do_img = raw.convert('RGB')
-                d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type)
+                d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type, index=file_index)
                 if not d_filename:
                     d_filename = f"T_{atlas_name}_Diffuse.png"
                 d_filepath = os.path.join(output_path, d_filename)
@@ -1512,7 +1627,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         emit_atlas = self.create_atlas_for_type(texture_sets, 'EMIT', atlas_size, layout, False)
         emit_filepath = None
         if emit_atlas:
-            filename = get_texture_filename(atlas_name, 'EMIT', use_low_naming, address, obj_type)
+            filename = get_texture_filename(atlas_name, 'EMIT', use_low_naming, address, obj_type, index=file_index)
             if not filename:
                 filename = f"T_{atlas_name}_Emit.png"
             filepath = os.path.join(output_path, filename)
@@ -1526,7 +1641,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         roughness_atlas = self.create_atlas_for_type(texture_sets, 'ROUGHNESS', atlas_size, layout, False)
         roughness_filepath = None
         if roughness_atlas:
-            filename = get_texture_filename(atlas_name, 'ROUGHNESS', use_low_naming, address, obj_type)
+            filename = get_texture_filename(atlas_name, 'ROUGHNESS', use_low_naming, address, obj_type, index=file_index)
             if not filename:
                 filename = f"T_{atlas_name}_Roughness.png"
             filepath = os.path.join(output_path, filename)
@@ -1540,7 +1655,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         metallic_atlas = self.create_atlas_for_type(texture_sets, 'METALLIC', atlas_size, layout, False)
         metallic_filepath = None
         if metallic_atlas:
-            filename = get_texture_filename(atlas_name, 'METALLIC', use_low_naming, address, obj_type)
+            filename = get_texture_filename(atlas_name, 'METALLIC', use_low_naming, address, obj_type, index=file_index)
             if not filename:
                 filename = f"T_{atlas_name}_Metallic.png"
             filepath = os.path.join(output_path, filename)
@@ -1571,7 +1686,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
 
             erm_img = Image.merge('RGB', (e_img, r_img, m_img))
 
-            erm_filename = get_texture_filename(atlas_name, 'ERM', use_low_naming, address, obj_type)
+            erm_filename = get_texture_filename(atlas_name, 'ERM', use_low_naming, address, obj_type, index=file_index)
             if not erm_filename:
                 erm_filename = f"T_{atlas_name}_ERM.png"
             erm_filepath = os.path.join(output_path, erm_filename)
@@ -1590,7 +1705,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             print(f"\n🖼️ Создание Opacity атласа")
             opacity_atlas = self.create_atlas_for_type(texture_sets, 'OPACITY', atlas_size, layout, False)
             if opacity_atlas:
-                filename = get_texture_filename(atlas_name, 'OPACITY', use_low_naming, address, obj_type)
+                filename = get_texture_filename(atlas_name, 'OPACITY', use_low_naming, address, obj_type, index=file_index)
                 if not filename:
                     filename = f"T_{atlas_name}_Opacity.png"
                 filepath = os.path.join(output_path, filename)
@@ -1603,7 +1718,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         print(f"\n🖼️ Создание Normal атласа")
         normal_atlas = self.create_atlas_for_type(texture_sets, 'NORMAL', atlas_size, layout, False)
         if normal_atlas:
-            filename = get_texture_filename(atlas_name, 'NORMAL', use_low_naming, address, obj_type)
+            filename = get_texture_filename(atlas_name, 'NORMAL', use_low_naming, address, obj_type, index=file_index)
             if not filename:
                 filename = f"T_{atlas_name}_Normal.png"
             filepath = os.path.join(output_path, filename)
@@ -1627,6 +1742,8 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 address, obj_type = process_object_name(bpy.context.active_object.name)
             except Exception:
                 pass
+        # Multi-atlas sets this per bin; single atlas keeps the default 1
+        file_index = getattr(self, '_atlas_file_index', 1)
         
         # Создаем DO из DiffuseOpacity текстур (или Diffuse + Opacity)
         print(f"\n🖼️ Создание DO атласа")
@@ -1636,7 +1753,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         
         if do_atlas:
             # Сохраняем DO
-            do_filename = get_texture_filename(atlas_name, 'DIFFUSE_OPACITY', use_low_naming, address, obj_type)
+            do_filename = get_texture_filename(atlas_name, 'DIFFUSE_OPACITY', use_low_naming, address, obj_type, index=file_index)
             if not do_filename:
                 do_filename = f"T_{atlas_name}_DO.png"
             do_filepath = os.path.join(output_path, do_filename)
@@ -1651,7 +1768,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 print(f"  🔧 Извлечение D из DO")
                 with Image.open(do_filepath) as do_img:
                     d_img = do_img.convert('RGB')
-                d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type)
+                d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type, index=file_index)
                 if not d_filename:
                     d_filename = f"T_{atlas_name}_d.png"
                 d_filepath = os.path.join(output_path, d_filename)
@@ -1670,7 +1787,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 # D - копия DO
                 with Image.open(do_filepath) as raw:
                     do_img = raw.convert('RGB')
-                d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type)
+                d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type, index=file_index)
                 if not d_filename:
                     d_filename = f"T_{atlas_name}_d.png"
                 d_filepath = os.path.join(output_path, d_filename)
@@ -1688,7 +1805,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             diffuse_atlas = self.create_atlas_for_type(texture_sets, 'DIFFUSE', atlas_size, layout, False)
             
             if diffuse_atlas:
-                d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type)
+                d_filename = get_texture_filename(atlas_name, 'DIFFUSE', use_low_naming, address, obj_type, index=file_index)
                 if not d_filename:
                     d_filename = f"T_{atlas_name}_d.png"
                 d_filepath = os.path.join(output_path, d_filename)
@@ -1696,7 +1813,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 created_atlases['DIFFUSE'] = d_filepath
                 
                 # Создаем DO
-                do_filename = get_texture_filename(atlas_name, 'DIFFUSE_OPACITY', use_low_naming, address, obj_type)
+                do_filename = get_texture_filename(atlas_name, 'DIFFUSE_OPACITY', use_low_naming, address, obj_type, index=file_index)
                 if not do_filename:
                     do_filename = f"T_{atlas_name}_DO.png"
                 do_filepath = os.path.join(output_path, do_filename)
@@ -1707,7 +1824,9 @@ class AGR_OT_CreateAtlasFromObject(Operator):
 
                     with Image.open(d_filepath) as raw_d:
                         d_img = raw_d.convert('RGB')
-                    o_array = np.array(opacity_atlas.pixels[:]).reshape(atlas_size, atlas_size, 4)
+                    o_array = np.empty(atlas_size * atlas_size * 4, dtype=np.float32)
+                    opacity_atlas.pixels.foreach_get(o_array)
+                    o_array = o_array.reshape(atlas_size, atlas_size, 4)
                     # Flip vertically: Blender pixels are bottom-to-top, Pillow expects top-to-bottom
                     o_channel = np.flipud((o_array[:, :, 0] * 255).astype(np.uint8))
                     o_pil = Image.fromarray(o_channel, mode='L')
@@ -1743,7 +1862,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         print(f"\n🖼️ Создание ERM атласа")
         erm_atlas = self.create_erm_atlas(texture_sets, atlas_size, layout)
         if erm_atlas:
-            filename = get_texture_filename(atlas_name, 'ERM', use_low_naming, address, obj_type)
+            filename = get_texture_filename(atlas_name, 'ERM', use_low_naming, address, obj_type, index=file_index)
             if not filename:
                 filename = f"T_{atlas_name}_erm.png"
             filepath = os.path.join(output_path, filename)
@@ -1758,7 +1877,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         # Roughness
         roughness_atlas = self.create_atlas_for_type(texture_sets, 'ROUGHNESS', atlas_size, layout, False)
         if roughness_atlas:
-            filename = get_texture_filename(atlas_name, 'ROUGHNESS', use_low_naming, address, obj_type)
+            filename = get_texture_filename(atlas_name, 'ROUGHNESS', use_low_naming, address, obj_type, index=file_index)
             if not filename:
                 filename = f"T_{atlas_name}_r.png"
             filepath = os.path.join(output_path, filename)
@@ -1770,7 +1889,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         # Metallic
         metallic_atlas = self.create_atlas_for_type(texture_sets, 'METALLIC', atlas_size, layout, False)
         if metallic_atlas:
-            filename = get_texture_filename(atlas_name, 'METALLIC', use_low_naming, address, obj_type)
+            filename = get_texture_filename(atlas_name, 'METALLIC', use_low_naming, address, obj_type, index=file_index)
             if not filename:
                 filename = f"T_{atlas_name}_m.png"
             filepath = os.path.join(output_path, filename)
@@ -1782,7 +1901,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         # Emit
         emit_atlas = self.create_atlas_for_type(texture_sets, 'EMIT', atlas_size, layout, False)
         if emit_atlas:
-            filename = get_texture_filename(atlas_name, 'EMIT', use_low_naming, address, obj_type)
+            filename = get_texture_filename(atlas_name, 'EMIT', use_low_naming, address, obj_type, index=file_index)
             if not filename:
                 filename = f"T_{atlas_name}_e.png"
             filepath = os.path.join(output_path, filename)
@@ -1795,7 +1914,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         print(f"\n🖼️ Создание Opacity атласа")
         opacity_atlas = self.create_atlas_for_type(texture_sets, 'OPACITY', atlas_size, layout, False)
         if opacity_atlas:
-            filename = get_texture_filename(atlas_name, 'OPACITY', use_low_naming, address, obj_type)
+            filename = get_texture_filename(atlas_name, 'OPACITY', use_low_naming, address, obj_type, index=file_index)
             if not filename:
                 filename = f"T_{atlas_name}_o.png"
             filepath = os.path.join(output_path, filename)
@@ -1808,7 +1927,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         print(f"\n🖼️ Создание Normal атласа")
         normal_atlas = self.create_atlas_for_type(texture_sets, 'NORMAL', atlas_size, layout, False)
         if normal_atlas:
-            filename = get_texture_filename(atlas_name, 'NORMAL', use_low_naming, address, obj_type)
+            filename = get_texture_filename(atlas_name, 'NORMAL', use_low_naming, address, obj_type, index=file_index)
             if not filename:
                 filename = f"T_{atlas_name}_n.png"
             filepath = os.path.join(output_path, filename)
@@ -1876,6 +1995,24 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                         m_img = m_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
                     m_channel = np.flipud(np.array(m_img, dtype=np.float32) / 255.0)
 
+            # Fallback: unpack missing channels from the packed ERM file —
+            # standard HIGH sets ship only DiffuseOpacity+ERM+Normal, and
+            # without this the atlas silently loses Emission/Metallic.
+            if e_channel is None or r_channel is None or m_channel is None:
+                erm_path = self.get_texture_path(item['texture_set'], 'ERM')
+                if erm_path and os.path.exists(erm_path):
+                    with Image.open(erm_path) as raw:
+                        erm_img = raw.convert('RGB')
+                        if erm_img.size != (cell_width, cell_height):
+                            erm_img = erm_img.resize((cell_width, cell_height), Image.Resampling.LANCZOS)
+                        erm_arr = np.flipud(np.array(erm_img, dtype=np.float32) / 255.0)
+                    if e_channel is None:
+                        e_channel = erm_arr[:, :, 0]
+                    if r_channel is None:
+                        r_channel = erm_arr[:, :, 1]
+                    if m_channel is None:
+                        m_channel = erm_arr[:, :, 2]
+
             if e_channel is None:
                 e_channel = np.zeros((cell_height, cell_width), dtype=np.float32)
             if r_channel is None:
@@ -1924,6 +2061,11 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             if texture_path and os.path.exists(texture_path):
                 self.place_texture_in_atlas(atlas_array, texture_path, item)
             else:
+                if texture_type == 'OPACITY':
+                    # Missing Opacity means fully opaque — a black region
+                    # would turn the whole set transparent in the DO atlas
+                    x, y = item['x'], item['y']
+                    atlas_array[y:y+item['height'], x:x+item['width'], 0:3] = 1.0
                 print(f"  ⚠️ Текстура не найдена: {texture_type} для {item['texture_set'].name}")
 
         atlas_image.pixels.foreach_set(atlas_array.ravel())
@@ -1952,7 +2094,16 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             filepath = os.path.join(folder_path, filename)
             if os.path.exists(filepath):
                 return filepath
-        
+
+        # Diffuse and DiffuseOpacity are interchangeable colour sources:
+        # HIGH sets may ship only DiffuseOpacity, LOW sets only Diffuse —
+        # never fall through to a black region when the paired map exists.
+        paired = {'DIFFUSE': 'DIFFUSE_OPACITY', 'DIFFUSE_OPACITY': 'DIFFUSE'}.get(texture_type)
+        if paired:
+            filepath = os.path.join(folder_path, texture_file_map[paired])
+            if os.path.exists(filepath):
+                return filepath
+
         return None
     
     def place_texture_in_atlas(self, atlas_array, texture_path, layout_item):
@@ -1981,7 +2132,9 @@ class AGR_OT_CreateAtlasFromObject(Operator):
 
                 tex_width = temp_img.size[0]
                 tex_height = temp_img.size[1]
-                tex_array = np.array(temp_img.pixels[:]).reshape(tex_height, tex_width, 4)
+                tex_array = np.empty(tex_width * tex_height * 4, dtype=np.float32)
+                temp_img.pixels.foreach_get(tex_array)
+                tex_array = tex_array.reshape(tex_height, tex_width, 4)
 
                 if tex_width != cell_width or tex_height != cell_height:
                     indices_y = np.round(np.linspace(0, tex_height - 1, cell_height)).astype(int)
@@ -1996,6 +2149,10 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             atlas_array[y:y+cell_height, x:x+cell_width, :] = tex_array
 
         except Exception as e:
+            # Accumulate for the operator's final report — a swallowed error
+            # here means a black hole in the atlas on a "successful" run
+            self._place_errors = getattr(self, '_place_errors', [])
+            self._place_errors.append(f"{os.path.basename(texture_path)}: {e}")
             print(f"  ❌ Ошибка размещения {texture_path}: {e}")
     
     def save_atlas_image(self, image, filepath, texture_type):
@@ -2161,7 +2318,9 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 tex_o = load_texture(created_atlases['OPACITY'], os.path.basename(created_atlases['OPACITY']), (-700, 150), 'Non-Color')
                 if tex_o:
                     links.new(tex_o.outputs['Color'], bsdf.inputs['Alpha'])
-                    material.blend_method = 'HASHED'
+                    # blend_method is deprecated since 4.2 — guard for 5.x
+                    if hasattr(material, 'blend_method'):
+                        material.blend_method = 'HASHED'
                     print(f"  ✅ Подключен Opacity (o)")
             
             # LOW: подключаем отдельные карты R и M (не ERM)
@@ -2266,8 +2425,274 @@ class AGR_OT_CreateAtlasFromObject(Operator):
         # Устанавливаем все полигоны на материал 0
         for poly in obj.data.polygons:
             poly.material_index = 0
-        
+
+        # Guard against a second (non-idempotent) UV remap; cleared by Unpack
+        obj['agr_atlas_applied'] = atlas_material.name
+
         print(f"✅ UV раскладка применена, материал назначен")
+
+
+class AGR_OT_CreateMultiAtlasFromObject(AGR_OT_CreateAtlasFromObject):
+    """Pack ALL object materials into as many atlases of the chosen size as needed"""
+    bl_idname = "agr.create_multi_atlas_from_object"
+    bl_label = "Create Multi-Atlas from Object"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.agr_baker_settings
+        texture_sets_list = context.scene.agr_texture_sets
+
+        # Собираем все материалы объекта
+        # Без дублей: один материал может занимать несколько слотов,
+        # а в атласе ему нужна ровно одна ячейка
+        material_names = []
+        for slot in obj.material_slots:
+            if slot.material and slot.material.name not in material_names:
+                material_names.append(slot.material.name)
+
+        if not material_names:
+            self.report({'WARNING'}, "У объекта нет материалов")
+            return {'CANCELLED'}
+
+        # Ищем соответствующие texture sets
+        object_sets = []
+        missing_materials = []
+
+        for mat_name in material_names:
+            found = False
+            for tex_set in texture_sets_list:
+                if tex_set.material_name == mat_name and not tex_set.is_atlas:
+                    object_sets.append(tex_set)
+                    found = True
+                    break
+
+            if not found:
+                missing_materials.append(mat_name)
+
+        if missing_materials:
+            self.report({'ERROR'}, f"Не найдены texture sets для материалов: {', '.join(missing_materials)}")
+            return {'CANCELLED'}
+
+        if not object_sets:
+            self.report({'WARNING'}, "Не найдено ни одного texture set для материалов объекта")
+            return {'CANCELLED'}
+
+        # Повторный ремап и тайлящиеся UV необратимо портят развёртку —
+        # проверяем ДО любых изменений
+        if not check_atlas_uv_preconditions(self, obj):
+            return {'CANCELLED'}
+
+        atlas_size = int(settings.atlas_size)
+
+        # В отличие от одиночного атласа, площадь не ограничиваем — лишь бы
+        # каждый сет по отдельности влезал в атлас
+        too_big = [s.name for s in object_sets if s.resolution > atlas_size]
+        if too_big:
+            self.report({'ERROR'}, f"Сеты больше атласа {atlas_size}px: {', '.join(too_big)}")
+            return {'CANCELLED'}
+
+        # Определяем тип атласа на основе имени объекта
+        try:
+            address, obj_type = process_object_name(obj.name)
+            if obj_type in ['Main', 'Flora', 'Ground', 'GroundEl']:
+                atlas_type = 'LOW'
+                use_low_naming = True
+            else:
+                atlas_type = 'HIGH'
+                use_low_naming = False
+        except Exception:
+            atlas_type = 'HIGH'
+            use_low_naming = False
+
+        print(f"\n{'='*60}")
+        print(f"🎨 СОЗДАНИЕ МУЛЬТИ-АТЛАСА ИЗ МАТЕРИАЛОВ ОБЪЕКТА")
+        print(f"{'='*60}")
+        print(f"Объект: {obj.name}")
+        print(f"Тип атласа: {atlas_type}")
+        print(f"Размер атласа: {atlas_size}x{atlas_size}")
+        print(f"Количество материалов: {len(object_sets)}")
+
+        try:
+            result = self.create_and_apply_multi_atlas(
+                context, obj, object_sets, atlas_size, atlas_type, use_low_naming
+            )
+
+            if result:
+                self.report(
+                    {'INFO'},
+                    f"Создано атласов: {result['atlas_count']} ({atlas_size}px), материалов: {result['atlas_count']}"
+                )
+                bpy.ops.agr.refresh_texture_sets()
+                return {'FINISHED'}
+            else:
+                self.report({'ERROR'}, "Не удалось создать мульти-атлас")
+                return {'CANCELLED'}
+
+        except Exception as e:
+            self.report({'ERROR'}, f"Ошибка создания мульти-атласа: {str(e)}")
+            print(f"❌ Ошибка: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'CANCELLED'}
+
+    def create_and_apply_multi_atlas(self, context, obj, texture_sets, atlas_size, atlas_type, use_low_naming):
+        """Создает несколько атласов и применяет их к объекту"""
+        settings = context.scene.agr_baker_settings
+
+        has_alpha = check_sets_have_alpha(texture_sets)
+
+        # Базовое именование (индекс бина добавляется в цикле)
+        address = None
+        obj_type = None
+        if use_low_naming:
+            try:
+                address, obj_type = process_object_name(obj.name)
+            except Exception:
+                use_low_naming = False
+
+        # Определяем путь для сохранения
+        if texture_sets:
+            base_output_path = os.path.dirname(texture_sets[0].folder_path)
+        else:
+            blend_file_path = bpy.path.abspath("//")
+            base_output_path = os.path.join(blend_file_path, settings.output_folder)
+
+        # Рассчитываем упаковку по бинам
+        bin_layouts = calculate_multi_atlas_packing(texture_sets, atlas_size)
+        print(f"✅ Упаковка рассчитана: {len(bin_layouts)} атлас(ов)")
+
+        atlas_materials = []
+        atlas_names = []
+
+        for bin_idx, layout in enumerate(bin_layouts, start=1):
+            bin_sets = [item['texture_set'] for item in layout]
+
+            if use_low_naming:
+                atlas_name = f"A_{address}_{obj_type}_{bin_idx}"
+                material_name = f"M_{address}_{obj_type}_{bin_idx}"
+            else:
+                atlas_name = f"A_{obj.name}_{bin_idx}"
+                material_name = f"M_{atlas_name}"
+
+            print(f"\n📦 Атлас {bin_idx}/{len(bin_layouts)}: {atlas_name} ({len(bin_sets)} сетов)")
+
+            atlas_output_path = os.path.join(base_output_path, atlas_name)
+            if not os.path.exists(atlas_output_path):
+                os.makedirs(atlas_output_path)
+                print(f"📁 Создана папка: {atlas_output_path}")
+
+            # LOW filenames get the bin index (T_addr_Main_d_2.png for bin 2)
+            self._atlas_file_index = bin_idx
+            try:
+                if atlas_type == 'HIGH':
+                    created_atlases = self.create_high_atlas_textures(
+                        bin_sets, atlas_size, layout, atlas_output_path, atlas_name, has_alpha, use_low_naming
+                    )
+                else:  # LOW
+                    created_atlases = self.create_low_atlas_textures(
+                        bin_sets, atlas_size, layout, atlas_output_path, atlas_name, has_alpha, use_low_naming
+                    )
+            finally:
+                self._atlas_file_index = 1
+
+            self.save_atlas_mapping(atlas_output_path, atlas_name, atlas_type, atlas_size, layout, created_atlases)
+
+            atlas_material = self.create_atlas_material(
+                context, atlas_name, material_name, created_atlases, atlas_type
+            )
+            atlas_materials.append(atlas_material)
+            atlas_names.append(atlas_name)
+
+        # Применяем все атласы к объекту (мультиматериальный вариант)
+        self.apply_multi_atlas_to_object(context, obj, atlas_materials, bin_layouts)
+
+        print(f"\n✅ Мульти-атлас создан и применен: {len(bin_layouts)} атлас(ов)")
+        print(f"{'='*60}\n")
+
+        return {
+            'atlas_count': len(bin_layouts),
+            'atlas_names': atlas_names,
+            'materials': atlas_materials,
+        }
+
+    def apply_multi_atlas_to_object(self, context, obj, atlas_materials, bin_layouts):
+        """Применяет несколько атласов: UV ремап + материал на полигон по бину"""
+        print(f"\n📐 Применение мульти-атласа к объекту {obj.name}")
+
+        # Маппинг материал -> (индекс бина, UV регион)
+        material_to_target = {}
+        for bin_idx, layout in enumerate(bin_layouts):
+            for item in layout:
+                mat_name = item['texture_set'].material_name
+                material_to_target[mat_name] = {
+                    'bin': bin_idx,
+                    'u_min': item['u_min'],
+                    'v_min': item['v_min'],
+                    'u_max': item['u_max'],
+                    'v_max': item['v_max'],
+                }
+
+        print(f"  📋 Маппинг материалов -> атлас/UV:")
+        for mat_name, t in material_to_target.items():
+            print(f"    {mat_name}: атлас {t['bin'] + 1}, UV ({t['u_min']:.3f}, {t['v_min']:.3f}) -> ({t['u_max']:.3f}, {t['v_max']:.3f})")
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Сохраняем маппинг face_index -> material_name ДО очистки материалов
+        face_to_material = {}
+        for i, slot in enumerate(obj.material_slots):
+            if slot.material:
+                mat_name = slot.material.name
+                for poly in obj.data.polygons:
+                    if poly.material_index == i:
+                        face_to_material[poly.index] = mat_name
+
+        print(f"  📊 Сохранено {len(face_to_material)} полигонов с материалами")
+
+        if obj.data.uv_layers.active is None:
+            obj.data.uv_layers.new(name="UVMap")
+
+        uv_layer = obj.data.uv_layers.active.data
+
+        processed_faces = 0
+        for poly in obj.data.polygons:
+            if poly.index in face_to_material:
+                mat_name = face_to_material[poly.index]
+
+                if mat_name in material_to_target:
+                    target = material_to_target[mat_name]
+
+                    orig_uvs = []
+                    for loop_idx in poly.loop_indices:
+                        uv = uv_layer[loop_idx].uv
+                        orig_uvs.append((uv.x, uv.y))
+
+                    for i, loop_idx in enumerate(poly.loop_indices):
+                        orig_u, orig_v = orig_uvs[i]
+                        new_u = target['u_min'] + orig_u * (target['u_max'] - target['u_min'])
+                        new_v = target['v_min'] + orig_v * (target['v_max'] - target['v_min'])
+                        uv_layer[loop_idx].uv = (new_u, new_v)
+
+                    processed_faces += 1
+
+        print(f"  ✅ Обработано {processed_faces} полигонов")
+
+        # Заменяем материалы: один слот на каждый атлас
+        obj.data.materials.clear()
+        for atlas_material in atlas_materials:
+            obj.data.materials.append(atlas_material)
+
+        # Полигон получает материал своего бина
+        for poly in obj.data.polygons:
+            mat_name = face_to_material.get(poly.index)
+            target = material_to_target.get(mat_name)
+            poly.material_index = target['bin'] if target else 0
+
+        # Guard against a second (non-idempotent) UV remap; cleared by Unpack
+        obj['agr_atlas_applied'] = ", ".join(m.name for m in atlas_materials)
+
+        print(f"✅ UV раскладка применена, {len(atlas_materials)} материал(ов) назначено")
 
 
 # ===== APPLY EXISTING ATLAS TO OBJECT OPERATOR =====
@@ -2338,20 +2763,20 @@ class AGR_OT_ApplyAtlasToObject(Operator):
     def poll(cls, context):
         obj = context.active_object
         if not obj or obj.type != 'MESH':
+            cls.poll_message_set("Нужен активный MESH-объект")
             return False
-        
+
         # Check for atlases via texture sets collection (no filesystem I/O in poll)
         for tex_set in context.scene.agr_texture_sets:
             if getattr(tex_set, 'is_atlas', False):
                 return True
 
-        # Fallback: check if any A_* folder name pattern exists in scene data
-        settings = context.scene.agr_baker_settings
-        blend_path = bpy.path.abspath("//")
-        if not blend_path:
+        # Fallback: poll runs on every redraw — no filesystem checks here.
+        # invoke() reports gracefully when no atlases are actually found.
+        if not bpy.path.abspath("//"):
+            cls.poll_message_set("Сохраните .blend файл — атласы ищутся рядом с ним")
             return False
-        agr_bake_path = os.path.join(blend_path, settings.output_folder)
-        return os.path.isdir(agr_bake_path)
+        return True
     
     def invoke(self, context, event):
         # Показываем диалог выбора атласа
@@ -2405,7 +2830,11 @@ class AGR_OT_ApplyAtlasToObject(Operator):
         if missing:
             self.report({'ERROR'}, f"Материалы не найдены в атласе: {', '.join(missing)}. Операция отменена.")
             return {'CANCELLED'}
-        
+
+        # Повторный ремап и тайлящиеся UV необратимо портят развёртку
+        if not check_atlas_uv_preconditions(self, obj):
+            return {'CANCELLED'}
+
         print(f"\n{'='*60}")
         print(f"📐 ПРИМЕНЕНИЕ АТЛАСА К ОБЪЕКТУ")
         print(f"{'='*60}")
@@ -2460,13 +2889,20 @@ class AGR_OT_ApplyAtlasToObject(Operator):
                         face_to_material[poly.index] = mat_name
         
         print(f"💾 Сохранено {len(face_to_material)} полигонов с материалами")
-        
-        # Получаем или создаем атласный материал
-        atlas_material_name = f"M_{atlas_name}"
+
+        # Имя материала по конвенции M_Address_Type_1 (как у Create Atlas
+        # from Object в LOW-схеме); фолбэк на M_<atlas_name> для объектов
+        # вне SM_-паттерна
+        try:
+            address, obj_type = process_object_name(obj.name)
+            atlas_material_name = f"M_{address}_{obj_type}_1"
+        except Exception:
+            atlas_material_name = f"M_{atlas_name}"
+
         if atlas_material_name not in bpy.data.materials:
             # Пытаемся создать материал из текстур атласа
-            self.create_atlas_material_from_textures(atlas_folder_path, atlas_name, mapping)
-        
+            self.create_atlas_material_from_textures(atlas_folder_path, atlas_name, mapping, atlas_material_name)
+
         if atlas_material_name not in bpy.data.materials:
             self.report({'WARNING'}, f"Материал атласа '{atlas_material_name}' не найден")
             return
@@ -2519,14 +2955,30 @@ class AGR_OT_ApplyAtlasToObject(Operator):
         
         bmesh.update_edit_mesh(obj.data)
         bpy.ops.object.mode_set(mode='OBJECT')
-        
+
+        # Guard against a second (non-idempotent) UV remap; cleared by Unpack
+        obj['agr_atlas_applied'] = atlas_material_name
+
         print(f"✅ UV раскладка применена: обработано {processed_faces} полигонов по JSON маппингу")
-    
-    def create_atlas_material_from_textures(self, atlas_folder_path, atlas_name, mapping):
+
+    def create_atlas_material_from_textures(self, atlas_folder_path, atlas_name, mapping, material_name=None):
         """Создает материал атласа из текстур"""
-        material_name = f"M_{atlas_name}"
+        if not material_name:
+            material_name = f"M_{atlas_name}"
         atlas_type = mapping.get('atlas_type', 'HIGH')
         created_atlases = mapping.get('created_atlases', {})
+
+        # atlas_mapping.json хранит абсолютные пути — при переносе проекта
+        # перебазируем на текущую папку атласа по имени файла
+        def resolve_atlas_path(path):
+            if path and os.path.exists(path):
+                return path
+            if path:
+                local = os.path.join(atlas_folder_path, os.path.basename(path))
+                if os.path.exists(local):
+                    return local
+            return path
+        created_atlases = {k: resolve_atlas_path(v) for k, v in created_atlases.items()}
         
         if material_name in bpy.data.materials:
             material = bpy.data.materials[material_name]
@@ -2608,9 +3060,11 @@ class AGR_OT_ApplyAtlasToObject(Operator):
                 links.new(tex_n.outputs['Color'], normal_map.inputs['Color'])
                 links.new(normal_map.outputs['Normal'], bsdf.inputs['Normal'])
                 print(f"  ✅ Подключен Normal")
-        
-        material.blend_method = 'HASHED'
-        
+
+        # blend_method is deprecated since 4.2 — guard for 5.x
+        if hasattr(material, 'blend_method'):
+            material.blend_method = 'HASHED'
+
         print(f"🎨 Материал создан: {material_name}")
 
 
@@ -2626,8 +3080,10 @@ class AGR_OT_UnpackAtlasToMaterials(Operator):
     def poll(cls, context):
         obj = context.active_object
         if not obj or obj.type != 'MESH':
+            cls.poll_message_set("Нужен активный MESH-объект")
             return False
         if not obj.active_material:
+            cls.poll_message_set("У объекта должен быть активный материал атласа")
             return False
         return True
     
@@ -2832,7 +3288,15 @@ class AGR_OT_UnpackAtlasToMaterials(Operator):
         print(f"\n🔍 Анализ полигонов:")
         print(f"  Всего полигонов: {len(obj.data.polygons)}")
         print(f"  Определено материалов: {len(face_to_material)}")
-        
+
+        # Все фейсы должны попасть в регионы раскладки ДО каких-либо
+        # изменений — иначе несопоставленные фейсы остались бы с висячим
+        # material_index и атласными UV
+        unmatched = len(obj.data.polygons) - len(face_to_material)
+        if unmatched:
+            self.report({'ERROR'}, f"{unmatched} полигонов не попадают в регионы атласа — распаковка отменена (UV сдвинуты или объект содержит не-атласные материалы)")
+            return None
+
         # Создаем/получаем материалы для каждого региона
         material_objects = {}
         material_indices = {}
@@ -2895,11 +3359,15 @@ class AGR_OT_UnpackAtlasToMaterials(Operator):
                 
                 faces_processed += 1
         
+        # Object is back to individual materials — allow atlas apply again
+        if 'agr_atlas_applied' in obj:
+            del obj['agr_atlas_applied']
+
         print(f"\n✅ Распаковка завершена:")
         print(f"  Материалов: {len(material_objects)}")
         print(f"  Полигонов обработано: {faces_processed}")
         print(f"{'='*60}\n")
-        
+
         return {
             'materials_count': len(material_objects),
             'faces_processed': faces_processed
@@ -2913,6 +3381,7 @@ classes = (
     AGR_OT_PreviewAtlasLayoutFromObject,
     AGR_OT_CreateAtlasOnly,
     AGR_OT_CreateAtlasFromObject,
+    AGR_OT_CreateMultiAtlasFromObject,
     AGR_OT_ApplyAtlasToObject,
     AGR_OT_UnpackAtlasToMaterials,
 )

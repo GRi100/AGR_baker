@@ -1,5 +1,5 @@
 """
-Utility operators for AGR Baker v2
+Utility operators for AGR Tools
 """
 
 import bpy
@@ -25,11 +25,18 @@ class AGR_OT_InstallPillow(Operator):
             
             # Install Pillow using pip
             subprocess.check_call([python_exe, "-m", "pip", "install", "Pillow"])
-            
-            self.report({'INFO'}, "Pillow installed successfully! Please restart Blender")
+
+            # Refresh the UI flag so the warning disappears without a
+            # restart when the fresh install is importable right away
+            try:
+                from PIL import Image  # noqa: F401
+                from . import ui
+                ui.PILLOW_AVAILABLE = True
+                self.report({'INFO'}, "Pillow installed successfully!")
+            except ImportError:
+                self.report({'INFO'}, "Pillow installed successfully! Please restart Blender")
             print("✅ Pillow installed successfully!")
-            print("⚠️ Please restart Blender to use Pillow features")
-            
+
             return {'FINISHED'}
         
         except subprocess.CalledProcessError as e:

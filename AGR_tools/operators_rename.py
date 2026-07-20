@@ -1,5 +1,5 @@
 """
-AGR Rename operators for AGR Baker v2
+AGR Rename operators for AGR Tools
 Based on rename_project.py with proper popup dialogs
 """
 
@@ -13,6 +13,33 @@ from bpy.props import StringProperty, IntProperty, EnumProperty
 
 
 # ============= Helper Functions =============
+
+# Longest alternatives first so backtracking never settles on a short type
+SM_NAME_RE = re.compile(
+    r'^SM_(?P<address>.+?)(?:_(?P<number>\d{3}))?_'
+    r'(?P<type>GroundElGlass|GroundGlass|MainGlass|GroundEl|Ground|Main|Flora)'
+    r'(?:\.\d{3})?$'
+)
+
+# Which object types each rename operation accepts — the single source of
+# truth shared by ui.py draw() and the operators (lists used to diverge
+# between 6 regex copies in the panel)
+RENAME_ALLOWED_TYPES = {
+    'materials': {'Main', 'MainGlass', 'Ground', 'GroundGlass', 'GroundEl', 'GroundElGlass', 'Flora'},
+    'glass_materials': {'MainGlass', 'GroundGlass', 'GroundElGlass'},
+    'textures': {'Main', 'Ground', 'GroundEl', 'Flora'},
+    'geojson': {'Main', 'Ground'},
+}
+
+
+def parse_sm_name(name):
+    """Parse 'SM_Address[_NNN]_Type[.001]' → (address, number|None, obj_type),
+    or None when the name does not follow the SM_ convention."""
+    match = SM_NAME_RE.match(name)
+    if not match:
+        return None
+    return match.group('address'), match.group('number'), match.group('type')
+
 
 def _get_new_address(scene):
     """Get address from scene properties"""
@@ -656,7 +683,8 @@ class AGR_OT_rename_textures(Operator):
         )
         
         if renamed_count > 0 and new_texture_paths:
-            self._pack_textures_and_cleanup(low_texture_folder, loaded_images)
+            self._pack_textures_and_cleanup(low_texture_folder, loaded_images,
+                                            new_texture_paths.values())
             self.report({'INFO'}, f"Обработано текстур: {renamed_count}")
             return {'FINISHED'}
         
@@ -688,20 +716,16 @@ class AGR_OT_rename_textures(Operator):
         return textures if textures else None
     
     def get_texture_type_from_filename(self, filename):
-        # Regular (non-UDIM) textures use only short single-letter codes.
-        # Anchor to end of filename to avoid false match on address parts like Volkhonka_D_5 → _d_
-        if re.search(r'_d_\d+\.png$', filename) or filename.endswith('_d.png'):
-            return 'Diffuse'
-        if re.search(r'_n_\d+\.png$', filename) or filename.endswith('_n.png'):
-            return 'Normal'
-        if re.search(r'_r_\d+\.png$', filename) or filename.endswith('_r.png'):
-            return 'Roughness'
-        if re.search(r'_m_\d+\.png$', filename) or filename.endswith('_m.png'):
-            return 'Metallic'
-        if re.search(r'_o_\d+\.png$', filename) or filename.endswith('_o.png'):
-            return 'Opacity'
-        if re.search(r'_e_\d+\.png$', filename) or filename.endswith('_e.png'):
-            return 'Emit'
+        # Regular (non-UDIM) lowpoly textures use short suffix codes —
+        # the SAME codes go into output filenames and into the keys that
+        # reconnect_textures expects (project convention: lowpoly = short
+        # codes, UDIM highpoly = full names). Mirrors operators_rename_project.
+        # Anchor to end of filename to avoid false match on address parts
+        # like Volkhonka_D_5; check longer codes first (erm before r/m/e,
+        # do before d/o).
+        for tex_type in ('erm', 'do', 'd', 'o', 'm', 'n', 'r', 'e'):
+            if re.search(rf'_{tex_type}_\d+\.png$', filename) or filename.endswith(f'_{tex_type}.png'):
+                return tex_type
         return None
     
     def rename_udim_textures(self, folder_path, new_address, number, obj_type):
@@ -953,6 +977,21 @@ class AGR_OT_rename_textures(Operator):
                         diffuse_node.image = new_img
                         loaded_images.append(new_img)
 
+            # DiffuseOpacity (LOW-atlas '_do' files). Regular low sets use
+            # separate _d/_o maps, so this fires only when an atlas material
+            # actually references a _do image — replace it wherever it is
+            # used (Base Color and Alpha share the same TEX_IMAGE node),
+            # otherwise the renamed file would be lost by cleanup.
+            if 'do' in new_texture_paths:
+                for node in nodes:
+                    if node.type == 'TEX_IMAGE' and node.image:
+                        old_name = os.path.basename(node.image.filepath) if node.image.filepath else node.image.name
+                        if re.search(r'_do(_\d+)?(\.png)?(\.\d{3})?$', old_name):
+                            new_img = self.load_texture(new_texture_paths['do'], 'sRGB')
+                            if new_img:
+                                node.image = new_img
+                                loaded_images.append(new_img)
+
             # Normal
             if 'n' in new_texture_paths:
                 for node in nodes:
@@ -1033,9 +1072,9 @@ class AGR_OT_rename_textures(Operator):
             print(f"Error loading texture {filepath}: {e}")
             return None
     
-    def _pack_textures_and_cleanup(self, folder_path, images):
+    def _pack_textures_and_cleanup(self, folder_path, images, created_paths=None):
         seen_paths = set()
-        
+
         for img in (images or []):
             if not img:
                 continue
@@ -1043,39 +1082,33 @@ class AGR_OT_rename_textures(Operator):
                 abs_path = bpy.path.abspath(img.filepath)
             except Exception:
                 continue
-            
+
             if not abs_path or abs_path in seen_paths:
                 continue
             seen_paths.add(abs_path)
-            
+
             if not os.path.exists(abs_path):
                 continue
-            
+
             try:
                 if not img.packed_file:
                     img.pack()
             except Exception:
                 continue
-        
+
+        # Remove only the files this operator created — low_texture may
+        # contain foreign user files that must survive the cleanup.
+        for path in (created_paths or []):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+        # rmdir succeeds only when the folder is empty
         try:
-            for root, dirs, files in os.walk(folder_path, topdown=False):
-                for filename in files:
-                    try:
-                        os.remove(os.path.join(root, filename))
-                    except Exception:
-                        pass
-                for dirname in dirs:
-                    try:
-                        os.rmdir(os.path.join(root, dirname))
-                    except Exception:
-                        pass
-            
-            if os.path.exists(folder_path):
-                try:
-                    os.rmdir(folder_path)
-                except Exception:
-                    pass
-        except Exception:
+            os.rmdir(folder_path)
+        except OSError:
             pass
 
 
@@ -1309,7 +1342,8 @@ def _rename_child_lights_root(root_obj, address, number, obj_type):
             counter = spot_counter
             spot_counter += 1
         elif light_type == 'POINT':
-            lighttype_name = 'Point'
+            # Project convention: point lights are named "Omni" (3ds Max style)
+            lighttype_name = 'Omni'
             counter = point_counter
             point_counter += 1
         else:
@@ -1334,8 +1368,7 @@ class AGR_OT_rename_lights_root(Operator):
         obj = context.active_object
         if not obj or obj.type != 'EMPTY':
             return False
-        if not re.search(r'_Root$', obj.name):
-            return False
+        # Name is not checked: the operator renames the empty INTO *_Root
         return any(child.type == 'LIGHT' for child in obj.children)
 
     def execute(self, context):

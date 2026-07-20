@@ -63,7 +63,8 @@ class AGR_OT_CreateFrameOnSets(Operator):
     """Create frame on selected texture sets"""
     bl_idname = "agr.create_frame_on_sets"
     bl_label = "Create Frame on Sets"
-    bl_options = {'REGISTER', 'UNDO'}
+    # No UNDO: writes PNG files on disk, Ctrl+Z cannot revert them
+    bl_options = {'REGISTER'}
 
     scale_factor: FloatProperty(
         name="Scale Factor",
@@ -88,11 +89,13 @@ class AGR_OT_CreateFrameOnSets(Operator):
 
         texture_sets_list = context.scene.agr_texture_sets
 
-        # Get selected sets
-        selected_sets = [tex_set for tex_set in texture_sets_list if tex_set.is_selected]
+        # Get selected sets (atlases excluded, same as mirror: LOW atlases
+        # use short-suffix filenames that never match the templates below)
+        selected_sets = [tex_set for tex_set in texture_sets_list
+                         if tex_set.is_selected and not tex_set.is_atlas]
 
         if len(selected_sets) == 0:
-            self.report({'WARNING'}, "No texture sets selected")
+            self.report({'WARNING'}, "No texture sets selected (atlases are skipped)")
             return {'CANCELLED'}
 
         # Get overlay image path if needed
@@ -119,10 +122,13 @@ class AGR_OT_CreateFrameOnSets(Operator):
 
             print(f"\n🖼️ Processing texture set: S_{material_name}")
 
-            # List of texture types to process
+            # List of texture types to process. DiffuseOpacity goes FIRST:
+            # with an overlay it side-writes Frame_Diffuse (overlay composited)
+            # and Frame_Opacity (overlay alpha), and those must survive —
+            # plain framed Diffuse/Opacity later in the loop are skipped.
             texture_files = {
-                'Diffuse': f"T_{material_name}_Diffuse.png",
                 'DiffuseOpacity': f"T_{material_name}_DiffuseOpacity.png",
+                'Diffuse': f"T_{material_name}_Diffuse.png",
                 'Emit': f"T_{material_name}_Emit.png",
                 'Roughness': f"T_{material_name}_Roughness.png",
                 'Metallic': f"T_{material_name}_Metallic.png",
@@ -132,11 +138,19 @@ class AGR_OT_CreateFrameOnSets(Operator):
             }
 
             set_processed = False
+            overlay_written = set()
 
             for tex_type, filename in texture_files.items():
                 filepath = os.path.join(folder_path, filename)
 
                 if not os.path.exists(filepath):
+                    continue
+
+                new_filename = f"T_{material_name}_Frame_{tex_type}.png"
+                output_path = os.path.join(new_folder_path, new_filename)
+
+                if new_filename in overlay_written:
+                    print(f"  ⏭️ {filename}: skipped (already produced from DiffuseOpacity overlay)")
                     continue
 
                 try:
@@ -147,8 +161,6 @@ class AGR_OT_CreateFrameOnSets(Operator):
                     if img.width <= 256 or img.height <= 256:
                         print(f"  ⏭️ {filename}: skipped (resolution {img.width}x{img.height} <= 256px)")
                         # Still copy the file to new folder with new name
-                        new_filename = f"T_{material_name}_Frame_{tex_type}.png"
-                        output_path = os.path.join(new_folder_path, new_filename)
                         shutil.copy2(filepath, output_path)
                         skipped_count += 1
                         img.close()
@@ -166,11 +178,17 @@ class AGR_OT_CreateFrameOnSets(Operator):
 
                     if result_img:
                         # Save to new folder with new name
-                        new_filename = f"T_{material_name}_Frame_{tex_type}.png"
-                        output_path = os.path.join(new_folder_path, new_filename)
                         result_img.save(output_path, 'PNG')
                         print(f"  ✅ {filename}: processed and saved as {new_filename}")
                         set_processed = True
+
+                        # Remember overlay side-effect files so the plain
+                        # framed originals do not overwrite them later
+                        if tex_type == 'DiffuseOpacity' and overlay_path:
+                            for side_name in (f"T_{material_name}_Frame_Diffuse.png",
+                                              f"T_{material_name}_Frame_Opacity.png"):
+                                if os.path.exists(os.path.join(new_folder_path, side_name)):
+                                    overlay_written.add(side_name)
 
                     img.close()
                     if result_img:
@@ -182,6 +200,15 @@ class AGR_OT_CreateFrameOnSets(Operator):
 
             if set_processed:
                 processed_count += 1
+
+            # A set that yielded nothing must not leave an empty folder
+            # behind (mirror does the same cleanup)
+            try:
+                if not os.listdir(new_folder_path):
+                    os.rmdir(new_folder_path)
+                    print(f"  🗑️ Removed empty folder: {new_folder_name}")
+            except OSError:
+                pass
 
         # Refresh texture sets list to include new sets
         texture_sets.refresh_texture_sets_list(context)
@@ -347,7 +374,8 @@ class AGR_OT_CreateFrameOnFiles(Operator):
     """
     bl_idname = "agr.create_frame_on_files"
     bl_label = "Create Frame on Files"
-    bl_options = {'REGISTER', 'UNDO'}
+    # No UNDO: writes PNG files on disk, Ctrl+Z cannot revert them
+    bl_options = {'REGISTER'}
 
     files: CollectionProperty(
         type=bpy.types.OperatorFileListElement,
@@ -470,9 +498,13 @@ class AGR_OT_CreateFrameOnFiles(Operator):
                 if not has_alpha and result_img.mode == 'RGBA':
                     result_img = result_img.convert('RGB')
 
-                # Save back to same file
+                # Output is always PNG — for non-PNG sources write a .png
+                # sibling instead of stuffing PNG bytes into a .jpg/.tga file
+                root, ext = os.path.splitext(filepath)
+                if ext.lower() != '.png':
+                    filepath = root + '.png'
                 result_img.save(filepath, 'PNG')
-                print(f"✅ {file_elem.name}: framed and saved")
+                print(f"✅ {os.path.basename(filepath)}: framed and saved")
 
                 processed_count += 1
 
@@ -505,7 +537,8 @@ class AGR_OT_ApplyOverlayToFiles(Operator):
     """
     bl_idname = "agr.apply_overlay_to_files"
     bl_label = "Apply Overlay to Files"
-    bl_options = {'REGISTER', 'UNDO'}
+    # No UNDO: overwrites PNG files in place, Ctrl+Z cannot revert them
+    bl_options = {'REGISTER'}
 
     files: CollectionProperty(
         type=bpy.types.OperatorFileListElement,

@@ -18,7 +18,7 @@ import tempfile
 import urllib.request
 import urllib.error
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from bpy.types import Operator, Panel, PropertyGroup, UIList
 from bpy.props import (
     StringProperty,
@@ -33,6 +33,13 @@ from .operators_bake import sanitize_material_name
 _ALL_PROJECTS = "All"
 
 _cached_items = []
+
+
+def _utcnow_naive():
+    """Naive UTC now. Index timestamps must stay tz-naive so they compare
+    cleanly with entries written by older builds (datetime.utcnow is
+    deprecated since Python 3.12, hence this replacement)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _apply_project_filter(scene):
@@ -238,8 +245,11 @@ def _write_index(ya_token: str, index_data: dict):
     urllib.request.urlopen(put_req, timeout=_TIMEOUT)
 
 
-def _yadisk_list_folders(ya_token: str) -> list:
-    """List subfolder names inside AGR_Share on Yandex.Disk."""
+def _yadisk_list_folders(ya_token: str):
+    """List subfolder names inside AGR_Share on Yandex.Disk.
+    Returns None when the listing FAILED (e.g. 429/503) — callers must not
+    treat a transient error as "no projects" or they would wipe the shared
+    index for the whole team."""
     encoded = urllib.parse.quote(_YADISK_FOLDER)
     req = urllib.request.Request(
         f"{_YADISK_API}?path={encoded}&fields=_embedded.items.name,_embedded.items.type&limit=100",
@@ -251,7 +261,7 @@ def _yadisk_list_folders(ya_token: str) -> list:
         items = data.get("_embedded", {}).get("items", [])
         return [i["name"] for i in items if i.get("type") == "dir"]
     except urllib.error.HTTPError:
-        return []
+        return None
 
 
 def _read_items(ya_token: str) -> list:
@@ -292,7 +302,7 @@ def _download_file(disk_path: str, local_path: str, ya_token: str):
 
 def _prune_old_items(items: list, max_days: int = 30) -> list:
     """Remove items older than max_days."""
-    cutoff = datetime.utcnow() - timedelta(days=max_days)
+    cutoff = _utcnow_naive() - timedelta(days=max_days)
     result = []
     for item in items:
         try:
@@ -308,7 +318,7 @@ def _format_relative_time(iso_str: str) -> str:
     """Convert ISO timestamp to a short relative string like '5m ago'."""
     try:
         ts = datetime.fromisoformat(iso_str)
-        delta = datetime.utcnow() - ts
+        delta = _utcnow_naive() - ts
         seconds = int(delta.total_seconds())
         if seconds < 60:
             return f"{seconds}s"
@@ -352,7 +362,7 @@ def _show_windows_toast(title: str, body: str):
         f"$texts.Item(0).AppendChild($tpl.CreateTextNode('{title_esc}'))|Out-Null;"
         f"$texts.Item(1).AppendChild($tpl.CreateTextNode('{body_esc}'))|Out-Null;"
         "$toast=[Windows.UI.Notifications.ToastNotification]::new($tpl);"
-        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('AGR Baker').Show($toast)"
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('AGR Tools').Show($toast)"
     )
 
     try:
@@ -507,6 +517,9 @@ class _ShareWatcher:
     @staticmethod
     def _loop(stop_event):
         while not stop_event.is_set():
+            # cfg is read after the try for the poll interval — keep it bound
+            # even when an exception fires before _load_config() returns
+            cfg = None
             try:
                 cfg = _load_config()
                 token = cfg.get("yandex_token", "")
@@ -876,7 +889,7 @@ class AGR_OT_ShareClipboard(Operator):
         if not project or project == _ALL_PROJECTS:
             self.report({'ERROR'}, f"Select a project folder first (not '{_ALL_PROJECTS}')")
             return {'CANCELLED'}
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = _utcnow_naive().strftime("%Y%m%d_%H%M%S")
         filename = f"clip_{sanitize_material_name(sender)}_{timestamp}.blend"
 
         self._state = {"result": None, "error": None}
@@ -925,7 +938,7 @@ class AGR_OT_ShareClipboard(Operator):
             items = _prune_old_items(items)
             items.append({
                 "sender": sender,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": _utcnow_naive().isoformat(),
                 "disk_path": disk_path,
                 "description": desc,
                 "objects_count": obj_count,
@@ -1025,9 +1038,22 @@ class AGR_OT_RefreshShareList(Operator):
             index_data = _read_index(ya_token)
 
             # Scan Yandex.Disk folders as source of truth
-            disk_folders = sorted(_yadisk_list_folders(ya_token))
+            listed = _yadisk_list_folders(ya_token)
 
-            # Sync: disk folders are the canonical project list
+            if listed is None:
+                # Listing failed (e.g. 429/503) — show the index as-is and
+                # do NOT reconcile: writing here would wipe the shared
+                # index based on a transient error
+                state["items"] = index_data.get("items", [])
+                state["projects"] = sorted(index_data.get("projects", []))
+                return
+
+            disk_folders = sorted(listed)
+
+            # Sync: disk folders are the canonical project list. A read
+            # operation only writes when disk state genuinely diverged;
+            # NOTE: the index has no etag/locking, so concurrent writers can
+            # still race — kept minimal deliberately (small team, short window).
             idx_projects = index_data.get("projects", [])
             if set(disk_folders) != set(idx_projects):
                 index_data["projects"] = disk_folders
@@ -1409,7 +1435,7 @@ class AGR_PT_SharePanel(Panel):
     bl_idname = "AGR_PT_share_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'AGR Baker'
+    bl_category = 'AGR Tools'
     bl_options = {'DEFAULT_CLOSED'}
     bl_order = 100
 
@@ -1422,14 +1448,14 @@ class AGR_PT_SharePanel(Panel):
 
         # --- Config section ---
         if not is_configured:
-            box = layout.box()
-            box.label(text="Configure connection", icon='ERROR')
-            box.operator("agr.save_share_config", text="Open Settings", icon='PREFERENCES')
+            warn = layout.column(align=True)
+            warn.alert = True
+            warn.label(text="Configure connection", icon='ERROR')
+            warn.operator("agr.save_share_config", text="Open Settings", icon='PREFERENCES')
             return
 
         # --- Project selector ---
-        box = layout.box()
-        row = box.row(align=True)
+        row = layout.row(align=True)
         row.prop_search(
             scene, "agr_share_active_project",
             scene, "agr_share_projects",

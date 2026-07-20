@@ -1,5 +1,5 @@
 """
-GeoJSON management operators for AGR Baker v2.
+GeoJSON management operators for AGR Tools.
 Handles scanning, creating, editing, and enriching GeoJSON files
 associated with SM_* folders next to the blend file.
 """
@@ -165,6 +165,24 @@ def _load_geojson(filepath):
 
 
 _JFLOAT_RE = re.compile(r'"##JF:([^"#]+)##"')
+_JFLOAT_VALUE_RE = re.compile(r'^##JF:([^#]+)##$')
+
+
+def _jf_to_float(value, default=0.0):
+    """Convert a JSON value to float, unwrapping '##JF:0.500##' sentinels
+    produced by _fmt() — needed when data has not passed through
+    _save_geojson (e.g. in-memory sync to UI). Empty/invalid -> default.
+    """
+    if isinstance(value, str):
+        m = _JFLOAT_VALUE_RE.match(value)
+        if m:
+            value = m.group(1)
+        if not value.strip():
+            return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _save_geojson(filepath, data):
@@ -352,10 +370,10 @@ def _load_glasses_into_folder(folder, glasses_list):
             entry.color_r = int(color.get('Red', 255))
             entry.color_g = int(color.get('Green', 255))
             entry.color_b = int(color.get('Blue', 255))
-            entry.transparency = float(params.get('transparency', 0.0))
-            entry.refraction = float(params.get('refraction', 1.5))
-            entry.roughness = float(params.get('roughness', 0.0))
-            entry.metallicity = float(params.get('metallicity', 0.0))
+            entry.transparency = _jf_to_float(params.get('transparency'), 0.0)
+            entry.refraction = _jf_to_float(params.get('refraction'), 1.5)
+            entry.roughness = _jf_to_float(params.get('roughness'), 0.0)
+            entry.metallicity = _jf_to_float(params.get('metallicity'), 0.0)
 
 
 # ────────────────────────────────────────────
@@ -668,7 +686,7 @@ class AGR_OT_add_glass_to_geojson(Operator):
             return {'CANCELLED'}
 
         glass_pattern = re.compile(
-            r'^SM_(.+?)_(MainGlass|GroundGlass)(?:_(\d+))?(?:\.\d{3})?$'
+            r'^SM_(.+?)_(MainGlass|GroundGlass|GroundElGlass)(?:_(\d+))?(?:\.\d{3})?$'
         )
 
         total_glasses = 0
@@ -687,9 +705,9 @@ class AGR_OT_add_glass_to_geojson(Operator):
             base_address = match.group(1)
             glass_type = match.group(2)
 
-            # Determine target folder
+            # Determine target folder (GroundElGlass lives in the Ground folder too)
             target_folder_name = None
-            if glass_type == "GroundGlass":
+            if glass_type in ("GroundGlass", "GroundElGlass"):
                 candidate = f"SM_{base_address}"
                 if candidate in folder_map:
                     target_folder_name = candidate

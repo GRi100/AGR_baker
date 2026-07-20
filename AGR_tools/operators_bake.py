@@ -1,5 +1,5 @@
 """
-Baking operators for AGR Baker v2
+Baking operators for AGR Tools
 """
 
 import bpy
@@ -16,6 +16,15 @@ from .core import baking, materials, texture_sets
 def sanitize_material_name(name):
     """Replace filesystem-unsafe characters in material name with underscores"""
     return re.sub(r'[/\\:*?"<>|]', '_', name)
+
+
+def _image_pixels_to_np(image):
+    """Read image pixels into a float32 array shaped (height, width, 4).
+    foreach_get is orders of magnitude faster than slicing image.pixels[:]."""
+    width, height = image.size
+    buf = np.empty(width * height * 4, dtype=np.float32)
+    image.pixels.foreach_get(buf)
+    return buf.reshape(height, width, 4)
 
 
 class AGR_OT_BakeTextures(Operator):
@@ -187,13 +196,12 @@ class AGR_OT_BakeTextures(Operator):
         img_emit = baking.create_texture_image(
             f"T_{material_name}_Emit", resolution
         )
-        img_normal = baking.create_texture_image(
-            f"T_{material_name}_Normal", resolution
-        )
-        
+        # img_normal is created later in the Normal section: both branches
+        # there create their own image, an early one would only leak as .001
+
         # Setup bake node
         baking.setup_bake_node(material)
-        
+
         # Disable metallic for diffuse baking (metallic ruins diffuse baking)
         print("  🔄 Disabling metallic for diffuse baking...")
         original_metallic_states = self.disable_metallic_for_diffuse(source_objects)
@@ -418,8 +426,8 @@ class AGR_OT_BakeTextures(Operator):
             diffuse_opacity_file = bpy.data.images.load(diffuse_opacity_path)
             diffuse_opacity_file.colorspace_settings.name = 'sRGB'
 
-            width, height = diffuse_opacity_file.size
-            pixels = np.array(diffuse_opacity_file.pixels[:]).reshape(height, width, 4)
+            pixels = _image_pixels_to_np(diffuse_opacity_file)
+            height, width = pixels.shape[0], pixels.shape[1]
 
             # Extract alpha channel
             alpha = pixels[:, :, 3]
@@ -431,7 +439,7 @@ class AGR_OT_BakeTextures(Operator):
             opacity_array[:, :, 2] = alpha
             opacity_array[:, :, 3] = 1.0
 
-            opacity_img.pixels = opacity_array.flatten().tolist()
+            opacity_img.pixels.foreach_set(opacity_array.ravel())
             opacity_img.update()
 
             print(f"  ✅ Extracted opacity from saved DiffuseOpacity file")
@@ -465,9 +473,9 @@ class AGR_OT_BakeTextures(Operator):
             width, height = emit_file.size
 
             # Convert to arrays
-            emit_array = np.array(emit_file.pixels[:]).reshape(height, width, 4)
-            roughness_array = np.array(roughness_file.pixels[:]).reshape(height, width, 4)
-            metallic_array = np.array(metallic_file.pixels[:]).reshape(height, width, 4)
+            emit_array = _image_pixels_to_np(emit_file)
+            roughness_array = _image_pixels_to_np(roughness_file)
+            metallic_array = _image_pixels_to_np(metallic_file)
 
             # Create ERM
             erm_array = np.zeros((height, width, 4), dtype=np.float32)
@@ -476,7 +484,7 @@ class AGR_OT_BakeTextures(Operator):
             erm_array[:, :, 2] = metallic_array[:, :, 0]   # B = Metallic
             erm_array[:, :, 3] = 1.0
 
-            erm_img.pixels = erm_array.flatten().tolist()
+            erm_img.pixels.foreach_set(erm_array.ravel())
             erm_img.update()
 
             print(f"  ✅ Created ERM texture from saved files")
@@ -493,14 +501,21 @@ class AGR_OT_BakeTextures(Operator):
                                     metallic_img, mat_idx, settings):
         """Bake metallic by routing it through roughness input for ALL objects"""
         original_states = []
-        
+        processed_materials = set()
+
         # Process ALL source objects (high-poly)
         for source_obj in source_objects:
             for mat_slot in source_obj.material_slots:
                 if not mat_slot.material or not mat_slot.material.use_nodes:
                     continue
-                
+
                 mat = mat_slot.material
+                # A shared material must be rewired/snapshotted only once —
+                # a second pass would snapshot the already-modified state and
+                # its restore would destroy the original wiring.
+                if mat.name in processed_materials:
+                    continue
+                processed_materials.add(mat.name)
                 nodes_data = []
                 
                 for node in mat.node_tree.nodes:
@@ -563,14 +578,19 @@ class AGR_OT_BakeTextures(Operator):
                                 emit_img, mat_idx, settings):
         """Bake emission strength by routing it through roughness input for ALL objects"""
         original_states = []
-        
+        processed_materials = set()
+
         # Process ALL source objects (high-poly)
         for source_obj in source_objects:
             for mat_slot in source_obj.material_slots:
                 if not mat_slot.material or not mat_slot.material.use_nodes:
                     continue
-                
+
                 mat = mat_slot.material
+                # Same dedup as bake_metallic_via_roughness — see comment there.
+                if mat.name in processed_materials:
+                    continue
+                processed_materials.add(mat.name)
                 nodes_data = []
                 
                 for node in mat.node_tree.nodes:
@@ -1185,8 +1205,8 @@ class AGR_OT_SimpleBake(Operator):
             diffuse_opacity_file = bpy.data.images.load(diffuse_opacity_path)
             diffuse_opacity_file.colorspace_settings.name = 'sRGB'
 
-            width, height = diffuse_opacity_file.size
-            pixels = np.array(diffuse_opacity_file.pixels[:]).reshape(height, width, 4)
+            pixels = _image_pixels_to_np(diffuse_opacity_file)
+            height, width = pixels.shape[0], pixels.shape[1]
 
             alpha = pixels[:, :, 3]
 
@@ -1196,7 +1216,7 @@ class AGR_OT_SimpleBake(Operator):
             opacity_array[:, :, 2] = alpha
             opacity_array[:, :, 3] = 1.0
 
-            opacity_img.pixels = opacity_array.flatten().tolist()
+            opacity_img.pixels.foreach_set(opacity_array.ravel())
             opacity_img.update()
 
             print(f"  ✅ Extracted opacity from saved DiffuseOpacity file")
@@ -1227,9 +1247,9 @@ class AGR_OT_SimpleBake(Operator):
 
             width, height = emit_file.size
 
-            emit_array = np.array(emit_file.pixels[:]).reshape(height, width, 4)
-            roughness_array = np.array(roughness_file.pixels[:]).reshape(height, width, 4)
-            metallic_array = np.array(metallic_file.pixels[:]).reshape(height, width, 4)
+            emit_array = _image_pixels_to_np(emit_file)
+            roughness_array = _image_pixels_to_np(roughness_file)
+            metallic_array = _image_pixels_to_np(metallic_file)
 
             erm_array = np.zeros((height, width, 4), dtype=np.float32)
             erm_array[:, :, 0] = emit_array[:, :, 0]
@@ -1237,7 +1257,7 @@ class AGR_OT_SimpleBake(Operator):
             erm_array[:, :, 2] = metallic_array[:, :, 0]
             erm_array[:, :, 3] = 1.0
 
-            erm_img.pixels = erm_array.flatten().tolist()
+            erm_img.pixels.foreach_set(erm_array.ravel())
             erm_img.update()
 
             print(f"  ✅ Created ERM texture from saved files")

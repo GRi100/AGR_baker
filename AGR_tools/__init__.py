@@ -1,15 +1,15 @@
 """
-AGR Baker v2.0 - Texture Baking and Management Addon for Blender 5.0
+AGR Tools - Texture Baking and Management Addon for Blender 5.0
 Author: computer_invader
 """
 
 bl_info = {
-    "name": "AGR Baker v2",
+    "name": "AGR Tools",
     "author": "computer_invader",
-    "version": (2, 0, 0),
+    "version": (2, 2, 0),
     "blender": (5, 0, 0),
-    "location": "View3D > Sidebar > AGR Baker",
-    "description": "Advanced texture baking, atlas creation, UDIM workflows, and asset renaming",
+    "location": "View3D > Sidebar > AGR Tools",
+    "description": "Texture baking, atlas creation, UDIM workflows, asset renaming, lights, sync and team tools",
     "category": "Object",
 }
 
@@ -45,11 +45,14 @@ except ImportError:
     print("⚠️ PIL/Pillow not available - texture resizing will be limited")
     print("   Install with: pip install Pillow")
 
+from . import log
 from . import properties
 from . import operators
 from . import ui
 
+# log first: WindowManager status props must exist before ui draws them
 modules = [
+    log,
     properties,
     operators,
     ui,
@@ -60,14 +63,14 @@ def register():
     for module in modules:
         module.register()
     
-    print("✅ AGR Baker v2.0 registered successfully")
+    print("✅ AGR Tools registered successfully")
 
 def unregister():
     """Unregister all addon classes and properties"""
     for module in reversed(modules):
         module.unregister()
-    
-    print("AGR Baker v2.0 unregistered")
+
+    print("AGR Tools unregistered")
 
 if __name__ == "__main__":
     register()

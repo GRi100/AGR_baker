@@ -1,5 +1,5 @@
 """
-Quick Mode modal operator for AGR Baker v2
+Quick Mode modal operator for AGR Tools
 Provides keyboard-driven baking/convert workflow with viewport HUD overlay.
 Activated via Alt+2 in Object or Edit mode.
 """
@@ -41,7 +41,7 @@ def _draw_viewport_hints_callback(operator, context):
 
 
 class AGR_OT_QuickMode(Operator):
-    """AGR Baker Quick Mode — keyboard-driven baking and conversion"""
+    """AGR Tools Quick Mode — keyboard-driven baking and conversion"""
     bl_idname = "agr.quick_mode"
     bl_label = "AGR Quick Mode"
     bl_options = {'REGISTER'}
@@ -287,7 +287,7 @@ class AGR_OT_QuickMode(Operator):
         settings = context.scene.agr_baker_settings
 
         hints = [
-            ("AGR Baker Quick Mode", accent_color),
+            ("AGR Tools Quick Mode", accent_color),
             ("", text_color),
             (f"Resolution: {settings.resolution}px", text_color),
             (f"Max Ray Distance: {settings.max_ray_distance:.3f}", text_color),

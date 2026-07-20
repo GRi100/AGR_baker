@@ -1,5 +1,5 @@
 """
-Core baking utilities for AGR Baker v2
+Core baking utilities for AGR Tools
 """
 
 import bpy
@@ -34,10 +34,11 @@ def create_texture_image(name, resolution, with_alpha=False):
         image.alpha_mode = 'STRAIGHT'
         print(f"  🔧 Created image with alpha channel: {name}")
     
-    # Initialize with white
-    pixels = [1.0, 1.0, 1.0, 1.0] * (resolution * resolution)
+    # Initialize with white (numpy buffer — a Python list of 4*res² floats
+    # costs gigabytes of RAM at 4K)
+    pixels = np.ones(resolution * resolution * 4, dtype=np.float32)
     image.pixels.foreach_set(pixels)
-    
+
     return image
 
 
@@ -62,7 +63,8 @@ def create_flat_normal_image(name, resolution=256):
     image.colorspace_settings.name = 'Non-Color'
     
     # Flat normal: RGB(0.5, 0.5, 1.0)
-    pixels = [0.5, 0.5, 1.0, 1.0] * (resolution * resolution)
+    pixels = np.tile(np.array([0.5, 0.5, 1.0, 1.0], dtype=np.float32),
+                     resolution * resolution)
     image.pixels.foreach_set(pixels)
     
     return image
@@ -146,9 +148,25 @@ def bake_texture(context, target_obj, source_objects, image, bake_type,
     texture_node.select = True
     nodes.active = texture_node
     
+    # Snapshot user's Bake panel state — every property written below must
+    # be rolled back in the finally, otherwise manual settings are lost
+    bake = context.scene.render.bake
+    original_bake_state = {
+        'use_selected_to_active': bake.use_selected_to_active,
+        'cage_extrusion': bake.cage_extrusion,
+        'max_ray_distance': bake.max_ray_distance,
+        'margin': bake.margin,
+        'use_clear': bake.use_clear,
+        'use_pass_direct': bake.use_pass_direct,
+        'use_pass_indirect': bake.use_pass_indirect,
+        'use_pass_color': bake.use_pass_color,
+        'normal_space': bake.normal_space,
+    }
+    original_cycles_bake_type = context.scene.cycles.bake_type
+
     # Configure baking settings
     simple_mode = len(source_objects) == 0
-    
+
     if simple_mode:
         context.scene.render.bake.use_selected_to_active = False
         context.scene.render.bake.cage_extrusion = 0.0
@@ -195,22 +213,27 @@ def bake_texture(context, target_obj, source_objects, image, bake_type,
         target_obj.select_set(True)
         context.view_layer.objects.active = target_obj
     
-    # Perform baking
+    # Perform baking — film_transparent must be restored even when the
+    # retry fails and RuntimeError propagates to the caller
     try:
-        bpy.ops.object.bake(type=context.scene.cycles.bake_type)
-        print(f"✅ Baked {bake_type} for {material.name}")
-    
-    except Exception as e:
-        print(f"❌ Baking error {bake_type}: {e}")
-        context.view_layer.update()
         try:
             bpy.ops.object.bake(type=context.scene.cycles.bake_type)
-            print(f"✅ Baked {bake_type} on retry")
-        except Exception as e2:
-            print(f"❌ Retry failed {bake_type}: {e2}")
-            raise RuntimeError(f"Bake failed for {bake_type} after retry: {e2}") from e2
-    
-    context.scene.render.film_transparent = original_film_transparent
+            print(f"✅ Baked {bake_type} for {material.name}")
+
+        except Exception as e:
+            print(f"❌ Baking error {bake_type}: {e}")
+            context.view_layer.update()
+            try:
+                bpy.ops.object.bake(type=context.scene.cycles.bake_type)
+                print(f"✅ Baked {bake_type} on retry")
+            except Exception as e2:
+                print(f"❌ Retry failed {bake_type}: {e2}")
+                raise RuntimeError(f"Bake failed for {bake_type} after retry: {e2}") from e2
+    finally:
+        context.scene.render.film_transparent = original_film_transparent
+        for prop, value in original_bake_state.items():
+            setattr(bake, prop, value)
+        context.scene.cycles.bake_type = original_cycles_bake_type
 
 
 def save_texture(image, filepath):
@@ -226,6 +249,7 @@ def save_texture(image, filepath):
     original_view = scene.view_settings.view_transform
     original_look = scene.view_settings.look
     original_display = scene.display_settings.display_device
+    original_compression = scene.render.image_settings.compression
     
     # Configure for PNG export
     scene.render.image_settings.file_format = 'PNG'
@@ -242,28 +266,31 @@ def save_texture(image, filepath):
     scene.view_settings.look = 'None'
     scene.display_settings.display_device = 'sRGB'
     
-    # Save
+    # Save — scene color-management settings must be restored even when
+    # the fallback save_render raises too
     original_filepath = image.filepath
     original_filepath_raw = image.filepath_raw
     image.filepath_raw = filepath
 
     try:
-        image.save_render(filepath)
-        print(f"💾 Saved: {filepath}")
-    except Exception as e:
-        print(f"❌ Save error {filepath}: {e}")
-        image.save_render(filepath, scene=scene)
+        try:
+            image.save_render(filepath)
+            print(f"💾 Saved: {filepath}")
+        except Exception as e:
+            print(f"❌ Save error {filepath}: {e}")
+            image.save_render(filepath, scene=scene)
+    finally:
+        image.filepath = original_filepath
+        image.filepath_raw = original_filepath_raw
 
-    image.filepath = original_filepath
-    image.filepath_raw = original_filepath_raw
-    
-    # Restore settings
-    scene.render.image_settings.file_format = original_format
-    scene.render.image_settings.color_mode = original_color_mode
-    scene.render.image_settings.color_depth = original_color_depth
-    scene.view_settings.view_transform = original_view
-    scene.view_settings.look = original_look
-    scene.display_settings.display_device = original_display
+        # Restore settings
+        scene.render.image_settings.file_format = original_format
+        scene.render.image_settings.color_mode = original_color_mode
+        scene.render.image_settings.color_depth = original_color_depth
+        scene.render.image_settings.compression = original_compression
+        scene.view_settings.view_transform = original_view
+        scene.view_settings.look = original_look
+        scene.display_settings.display_device = original_display
 
 
 def get_texture_resolution_from_node(node):
@@ -293,16 +320,16 @@ def check_socket_connection(material, socket_name):
                 continue
             
             socket = node.inputs[socket_name]
-            
-            # Check if socket has links
-            if not socket.links:
+
+            # Check if socket has links (a muted link is not a connection)
+            if not socket.links or socket.links[0].is_muted:
                 return False, None, False
-            
+
             # Get the connected node
             from_node = socket.links[0].from_node
-            
+
             # Check if it's a texture node
-            if from_node.type == 'TEX_IMAGE':
+            if from_node.type == 'TEX_IMAGE' and not from_node.mute:
                 resolution = get_texture_resolution_from_node(from_node)
                 return True, resolution, True
             
@@ -332,19 +359,31 @@ def trace_to_texture_node(node, visited=None, depth=0, max_depth=10):
         return None
     
     visited.add(node)
-    
-    # Check if current node is texture
-    if node.type == 'TEX_IMAGE':
+
+    # Check if current node is texture (a muted node is a pass-through,
+    # its own image must not count)
+    if node.type == 'TEX_IMAGE' and not node.mute:
         return get_texture_resolution_from_node(node)
-    
-    # Trace through input connections
+
+    # Node groups: the value comes from the group's internal tree — trace
+    # from its GROUP_OUTPUT node; GROUP_INPUT nodes inside have no inputs,
+    # so the trace naturally falls through to the group's external inputs
+    # via the generic loop below.
+    if node.type == 'GROUP' and node.node_tree:
+        for inner in node.node_tree.nodes:
+            if inner.type == 'GROUP_OUTPUT':
+                resolution = trace_to_texture_node(inner, visited, depth + 1, max_depth)
+                if resolution:
+                    return resolution
+
+    # Trace through input connections (skip muted links)
     for input_socket in node.inputs:
-        if input_socket.links:
+        if input_socket.links and not input_socket.links[0].is_muted:
             from_node = input_socket.links[0].from_node
             resolution = trace_to_texture_node(from_node, visited, depth + 1, max_depth)
             if resolution:
                 return resolution
-    
+
     return None
 
 
@@ -390,64 +429,6 @@ def determine_bake_resolution(material, socket_name, user_resolution):
     # Connected to non-texture nodes → user resolution
     print(f"  📏 {socket_name}: Connected to procedural → {user_resolution}px (user)")
     return user_resolution
-
-
-def determine_alpha_resolution(material, user_resolution):
-    """
-    Determine resolution for alpha-related baking
-    If Alpha socket has connection, use user resolution, otherwise 256px
-    
-    Returns:
-        int: Resolution to use
-    """
-    has_connection, texture_res, _ = check_socket_connection(material, 'Alpha')
-    
-    if has_connection:
-        print(f"  📏 Alpha: Connected → {user_resolution}px (user)")
-        return user_resolution
-    else:
-        print(f"  📏 Alpha: No connection → 256px stub")
-        return 256
-
-
-def check_normal_is_only_normal_map(material):
-    """
-    Check if Normal socket is connected only through a Normal Map node
-    (no other processing nodes)
-    
-    Returns:
-        bool: True if only Normal Map node is connected
-    """
-    if not material or not material.use_nodes:
-        return False
-    
-    for node in material.node_tree.nodes:
-        if node.type == 'BSDF_PRINCIPLED':
-            if 'Normal' not in node.inputs:
-                return False
-            
-            socket = node.inputs['Normal']
-            
-            # Check if socket has links
-            if not socket.links:
-                return False
-            
-            # Get the connected node
-            from_node = socket.links[0].from_node
-            
-            # Check if it's a Normal Map node
-            if from_node.type == 'NORMAL_MAP':
-                # Check if Normal Map is connected to a texture
-                color_input = from_node.inputs.get('Color')
-                if color_input and color_input.links:
-                    texture_node = color_input.links[0].from_node
-                    if texture_node.type == 'TEX_IMAGE':
-                        print(f"  🔍 Normal: Only Normal Map node detected → 256px")
-                        return True
-            
-            return False
-    
-    return False
 
 
 def check_normal_map_without_texture(material):
@@ -519,11 +500,12 @@ def is_image_fully_white(image, check_alpha=False):
         return False
     
     try:
-        import numpy as np
-        
-        # Get pixels as numpy array
+        # Get pixels as numpy array (foreach_get is orders of magnitude
+        # faster than slicing image.pixels[:] through Python)
         width, height = image.size
-        pixels = np.array(image.pixels[:]).reshape(height, width, 4)
+        pixels = np.empty(width * height * 4, dtype=np.float32)
+        image.pixels.foreach_get(pixels)
+        pixels = pixels.reshape(height, width, 4)
         
         if check_alpha:
             # Check only alpha channel
