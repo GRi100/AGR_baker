@@ -477,6 +477,7 @@ class AGR_PT_SortSelectPanel(Panel):
         sel_row3.operator("agr.select_sets_for_object", text="For Active", icon='OBJECT_DATA')
         sel_row3.operator("agr.select_set_for_active_material", text="For Active Mat", icon='MATERIAL')
         sel_row3.operator("agr.select_mirrored_sets", text="Mirrored", icon='MOD_MIRROR')
+        sel_row3.operator("agr.select_stub_sets", text="Stubs", icon='COLOR')
 
 
 class AGR_PT_BatchOpsPanel(Panel):
@@ -505,6 +506,7 @@ class AGR_PT_BatchOpsPanel(Panel):
         row.operator("agr.connect_regular_set_to_material", text="Regular")
         if context.active_object and context.active_object.type == 'MESH':
             col.operator("agr.assign_set_to_active", text="Assign to Active", icon='OBJECT_DATA')
+        col.operator("agr.swap_sets_on_object", text="Swap on Object", icon='ARROW_LEFTRIGHT')
 
         # Group 2: file operations (rewrite PNGs on disk)
         col = layout.column(align=True)
@@ -515,6 +517,9 @@ class AGR_PT_BatchOpsPanel(Panel):
         row = col.row(align=True)
         row.operator("agr.mirror_texture_set", text="Mirror", icon='MOD_MIRROR')
         row.operator("agr.strip_useless_alpha", text="Strip Alpha", icon='IMAGE_ALPHA')
+        row = col.row(align=True)
+        row.operator("agr.tile_texture_set", text="Tile ×N", icon='MOD_ARRAY')
+        row.operator("agr.create_stub_set", text="Stub Set", icon='COLOR')
 
         # Group 3: frames / overlays
         col = layout.column(align=True)

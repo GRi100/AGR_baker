@@ -6,6 +6,7 @@ import bpy
 from bpy.types import Operator
 from bpy.props import EnumProperty, IntProperty
 import os
+import re
 
 from .core import texture_sets, materials
 from .log import agr_report
@@ -108,15 +109,15 @@ class AGR_OT_StripUselessAlpha(Operator):
 
 
 class AGR_OT_ResizeTextureSet(Operator):
-    """Resize all textures in selected sets using LANCZOS algorithm"""
+    """Create resized copies of selected texture sets (new S_*_<res>px folders, LANCZOS); originals stay untouched"""
     bl_idname = "agr.resize_texture_set"
-    bl_label = "Resize Texture Set"
-    # No UNDO: rewrites PNG files in place, Ctrl+Z cannot revert them
+    bl_label = "Resize Selected Sets"
+    # No UNDO: writes new PNG folders on disk, Ctrl+Z cannot revert them
     bl_options = {'REGISTER'}
-    
+
     target_resolution: EnumProperty(
         name="Target Resolution",
-        description="Resolution to resize textures to",
+        description="Resolution of the resized copy",
         items=[
             ('64', "64", "64x64"),
             ('128', "128", "128x128"),
@@ -128,119 +129,128 @@ class AGR_OT_ResizeTextureSet(Operator):
         ],
         default='1024'
     )
-    
+
     def execute(self, context):
         texture_sets_list = context.scene.agr_texture_sets
         target_res = int(self.target_resolution)
-        
-        # Get selected sets
-        selected_sets = [tex_set for tex_set in texture_sets_list if tex_set.is_selected]
-        
+
+        # Get selected sets (atlases excluded - resize only regular sets)
+        selected_sets = [tex_set for tex_set in texture_sets_list
+                         if tex_set.is_selected and not tex_set.is_atlas]
+
         if len(selected_sets) == 0:
             self.report({'WARNING'}, "No texture sets selected")
             return {'CANCELLED'}
-        
+
         try:
             from PIL import Image
-            has_pil = True
         except ImportError:
             self.report({'ERROR'}, "PIL/Pillow not available. Install with: pip install Pillow")
             return {'CANCELLED'}
-        
-        # Validate ALL sets have HIGH textures BEFORE any resize
-        is_valid, error_msg = materials.validate_all_high_mode(selected_sets)
-        if not is_valid:
-            self.report({'ERROR'}, error_msg)
-            return {'CANCELLED'}
 
-        resized_count = 0
+        suffix = f"{target_res}px"
+
+        processed_count = 0
         error_count = 0
 
         for tex_set in selected_sets:
             material_name = tex_set.material_name
             folder_path = tex_set.folder_path
-            
-            print(f"\n🔄 Resizing texture set: S_{material_name} to {target_res}px")
-            
-            # List of texture types to resize
-            texture_files = [
-                f"T_{material_name}_Diffuse.png",
-                f"T_{material_name}_DiffuseOpacity.png",
-                f"T_{material_name}_Emit.png",
-                f"T_{material_name}_Roughness.png",
-                f"T_{material_name}_Metallic.png",
-                f"T_{material_name}_Opacity.png",
-                f"T_{material_name}_Normal.png",
-                f"T_{material_name}_ERM.png",
-            ]
-            
-            for filename in texture_files:
-                filepath = os.path.join(folder_path, filename)
-                
-                if not os.path.exists(filepath):
-                    continue
-                
-                try:
-                    # Load image
-                    with Image.open(filepath) as img:
-                        original_size = img.size
 
-                        # Skip if already at target resolution
-                        if img.width == target_res and img.height == target_res:
-                            print(f"  ⏭️ {filename}: already {target_res}px")
-                            continue
+            try:
+                print(f"\n🔄 Resizing {material_name} → {target_res}px...")
 
-                        # Resize using LANCZOS
-                        img_resized = img.resize((target_res, target_res), Image.LANCZOS)
+                parent_folder = os.path.dirname(folder_path)
+                new_folder_name = f"S_{material_name}_{suffix}"
+                new_folder_path = os.path.join(parent_folder, new_folder_name)
+                if not os.path.exists(new_folder_path):
+                    os.makedirs(new_folder_path)
 
-                    # Save back to same file
-                    img_resized.save(filepath, 'PNG')
-                    img_resized.close()
+                texture_types = [
+                    ('Diffuse', f"T_{material_name}_Diffuse.png"),
+                    ('DiffuseOpacity', f"T_{material_name}_DiffuseOpacity.png"),
+                    ('Roughness', f"T_{material_name}_Roughness.png"),
+                    ('Metallic', f"T_{material_name}_Metallic.png"),
+                    ('Emit', f"T_{material_name}_Emit.png"),
+                    ('Opacity', f"T_{material_name}_Opacity.png"),
+                    ('ERM', f"T_{material_name}_ERM.png"),
+                    ('Normal', f"T_{material_name}_Normal.png"),
+                ]
 
-                    print(f"  ✅ {filename}: {original_size[0]}px → {target_res}px")
-                    resized_count += 1
-                    
-                except Exception as e:
-                    print(f"  ❌ Error resizing {filename}: {e}")
+                resized_count = 0
+                failed_count = 0
+
+                for tex_type, filename in texture_types:
+                    tex_path = os.path.join(folder_path, filename)
+
+                    if os.path.exists(tex_path):
+                        try:
+                            with Image.open(tex_path) as img:
+                                original_size = img.size
+                                if img.size == (target_res, target_res):
+                                    # Already at target - plain copy into the new set
+                                    img_resized = img.copy()
+                                else:
+                                    img_resized = img.resize((target_res, target_res), Image.LANCZOS)
+
+                            new_filename = f"T_{material_name}_{suffix}_{tex_type}.png"
+                            output_path = os.path.join(new_folder_path, new_filename)
+                            img_resized.save(output_path, 'PNG')
+                            img_resized.close()
+                            print(f"  📐 {tex_type}: {original_size[0]}px → {target_res}px")
+                            resized_count += 1
+
+                        except Exception as e:
+                            print(f"  ⚠️ Error resizing {tex_type}: {e}")
+                            failed_count += 1
+
+                if failed_count > 0:
                     error_count += 1
-            
-            # Update resolution in texture set
-            tex_set.resolution = target_res
-            
-            # Reconnect textures to material
-            material_name = tex_set.material_name
-            if material_name in bpy.data.materials:
-                material = bpy.data.materials[material_name]
-                print(f"🔗 Reconnecting textures to material {material_name}...")
-                materials.connect_texture_set_to_material(material, folder_path, material_name)
 
-        # Refresh texture sets list
+                if resized_count > 0:
+                    print(f"  ✅ Created {new_folder_name} with {resized_count} textures")
+                    processed_count += 1
+                else:
+                    print(f"  ⚠️ No textures found to resize")
+                    # Don't leave an empty S_*_<res>px folder behind
+                    try:
+                        os.rmdir(new_folder_path)
+                    except OSError:
+                        pass
+
+            except Exception as e:
+                print(f"  ❌ Error processing {material_name}: {e}")
+                error_count += 1
+
+        # Refresh texture sets list so new _<res>px sets appear
         texture_sets.refresh_texture_sets_list(context)
-        
+
         if error_count > 0:
-            self.report({'WARNING'}, f"Resized {resized_count} textures, {error_count} errors")
+            self.report({'WARNING'}, f"Resized {processed_count} sets, {error_count} errors")
         else:
-            self.report({'INFO'}, f"Resized {resized_count} textures to {target_res}px and reconnected")
-        
+            self.report({'INFO'}, f"Created {processed_count} resized set(s) (_{suffix})")
+
         return {'FINISHED'}
-    
+
     def invoke(self, context, event):
-        selected_count = sum(1 for tex_set in context.scene.agr_texture_sets if tex_set.is_selected)
+        selected_count = sum(1 for tex_set in context.scene.agr_texture_sets
+                             if tex_set.is_selected and not tex_set.is_atlas)
         if selected_count == 0:
             self.report({'WARNING'}, "No sets selected")
             return {'CANCELLED'}
         return context.window_manager.invoke_props_dialog(self)
-    
+
     def draw(self, context):
         layout = self.layout
-        selected_count = sum(1 for tex_set in context.scene.agr_texture_sets if tex_set.is_selected)
-        
+        selected_count = sum(1 for tex_set in context.scene.agr_texture_sets
+                             if tex_set.is_selected and not tex_set.is_atlas)
+
         layout.label(text=f"Resize {selected_count} texture set(s)", icon='IMAGE_DATA')
         layout.separator()
         layout.prop(self, "target_resolution")
         layout.separator()
-        layout.label(text="All textures will be resized using LANCZOS", icon='INFO')
-
+        layout.label(text=f"• Creates new S_*_{self.target_resolution}px sets", icon='INFO')
+        layout.label(text="• Originals are not modified")
 
 class AGR_OT_ConnectSetToMaterial(Operator):
     """Connect selected texture sets to materials"""
@@ -1151,6 +1161,301 @@ class AGR_OT_MirrorTextureSet(Operator):
         layout.label(text="• Normal maps get channel inversion")
 
 
+class AGR_OT_TileTextureSet(Operator):
+    """Enlarge selected texture sets by tiling: repeat the texture N x N times into a new S_*_tileNx set (resolution grows N times)"""
+    bl_idname = "agr.tile_texture_set"
+    bl_label = "Tile Selected Sets"
+    # No UNDO: writes new PNG folders on disk, Ctrl+Z cannot revert them
+    bl_options = {'REGISTER'}
+
+    # Blender's practical texture ceiling; tiling past it produces unusable PNGs
+    MAX_RESOLUTION = 16384
+
+    tile_factor: bpy.props.IntProperty(
+        name="Multiplier",
+        description="How many times to enlarge: N=2 places 2x2 copies (4 quadrants), N=3 places 3x3, etc.",
+        default=2,
+        min=2,
+        max=8
+    )
+
+    def execute(self, context):
+        texture_sets_list = context.scene.agr_texture_sets
+
+        # Get selected sets (atlases excluded - tile only regular sets)
+        selected_sets = [tex_set for tex_set in texture_sets_list
+                         if tex_set.is_selected and not tex_set.is_atlas]
+
+        if len(selected_sets) == 0:
+            self.report({'WARNING'}, "No texture sets selected")
+            return {'CANCELLED'}
+
+        try:
+            from PIL import Image
+        except ImportError:
+            self.report({'ERROR'}, "PIL/Pillow not available. Install with: pip install Pillow")
+            return {'CANCELLED'}
+
+        n = self.tile_factor
+        suffix = f"tile{n}x"
+
+        processed_count = 0
+        error_count = 0
+        skipped_big = 0
+
+        for tex_set in selected_sets:
+            material_name = tex_set.material_name
+            folder_path = tex_set.folder_path
+
+            try:
+                print(f"\n🔄 Tiling {material_name} ({n}x{n})...")
+
+                parent_folder = os.path.dirname(folder_path)
+                new_folder_name = f"S_{material_name}_{suffix}"
+                new_folder_path = os.path.join(parent_folder, new_folder_name)
+                if not os.path.exists(new_folder_path):
+                    os.makedirs(new_folder_path)
+
+                texture_types = [
+                    ('Diffuse', f"T_{material_name}_Diffuse.png"),
+                    ('DiffuseOpacity', f"T_{material_name}_DiffuseOpacity.png"),
+                    ('Roughness', f"T_{material_name}_Roughness.png"),
+                    ('Metallic', f"T_{material_name}_Metallic.png"),
+                    ('Emit', f"T_{material_name}_Emit.png"),
+                    ('Opacity', f"T_{material_name}_Opacity.png"),
+                    ('ERM', f"T_{material_name}_ERM.png"),
+                    ('Normal', f"T_{material_name}_Normal.png"),
+                ]
+
+                tiled_count = 0
+                failed_count = 0
+
+                for tex_type, filename in texture_types:
+                    tex_path = os.path.join(folder_path, filename)
+
+                    if os.path.exists(tex_path):
+                        try:
+                            with Image.open(tex_path) as img:
+                                # Indexed/exotic modes lose their palette when
+                                # pasted into a fresh canvas - normalize first
+                                if img.mode not in ('RGB', 'RGBA', 'L', 'LA'):
+                                    img = img.convert('RGBA' if 'transparency' in img.info else 'RGB')
+
+                                w, h = img.size
+                                if w * n > self.MAX_RESOLUTION or h * n > self.MAX_RESOLUTION:
+                                    print(f"  ⚠️ Skipped {tex_type}: {w * n}px exceeds {self.MAX_RESOLUTION}px limit")
+                                    skipped_big += 1
+                                    continue
+
+                                img_tiled = Image.new(img.mode, (w * n, h * n))
+                                for ty in range(n):
+                                    for tx in range(n):
+                                        img_tiled.paste(img, (tx * w, ty * h))
+
+                            new_filename = f"T_{material_name}_{suffix}_{tex_type}.png"
+                            output_path = os.path.join(new_folder_path, new_filename)
+                            img_tiled.save(output_path, 'PNG')
+                            img_tiled.close()
+                            print(f"  🧩 Tiled {tex_type} ({w}px → {w * n}px)")
+                            tiled_count += 1
+
+                        except Exception as e:
+                            print(f"  ⚠️ Error tiling {tex_type}: {e}")
+                            failed_count += 1
+
+                if failed_count > 0:
+                    error_count += 1
+
+                if tiled_count > 0:
+                    print(f"  ✅ Created {new_folder_name} with {tiled_count} textures")
+                    processed_count += 1
+                else:
+                    print(f"  ⚠️ No textures found to tile")
+                    # Don't leave an empty S_*_tile* folder behind
+                    try:
+                        os.rmdir(new_folder_path)
+                    except OSError:
+                        pass
+
+            except Exception as e:
+                print(f"  ❌ Error processing {material_name}: {e}")
+                error_count += 1
+
+        # Refresh texture sets list so new _tile* sets appear
+        texture_sets.refresh_texture_sets_list(context)
+
+        if error_count > 0:
+            self.report({'WARNING'}, f"Tiled {processed_count} sets, {error_count} errors")
+        elif skipped_big > 0:
+            self.report({'WARNING'}, f"Created {processed_count} tiled set(s), {skipped_big} textures over {self.MAX_RESOLUTION}px skipped")
+        else:
+            self.report({'INFO'}, f"Created {processed_count} tiled set(s) (_{suffix})")
+
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        selected_count = sum(1 for tex_set in context.scene.agr_texture_sets
+                             if tex_set.is_selected and not tex_set.is_atlas)
+        if selected_count == 0:
+            self.report({'WARNING'}, "No sets selected")
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        layout = self.layout
+        selected = [tex_set for tex_set in context.scene.agr_texture_sets
+                    if tex_set.is_selected and not tex_set.is_atlas]
+
+        layout.label(text=f"Tile {len(selected)} texture set(s)", icon='MOD_ARRAY')
+        layout.separator()
+        layout.prop(self, "tile_factor", slider=True)
+
+        n = self.tile_factor
+        layout.separator()
+        layout.label(text=f"• Places {n}x{n} copies into new S_*_tile{n}x sets", icon='INFO')
+        max_res = max((tex_set.resolution for tex_set in selected), default=0)
+        if max_res:
+            result = max_res * n
+            if result > self.MAX_RESOLUTION:
+                layout.label(text=f"• Largest set: {max_res}px → {result}px (over limit, will skip!)", icon='ERROR')
+            else:
+                layout.label(text=f"• Largest set: {max_res}px → {result}px")
+
+
+def _average_color_of_image(path):
+    """Alpha-weighted average RGB of an image file -> (r, g, b) ints, or None
+    if the image is fully transparent / unreadable."""
+    from PIL import Image
+    import numpy as np
+
+    try:
+        with Image.open(path) as img:
+            has_alpha = 'A' in img.getbands()
+            img = img.convert('RGBA' if has_alpha else 'RGB')
+            arr = np.asarray(img)
+    except Exception as e:
+        print(f"  ⚠️ Cannot read {os.path.basename(path)}: {e}")
+        return None
+
+    if has_alpha:
+        # Weight RGB by alpha so transparent regions don't skew the color
+        alpha = arr[..., 3].astype(np.float32) * (1.0 / 255.0)
+        alpha_sum = alpha.sum(dtype=np.float64)
+        if alpha_sum < 1e-6:
+            return None
+        return tuple(int(round((arr[..., c] * alpha).sum(dtype=np.float64) / alpha_sum))
+                     for c in range(3))
+    return tuple(int(round(arr[..., c].mean(dtype=np.float64))) for c in range(3))
+
+
+class AGR_OT_CreateStubSet(Operator):
+    """For each selected set create a 256px stub set S_*_stub: solid-color textures filled with the set's average DiffuseOpacity color"""
+    bl_idname = "agr.create_stub_set"
+    bl_label = "Create Stub Sets"
+    # No UNDO: writes new PNG folders on disk, Ctrl+Z cannot revert them
+    bl_options = {'REGISTER'}
+
+    STUB_RESOLUTION = 256
+    # Same neutral PBR defaults as UDIM tile replacement: E=0, R=204, M=0
+    DEFAULT_ERM = (0, 204, 0)
+
+    def execute(self, context):
+        texture_sets_list = context.scene.agr_texture_sets
+
+        # Get selected sets (atlases excluded - stub only regular sets)
+        selected_sets = [tex_set for tex_set in texture_sets_list
+                         if tex_set.is_selected and not tex_set.is_atlas]
+
+        if len(selected_sets) == 0:
+            self.report({'WARNING'}, "No texture sets selected")
+            return {'CANCELLED'}
+
+        try:
+            from PIL import Image
+        except ImportError:
+            self.report({'ERROR'}, "PIL/Pillow not available. Install with: pip install Pillow")
+            return {'CANCELLED'}
+
+        res = (self.STUB_RESOLUTION, self.STUB_RESOLUTION)
+        processed_count = 0
+        error_count = 0
+
+        for tex_set in selected_sets:
+            material_name = tex_set.material_name
+            folder_path = tex_set.folder_path
+
+            try:
+                print(f"\n🔄 Stub for {material_name}...")
+
+                # Average DiffuseOpacity color of THIS set (alpha-weighted)
+                color_path = None
+                for fname in (f"T_{material_name}_DiffuseOpacity.png",
+                              f"T_{material_name}_Diffuse.png"):
+                    candidate = os.path.join(folder_path, fname)
+                    if os.path.exists(candidate):
+                        color_path = candidate
+                        break
+                if not color_path:
+                    print(f"  ⚠️ No DiffuseOpacity/Diffuse found, skipped")
+                    error_count += 1
+                    continue
+
+                diffuse_color = _average_color_of_image(color_path)
+                if not diffuse_color:
+                    print(f"  ⚠️ No usable pixels (fully transparent?), skipped")
+                    error_count += 1
+                    continue
+                print(f"  🎨 Average color RGB{diffuse_color}")
+
+                erm_color = None
+                erm_path = os.path.join(folder_path, f"T_{material_name}_ERM.png")
+                if os.path.exists(erm_path):
+                    erm_color = _average_color_of_image(erm_path)
+                if not erm_color:
+                    erm_color = self.DEFAULT_ERM
+                emit, rough, metal = erm_color
+
+                new_name = f"{material_name}_stub"
+                parent_folder = os.path.dirname(folder_path)
+                new_folder_path = os.path.join(parent_folder, f"S_{new_name}")
+                if not os.path.exists(new_folder_path):
+                    os.makedirs(new_folder_path)
+
+                # Full HIGH + LOW texture complement so the stub connects in both modes
+                stub_textures = [
+                    ('DiffuseOpacity', 'RGBA', diffuse_color + (255,)),
+                    ('Diffuse', 'RGB', diffuse_color),
+                    ('Opacity', 'RGB', (255, 255, 255)),
+                    ('ERM', 'RGB', erm_color),
+                    ('Emit', 'RGB', (emit, emit, emit)),
+                    ('Roughness', 'RGB', (rough, rough, rough)),
+                    ('Metallic', 'RGB', (metal, metal, metal)),
+                    ('Normal', 'RGB', (128, 128, 255)),
+                ]
+
+                for tex_type, mode, color in stub_textures:
+                    img = Image.new(mode, res, color)
+                    img.save(os.path.join(new_folder_path, f"T_{new_name}_{tex_type}.png"), 'PNG')
+                    img.close()
+
+                print(f"  ✅ Created S_{new_name} ({len(stub_textures)} textures)")
+                processed_count += 1
+
+            except Exception as e:
+                print(f"  ❌ Error processing {material_name}: {e}")
+                error_count += 1
+
+        # Refresh texture sets list so new _stub sets appear
+        texture_sets.refresh_texture_sets_list(context)
+
+        if error_count > 0:
+            self.report({'WARNING'}, f"Created {processed_count} stub set(s), {error_count} skipped/errors")
+        else:
+            self.report({'INFO'}, f"Created {processed_count} stub set(s) (_stub)")
+
+        return {'FINISHED'}
+
+
 class AGR_OT_SelectMirroredSets(Operator):
     """Select all texture sets with _mirrorX/_mirrorY suffix"""
     bl_idname = "agr.select_mirrored_sets"
@@ -1169,6 +1474,123 @@ class AGR_OT_SelectMirroredSets(Operator):
                 tex_set.is_selected = False
 
         self.report({'INFO'}, f"Selected {selected_count} mirrored sets")
+        return {'FINISHED'}
+
+
+class AGR_OT_SelectStubSets(Operator):
+    """Select all texture sets with _stub suffix"""
+    bl_idname = "agr.select_stub_sets"
+    bl_label = "Select Stub Sets"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        texture_sets_list = context.scene.agr_texture_sets
+        selected_count = 0
+
+        for tex_set in texture_sets_list:
+            if tex_set.name.endswith("_stub"):
+                tex_set.is_selected = True
+                selected_count += 1
+            else:
+                tex_set.is_selected = False
+
+        self.report({'INFO'}, f"Selected {selected_count} stub sets")
+        return {'FINISHED'}
+
+
+# Suffixes produced by the copying batch ops (Mirror / Tile / Stub / Resize).
+# group(1) = base material name, group(2) = the derived suffix itself.
+DERIVED_SET_SUFFIX_RE = re.compile(r'^(.+)_(mirror[XY]|tile\d+x|stub|\d+px)$')
+
+
+class AGR_OT_SwapSetsOnObject(Operator):
+    """Swap object materials to the checked derived sets (_mirrorX/_tileNx/_stub/_<res>px): a new material is built from each derived set and replaces its base material in the object's slots"""
+    bl_idname = "agr.swap_sets_on_object"
+    bl_label = "Swap Sets on Object"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        targets = [o for o in context.selected_objects if o.type == 'MESH']
+        if not targets and not (context.active_object and context.active_object.type == 'MESH'):
+            cls.poll_message_set("Выберите MESH-объект(ы)")
+            return False
+        return True
+
+    def execute(self, context):
+        texture_sets_list = context.scene.agr_texture_sets
+
+        selected_sets = [tex_set for tex_set in texture_sets_list
+                         if tex_set.is_selected and not tex_set.is_atlas]
+
+        if len(selected_sets) == 0:
+            self.report({'WARNING'}, "No texture sets selected")
+            return {'CANCELLED'}
+
+        targets = [o for o in context.selected_objects if o.type == 'MESH']
+        if not targets and context.active_object and context.active_object.type == 'MESH':
+            targets = [context.active_object]
+        if not targets:
+            self.report({'WARNING'}, "No mesh objects selected")
+            return {'CANCELLED'}
+
+        swapped_count = 0
+        no_match_count = 0
+        skipped_sets = []
+
+        for tex_set in selected_sets:
+            derived_name = tex_set.material_name
+
+            m = DERIVED_SET_SUFFIX_RE.match(derived_name)
+            if not m:
+                skipped_sets.append(tex_set.name)
+                print(f"⏭️ {tex_set.name}: not a derived set (_mirror*/_tile*/_stub/_*px), skipped")
+                continue
+            base_name = m.group(1)
+
+            derived_material = None  # built lazily, only if a matching slot exists
+            set_swapped = 0
+
+            for obj in targets:
+                for slot in obj.material_slots:
+                    slot_mat = slot.material
+                    if slot_mat is None:
+                        continue
+                    # Match base material exactly, tolerating Blender's .001 copies
+                    slot_name = slot_mat.name
+                    if slot_name != base_name and not (
+                            slot_name.startswith(base_name + '.')
+                            and slot_name[len(base_name) + 1:].isdigit()):
+                        continue
+
+                    if derived_material is None:
+                        if derived_name in bpy.data.materials:
+                            derived_material = bpy.data.materials[derived_name]
+                        else:
+                            # Copy keeps blend method / culling / extra nodes of the base
+                            derived_material = slot_mat.copy()
+                            derived_material.name = derived_name
+                        materials.connect_best_texture_set_to_material(
+                            derived_material, tex_set.folder_path, derived_name)
+
+                    slot.material = derived_material
+                    set_swapped += 1
+                    print(f"🔁 {obj.name}: {slot_name} → {derived_name}")
+
+            if set_swapped:
+                tex_set.is_assigned = True
+                swapped_count += set_swapped
+            else:
+                no_match_count += 1
+                print(f"⚠️ {tex_set.name}: base material '{base_name}' not found on target object(s)")
+
+        parts = [f"Swapped {swapped_count} slot(s)"]
+        if no_match_count:
+            parts.append(f"{no_match_count} set(s) had no matching material")
+        if skipped_sets:
+            parts.append(f"{len(skipped_sets)} not derived")
+        level = 'INFO' if swapped_count else 'WARNING'
+        self.report({level}, ", ".join(parts))
         return {'FINISHED'}
 
 
@@ -1195,7 +1617,11 @@ classes = (
     AGR_OT_SortSetsByAlpha,
     AGR_OT_GaussianBlurSet,
     AGR_OT_MirrorTextureSet,
+    AGR_OT_TileTextureSet,
+    AGR_OT_CreateStubSet,
     AGR_OT_SelectMirroredSets,
+    AGR_OT_SelectStubSets,
+    AGR_OT_SwapSetsOnObject,
     AGR_OT_StripUselessAlpha,
 )
 
