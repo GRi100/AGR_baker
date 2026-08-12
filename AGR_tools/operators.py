@@ -6,6 +6,7 @@ from . import operators_bake
 from . import operators_sets
 from . import operators_utils
 from . import operators_udim
+from . import operators_uv
 from . import operators_convert
 from . import operators_atlas
 from . import operators_frame
@@ -24,6 +25,7 @@ def register():
     operators_sets.register()
     operators_utils.register()
     operators_udim.register()
+    operators_uv.register()
     operators_convert.register()
     operators_atlas.register()
     operators_frame.register()
@@ -50,6 +52,7 @@ def unregister():
     operators_frame.unregister()
     operators_atlas.unregister()
     operators_convert.unregister()
+    operators_uv.unregister()
     operators_udim.unregister()
     operators_utils.unregister()
     operators_sets.unregister()
