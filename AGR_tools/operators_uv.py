@@ -31,7 +31,7 @@ import bpy
 import bmesh
 import gpu
 from gpu_extras.batch import batch_for_shader
-from math import ceil, floor
+from math import atan2, ceil, cos, floor, hypot, pi, sin
 from mathutils import Matrix, Vector, geometry
 
 from bpy.props import (
@@ -285,13 +285,20 @@ def _mean_world_normal(targets):
 
 
 def _capture_grid(op, context, settings, picked=None):
-    """Store the reference grid from two selected edges of one cell."""
+    """Store the reference grid from the selected edges.
+
+    Exactly 2 edges — precise capture from one cell (axes, sizes, origin).
+    3+ edges — statistical autofit over the whole selection (median cell
+    sizes, diagonals filtered out; see _capture_grid_autofit).
+    """
     if picked is None:
         picked = _selected_edges(context)
+    if len(picked) > 2:
+        return _capture_grid_autofit(op, context, settings)
     if len(picked) != 2:
-        count = "больше двух" if len(picked) > 2 else str(len(picked))
         agr_report(op, 'ERROR',
-                   f"Нужно ровно 2 ребра одной ячейки сетки (выделено: {count})")
+                   "Выделите 2 ребра одной ячейки (точный захват) или несколько "
+                   f"рёбер сетки (автофит) — сейчас выделено: {len(picked)}")
         return False
 
     (a1, b1), (a2, b2) = picked
@@ -369,6 +376,354 @@ def _capture_grid(op, context, settings, picked=None):
     return True
 
 
+# Autofit: edges farther than this from a family axis are discarded as
+# diagonals/garbage.  15° keeps a solid margin both to noisy grid edges
+# (millimeter noise is < 1°) and to the closest real diagonal (26.6° for
+# a 2:1 cell, 45° for a square one).  Diagonals of longer cells (18.4° for
+# 3:1, 14° for 4:1) need the median re-centering and the length signature
+# in _autofit_solve on top — the window alone cannot separate them.
+_AUTOFIT_ANGLE_TOL = pi / 12.0
+# Coplanarity: edges leaving the grid plane by more than 30° are not grid
+# edges (|d·n|/|d| = sine of the tilt; window returns/reveals sit at ~90°
+# and would otherwise vote for angle 0 with full 3D weight — atan2(0,0)==0)
+_AUTOFIT_PLANE_TOL = 0.5
+# True grid edges sit sub-degree from their family axis (mm noise); an edge
+# farther off AND matching the cell-diagonal length is a triangulation
+# diagonal even when it fits the ±15° window
+_AUTOFIT_TIGHT_TOL = pi / 90.0        # 2°
+_AUTOFIT_DIAG_LEN_TOL = 0.1           # ±10% around hypot(cell_u, cell_v)
+# Angle re-centering: the weighted-median shift converges in 2-3 passes
+_AUTOFIT_MAX_PASSES = 6
+_AUTOFIT_SHIFT_EPS = pi / 3600.0      # 0.05° — considered converged
+# If the two families keep less than this fraction of the in-plane edge
+# length, the "grid" explains a minority of the selection — refuse instead
+# of committing a garbage basis (uniform direction mess keeps ~33%)
+_AUTOFIT_MIN_KEPT_FRAC = 0.4
+# Rerun the fit with the families' own plane normal when the face-area
+# normal was tilted >2° by attached out-of-plane geometry (one-sided
+# window returns drag it and shrink every projected length)
+_AUTOFIT_REFIT_DOT = cos(pi / 90.0)
+
+
+def _median_sorted(vals):
+    """Median of an already sorted non-empty sequence."""
+    k = len(vals)
+    return vals[k // 2] if k % 2 else 0.5 * (vals[k // 2 - 1] + vals[k // 2])
+
+
+def _weighted_median(pairs):
+    """Weighted median of [(value, weight)] — the value where the running
+    weight crosses half of the total.  Majority-robust: unlike the mean it
+    ignores a coherent minority cluster (triangulation diagonals) entirely."""
+    pairs = sorted(pairs)
+    half = 0.5 * sum(w for _v, w in pairs)
+    acc = 0.0
+    for v, w in pairs:
+        acc += w
+        if acc >= half:
+            return v
+    return pairs[-1][0]
+
+
+def _collect_autofit_edges(context):
+    """ALL selected edges + the area normal of their linked faces.
+
+    Everything is copied out immediately (BMElem lifetime rule — see
+    _selected_edges).  Returns ([(world_a, world_b, is_boundary)], normal).
+    """
+    edges = []
+    normal = Vector((0.0, 0.0, 0.0))
+    for obj in _edit_mesh_objects(context):
+        bm = bmesh.from_edit_mesh(obj.data)
+        mat = obj.matrix_world
+        seen = set()
+        for e in bm.edges:
+            if not e.select:
+                continue
+            edges.append((mat @ e.verts[0].co, mat @ e.verts[1].co,
+                          e.is_boundary))
+            for f in e.link_faces:
+                if f in seen:
+                    continue
+                seen.add(f)
+                ws = [mat @ v.co for v in f.verts]
+                for i in range(1, len(ws) - 1):
+                    normal += (ws[i] - ws[0]).cross(ws[i + 1] - ws[0])
+    return edges, normal
+
+
+def _autofit_solve(edges, n):
+    """One autofit pass against a fixed grid-plane normal `n`.
+
+    Returns a dict: {'err': message} on failure, otherwise the fitted
+    axes/cells/origin plus statistics for the report and `n_fit` — the
+    plane normal implied by the surviving families — for the optional
+    refit pass (see _capture_grid_autofit).
+    """
+    # Coplanarity filter: an edge leaving the grid plane (window return,
+    # reveal) projects to ~nothing in-plane, so atan2(0, 0) == 0 made it
+    # vote for angle 0 with its FULL 3D length and its 3D length poisoned
+    # the family medians.  Drop such edges entirely and measure everything
+    # that stays IN THE PLANE.
+    data = []   # (a, b, in-plane unit dir, in-plane length, boundary, 3D unit dir)
+    oop = 0     # out-of-plane rejects
+    for a, b, boundary in edges:
+        d = b - a
+        l3 = d.length
+        if l3 < 1e-9:
+            continue
+        if abs(d.dot(n)) > _AUTOFIT_PLANE_TOL * l3:
+            oop += 1
+            continue
+        dp = d - n * d.dot(n)
+        lp = dp.length
+        if lp < 1e-9:
+            oop += 1
+            continue
+        data.append((a, b, dp / lp, lp, boundary, d / l3))
+    if len(data) < 3:
+        msg = "Для автофита выделите минимум 3 ребра сетки"
+        if oop:
+            msg += f" (вне плоскости отброшено: {oop})"
+        return {'err': msg}
+
+    # reference frame: same convention as the WORLD grid source
+    if abs(n.z) > 0.7:  # floor / ceiling
+        u_ref = Vector((1.0, 0.0, 0.0))
+        v_ref = Vector((0.0, 1.0, 0.0))
+    else:  # wall
+        u_ref = Vector((0.0, 0.0, 1.0)).cross(n).normalized()
+        v_ref = n.cross(u_ref).normalized()
+
+    # initial dominant angle: length-weighted circular mean of directions
+    # folded to a 90° period (both families collapse onto one point)
+    sc = cc = 0.0
+    angles = []
+    for _a, _b, du, lp, _bd, _d3 in data:
+        phi = atan2(du.dot(v_ref), du.dot(u_ref)) % pi  # sign-free direction
+        angles.append(phi)
+        sc += lp * sin(4.0 * phi)
+        cc += lp * cos(4.0 * phi)
+    if abs(sc) < 1e-9 and abs(cc) < 1e-9:
+        return {'err': "Направления рёбер не образуют выраженной сетки"}
+    alpha = (atan2(sc, cc) / 4.0) % (pi / 2.0)
+
+    # Iterative re-centering: the circular MEAN above is dragged by
+    # diagonal votes (~8° on a triangulated 3:1 wall) and the ±15° window
+    # anchored on the dragged angle keeps those diagonals in the family.
+    # Re-anchor on the weighted MEDIAN of the family deviations instead —
+    # the majority cluster (true grid edges) wins, and on the next pass
+    # the window, now centered on the true axis, expels the diagonals.
+    fam_a = fam_b = None
+    dropped = 0
+    for _ in range(_AUTOFIT_MAX_PASSES):
+        fam_a, fam_b, devs = [], [], []  # edges at alpha / alpha+90°
+        dropped = 0
+        for entry, phi in zip(data, angles):
+            delta = (phi - alpha) % pi
+            dev_a = delta if delta < pi / 2.0 else delta - pi
+            dev_b = delta - pi / 2.0
+            if abs(dev_a) <= _AUTOFIT_ANGLE_TOL:
+                fam_a.append((entry, dev_a))
+                devs.append((dev_a, entry[3]))
+            elif abs(dev_b) <= _AUTOFIT_ANGLE_TOL:
+                fam_b.append((entry, dev_b))
+                devs.append((dev_b, entry[3]))
+            else:
+                dropped += 1
+        if not fam_a or not fam_b:
+            return {'err': "Не нашлось двух перпендикулярных семейств рёбер "
+                           "(в выделении одни диагонали?) — выделите рёбра "
+                           "вдоль обеих осей сетки"}
+        shift = _weighted_median(devs)
+        if abs(shift) <= _AUTOFIT_SHIFT_EPS:
+            break
+        alpha = (alpha + shift) % (pi / 2.0)
+
+    # U = the more horizontal family (same convention as the 2-edge capture)
+    if alpha <= pi / 4.0:
+        u_fam, v_fam, u_ang = fam_a, fam_b, alpha
+    else:
+        u_fam, v_fam, u_ang = fam_b, fam_a, alpha - pi / 2.0
+
+    # Diagonal length signature: a 4:1 cell diagonal is only 14° off the
+    # U axis — INSIDE the angle window, unreachable for any angle filter.
+    # Estimate the cells from the tight (sub-2°) members and expel every
+    # off-axis edge whose length matches hypot(cell_u, cell_v).
+    tight_u = sorted(e[3] for e, dev in u_fam if abs(dev) <= _AUTOFIT_TIGHT_TOL)
+    tight_v = sorted(e[3] for e, dev in v_fam if abs(dev) <= _AUTOFIT_TIGHT_TOL)
+    if tight_u and tight_v:
+        diag = hypot(_median_sorted(tight_u), _median_sorted(tight_v))
+        band = _AUTOFIT_DIAG_LEN_TOL * diag
+
+        def _purge(fam):
+            return [(e, dev) for e, dev in fam
+                    if abs(dev) <= _AUTOFIT_TIGHT_TOL
+                    or abs(e[3] - diag) > band]
+
+        u_kept, v_kept = _purge(u_fam), _purge(v_fam)
+        dropped += (len(u_fam) - len(u_kept)) + (len(v_fam) - len(v_kept))
+        u_fam, v_fam = u_kept, v_kept
+
+    # Refuse when the fitted grid explains only a minority of the
+    # selection — committing a basis built from 3 edges out of 200 is
+    # worse than an honest error
+    total_w = sum(e[3] for e in data)
+    kept_w = (sum(e[3] for e, _dev in u_fam)
+              + sum(e[3] for e, _dev in v_fam))
+    if len(u_fam) + len(v_fam) < 3 or kept_w < _AUTOFIT_MIN_KEPT_FRAC * total_w:
+        return {'err': "Рёбра сетки — меньшинство выделения (отброшено "
+                       f"{dropped + oop} из {len(data) + oop} рёбер): похоже, "
+                       "выделение не лежит на регулярной сетке"}
+
+    def fam_axis(fam, ref):
+        """Length-weighted mean of the family's in-plane directions,
+        sign-aligned to ref so opposite edges don't cancel out."""
+        acc = Vector((0.0, 0.0, 0.0))
+        for (_a, _b, du, lp, _bd, _d3), _dev in fam:
+            acc += (-du if du.dot(ref) < 0.0 else du) * lp
+        return acc
+
+    x_acc = fam_axis(u_fam, u_ref * cos(u_ang) + v_ref * sin(u_ang))
+    if x_acc.length < 1e-9:
+        return {'err': "Семейство U вырождено — сетка не определяется"}
+    x_dir = x_acc.normalized()
+    y_dir = n.cross(x_dir).normalized()
+    y_raw = fam_axis(v_fam, y_dir)
+    if y_raw.length > 1e-9 and y_dir.dot(y_raw.normalized()) < 0:
+        y_dir = -y_dir
+
+    def fam_cell(fam):
+        """Median in-plane length; interior edges only when there are
+        enough of them (partial cells live on mesh borders), spread flag
+        on top."""
+        interior = [e[3] for e, _dev in fam if not e[4]]
+        pool = interior if len(interior) >= 3 else [e[3] for e, _dev in fam]
+        pool = sorted(pool)
+        med = _median_sorted(pool)
+        rough = sum(1 for lp in pool if abs(lp - med) > 0.2 * med)
+        return med, rough > 0.25 * len(pool)
+
+    cell_u, warn_u = fam_cell(u_fam)
+    cell_v, warn_v = fam_cell(v_fam)
+    if cell_u < 1e-9 or cell_v < 1e-9:
+        return {'err': "Медианная длина рёбер нулевая — ячейка вырождена"}
+
+    # origin = bounding corner of the selection (incl. diagonal endpoints —
+    # their verts are grid corners too; out-of-plane edges are excluded,
+    # their far ends are NOT grid corners)
+    p0 = data[0][0]
+    min_u = min_v = None
+    for a, b, _du, _lp, _bd, _d3 in data:
+        for p in (a, b):
+            rel = p - p0
+            gu, gv = rel.dot(x_dir), rel.dot(y_dir)
+            min_u = gu if min_u is None else min(min_u, gu)
+            min_v = gv if min_v is None else min(min_v, gv)
+    origin = p0 + x_dir * min_u + y_dir * min_v
+
+    # Plane normal implied by the surviving families' RAW 3D directions —
+    # when the face-area normal was tilted by attached out-of-plane faces
+    # (a one-sided window return), this one is clean and drives the refit
+    u3 = Vector((0.0, 0.0, 0.0))
+    v3 = Vector((0.0, 0.0, 0.0))
+    for (_a, _b, _du, lp, _bd, d3), _dev in u_fam:
+        u3 += (-d3 if d3.dot(x_dir) < 0.0 else d3) * lp
+    for (_a, _b, _du, lp, _bd, d3), _dev in v_fam:
+        v3 += (-d3 if d3.dot(y_dir) < 0.0 else d3) * lp
+    n_fit = u3.cross(v3)
+    if n_fit.length > 1e-6:
+        n_fit.normalize()
+        if n_fit.dot(n) < 0.0:
+            n_fit = -n_fit
+    else:
+        n_fit = n
+
+    return {
+        'err': None, 'n': n, 'n_fit': n_fit,
+        'x_dir': x_dir, 'y_dir': y_dir,
+        'cell_u': cell_u, 'cell_v': cell_v, 'origin': origin,
+        'warn': warn_u or warn_v,
+        'n_u': len(u_fam), 'n_v': len(v_fam),
+        'dropped': dropped, 'oop': oop,
+    }
+
+
+def _capture_grid_autofit(op, context, settings):
+    """Fit the reference grid statistically from 3+ selected edges.
+
+    A 2-edge capture trusts exactly those two edges — millimeter mesh noise
+    in them shifts the WHOLE grid.  The autofit averages it out instead
+    (the pipeline itself lives in _autofit_solve):
+
+      1. coplanarity filter: edges leaving the grid plane by >30° (window
+         returns, reveals) are dropped, and every direction/length below
+         is measured IN THE PLANE — the 3D length of a tilted edge is not
+         a grid pitch;
+      2. the dominant in-plane grid angle starts as a length-weighted
+         circular mean of edge directions folded to a 90° period, then is
+         re-anchored on the weighted MEDIAN of family deviations until it
+         converges (the mean alone is dragged by triangulation diagonals);
+      3. edges within _AUTOFIT_ANGLE_TOL of the two perpendicular family
+         axes are kept; off-axis edges whose length matches the cell
+         diagonal hypot(cell_u, cell_v) are expelled on top;
+      4. if the surviving families explain < _AUTOFIT_MIN_KEPT_FRAC of the
+         in-plane edge length, the capture is REFUSED — 3 edges out of 200
+         is not a fit;
+      5. cell sizes = MEDIAN in-plane edge length per family — robust to
+         trimmed border cells and noise while outliers stay under 50%;
+         interior (non-boundary) edges are preferred when there are at
+         least 3 of them, so partial cells on mesh borders don't vote;
+      6. axes = length-weighted mean of each family's sign-aligned
+         directions, orthonormalized like the 2-edge capture (auto-orient
+         at use time handles handedness/V-up on top);
+      7. origin = bounding corner of the selection in grid axes;
+      8. the whole fit reruns once against the plane normal implied by the
+         fitted families when the face-area normal was tilted >2° by
+         attached out-of-plane geometry (one-sided window returns shrink
+         every projected length otherwise).
+    """
+    edges, n_sum = _collect_autofit_edges(context)
+    if len(edges) < 3:
+        agr_report(op, 'ERROR',
+                   "Для автофита выделите минимум 3 ребра сетки")
+        return False
+    if n_sum.length < 1e-6:
+        agr_report(op, 'ERROR',
+                   "Не удалось определить нормаль поверхности у выделенных рёбер")
+        return False
+
+    fit = _autofit_solve(edges, n_sum.normalized())
+    if fit['err'] is None and fit['n_fit'].dot(fit['n']) < _AUTOFIT_REFIT_DOT:
+        refit = _autofit_solve(edges, fit['n_fit'])
+        if refit['err'] is None:
+            fit = refit  # keep the tilted-plane fit when the refit fails
+    if fit['err'] is not None:
+        agr_report(op, 'ERROR', fit['err'])
+        return False
+
+    settings.origin = fit['origin']
+    settings.u_dir = fit['x_dir']
+    settings.v_dir = fit['y_dir']
+    settings.cell_u = fit['cell_u']
+    settings.cell_v = fit['cell_v']
+    settings.has_grid = True
+    _tag_redraw_view3d()  # the grid overlay must repaint with the new grid
+
+    msg = (f"Сетка (автофит): ячейка {fit['cell_u']:.3g} × {fit['cell_v']:.3g} м "
+           f"по рёбрам U:{fit['n_u']} V:{fit['n_v']}")
+    if fit['dropped']:
+        msg += f", отброшено (диагонали и пр.): {fit['dropped']}"
+    if fit['oop']:
+        msg += f", вне плоскости сетки: {fit['oop']}"
+    if fit['warn']:
+        agr_report(op, 'WARNING',
+                   msg + " — длины рёбер сильно разбросаны, проверьте выделение")
+    else:
+        agr_report(op, 'INFO', msg)
+    return True
+
+
 def _ensure_grid(op, context, settings):
     """EDGES source: make sure a grid exists, auto-capturing from a
     2-edge selection for the original one-shot script workflow.
@@ -382,8 +737,8 @@ def _ensure_grid(op, context, settings):
     if len(picked) == 2:
         return 'CAPTURED' if _capture_grid(op, context, settings, picked) else None
     agr_report(op, 'ERROR',
-               "Сетка не задана — выделите 2 ребра ячейки и нажмите «Запомнить сетку», "
-               "или переключитесь на мировую сетку")
+               "Сетка не задана — выделите 2 ребра ячейки (или несколько рёбер — "
+               "автофит) и нажмите «Запомнить сетку», или переключитесь на мировую сетку")
     return None
 
 
@@ -1264,9 +1619,11 @@ class AGR_OT_UVGridCapture(_AGR_UVGridPollMixin, Operator):
     """Store the reference grid from two selected edges of one grid cell"""
     bl_idname = "agr.uv_grid_capture"
     bl_label = "Запомнить сетку"
-    bl_description = ("Запомнить опорную сетку по двум выделенным рёбрам одной "
-                      "ячейки: оси U/V, размер ячейки и начало — в мировых "
-                      "координатах, работает для всех объектов сцены")
+    bl_description = ("Запомнить опорную сетку. 2 ребра одной ячейки — точный "
+                      "захват (оси U/V, размер ячейки, начало); несколько рёбер — "
+                      "автофит: медианные длины двух перпендикулярных семейств, "
+                      "диагонали и обрезки отсеиваются. Мировые координаты, "
+                      "работает для всех объектов сцены")
     bl_options = {'REGISTER', 'UNDO'}
 
     def _execute(self, context):

@@ -6,16 +6,23 @@ and it sits right under "By Material" in the P menu, so it gets clicked
 by accident all the time. Katya asked for a confirmation dialog here -
 this module is dedicated to her.
 
-Implementation: VIEW3D_MT_edit_mesh_separate.draw is replaced at register
-time with a version where "By Loose Parts" calls agr.separate_loose_confirm
-(a dialog) instead of mesh.separate directly. The original draw function
-is restored at unregister.
+Implementation (Blender 5.x): there is NO VIEW3D_MT_edit_mesh_separate
+menu class anymore — the P key invokes mesh.separate directly and its enum
+popup is drawn C-side, so there is nothing to monkeypatch.  Instead an
+ADDON KEYMAP item shadows P in the "Mesh" keymap and opens our own menu
+(AGR_MT_separate_confirm), which mirrors the stock popup but routes
+"By Loose Parts" through the agr.separate_loose_confirm dialog.
+
+Known limitation: the Mesh menu and the right-click context menu build
+their Separate submenu inline via operator_menu_enum — those stay stock
+(guarding them would mean re-drawing whole stock menus).  The accident
+vector Katya asked about is the P popup, and that one is guarded.
 """
 
 import random
 
 import bpy
-from bpy.types import Operator
+from bpy.types import Menu, Operator
 
 # Vertex count above which the dialog switches to full panic mode
 _DANGER_VERTS = 100_000
@@ -29,7 +36,7 @@ _KATYA_QUOTES = [
     "«Я предупреждала. Теперь предупреждает Blender.»",
 ]
 
-_original_separate_draw = None
+_addon_keymaps = []  # [(keymap, keymap_item)] added by register()
 
 
 def _count_edit_verts(context):
@@ -85,10 +92,6 @@ class AGR_OT_separate_loose_confirm(Operator):
             col.separator()
 
         col.label(text=f"Катя: {self._quote}", icon='COMMUNITY')
-        col.separator()
-        sub = col.column(align=True)
-        sub.enabled = False
-        sub.label(text="Функционал добавлен по просьбе Кати. Мы помним.")
 
     def execute(self, context):
         try:
@@ -102,60 +105,65 @@ class AGR_OT_separate_loose_confirm(Operator):
         return result
 
 
-def _agr_separate_menu_draw(self, context):
-    """Replacement draw for VIEW3D_MT_edit_mesh_separate.
+class AGR_MT_separate_confirm(Menu):
+    """Replacement for the stock P / Separate enum popup in mesh edit mode.
 
-    Mirrors the stock menu (Selection / By Material / By Loose Parts) but
-    routes By Loose Parts through Katya's confirmation dialog.
+    Mirrors it item for item (Selection / By Material / By Loose Parts)
+    but routes By Loose Parts through Katya's confirmation dialog.
     """
-    layout = self.layout
-    layout.operator_context = 'INVOKE_DEFAULT'
-    layout.operator("mesh.separate", text="Selection").type = 'SELECTED'
-    layout.operator("mesh.separate", text="By Material").type = 'MATERIAL'
-    layout.operator("agr.separate_loose_confirm", text="By Loose Parts")
+    bl_idname = "AGR_MT_separate_confirm"
+    bl_label = "Separate"
 
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH'
 
-# Marker so a re-register (addon reload) never mistakes the patched draw
-# for the stock one and loses the original
-_agr_separate_menu_draw._agr_separate_patch = True
+    def draw(self, context):
+        layout = self.layout
+        layout.operator_context = 'INVOKE_DEFAULT'
+        layout.operator("mesh.separate", text="Selection").type = 'SELECTED'
+        layout.operator("mesh.separate", text="By Material").type = 'MATERIAL'
+        layout.operator("agr.separate_loose_confirm", text="By Loose Parts")
 
 
 classes = (
     AGR_OT_separate_loose_confirm,
+    AGR_MT_separate_confirm,
 )
 
 
 def register():
-    global _original_separate_draw
-
     for cls in classes:
         bpy.utils.register_class(cls)
 
-    menu = getattr(bpy.types, "VIEW3D_MT_edit_mesh_separate", None)
-    if menu is not None:
-        if getattr(menu.draw, "_agr_separate_patch", False):
-            # Unbalanced reload: the menu is still patched by a previous
-            # module instance — recover the stock draw from the attribute
-            # stashed on the patched function, then re-patch with ours.
-            _original_separate_draw = getattr(menu.draw, "_agr_original_draw", None)
-        else:
-            _original_separate_draw = menu.draw
-        # Stash the original ON the patched function so any future module
-        # instance can restore it even without this module's global
-        _agr_separate_menu_draw._agr_original_draw = _original_separate_draw
-        menu.draw = _agr_separate_menu_draw
-        print("✅ AGR Easter Egg: Katya now guards By Loose Parts")
+    # Shadow the stock P binding ("mesh.separate" in the Mesh keymap) with
+    # an addon keymap item opening our menu: addon keymaps take precedence
+    # over the default keyconfig, user customizations still win over both.
+    wm = bpy.context.window_manager
+    kc = wm.keyconfigs.addon if wm is not None else None
+    if kc is None:
+        print("⚠️ AGR Easter Egg: no addon keyconfig — Katya's P hook skipped")
+        return
+    km = kc.keymaps.new(name="Mesh", space_type='EMPTY')
+    # dedupe after an unbalanced dev reload: a stale item would open the
+    # menu twice (or keep working after a failed unregister)
+    for kmi in list(km.keymap_items):
+        if (kmi.idname == "wm.call_menu"
+                and getattr(kmi.properties, "name", "") == AGR_MT_separate_confirm.bl_idname):
+            km.keymap_items.remove(kmi)
+    kmi = km.keymap_items.new("wm.call_menu", 'P', 'PRESS')
+    kmi.properties.name = AGR_MT_separate_confirm.bl_idname
+    _addon_keymaps.append((km, kmi))
+    print("✅ AGR Easter Egg: Katya now guards By Loose Parts (P menu)")
 
 
 def unregister():
-    global _original_separate_draw
-
-    menu = getattr(bpy.types, "VIEW3D_MT_edit_mesh_separate", None)
-    if menu is not None:
-        original = _original_separate_draw or getattr(menu.draw, "_agr_original_draw", None)
-        if original is not None:
-            menu.draw = original
-        _original_separate_draw = None
+    for km, kmi in _addon_keymaps:
+        try:
+            km.keymap_items.remove(kmi)
+        except Exception:
+            pass  # keymap already gone (e.g. Blender shutdown order)
+    _addon_keymaps.clear()
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

@@ -6,7 +6,7 @@ import traceback
 
 import bpy
 import bmesh
-from math import radians
+from math import cos, pi, radians, sin
 from mathutils import Euler, Matrix, Vector
 
 # repo root = parent of scripts/ — works from any checkout location
@@ -1087,6 +1087,248 @@ try:
     check("no object was mutated before the guard",
           len(bm_a.faces) == 1 and len(bm_b.faces) == 1,
           f"A={len(bm_a.faces)} B={len(bm_b.faces)}")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 30: autofit capture — triangulated wall, noise, diagonals, trims")
+
+    def make_tri_wall(name, nx, nz, cell=1.0, noise=0.0004, cell_z=None):
+        """Triangulated XZ wall with deterministic ~1mm vertex noise.
+        cell = X pitch, cell_z = Z pitch (defaults to cell — square cells)."""
+        cz = cell if cell_z is None else cell_z
+        mesh = bpy.data.meshes.new(name)
+        verts = []
+        for j in range(nz + 1):
+            for i in range(nx + 1):
+                dx = (((i * 37 + j * 17) % 7) - 3) * noise
+                dz = (((i * 23 + j * 41) % 7) - 3) * noise
+                verts.append((i * cell + dx, 0.0, j * cz + dz))
+        faces = []
+        for j in range(nz):
+            for i in range(nx):
+                k = j * (nx + 1) + i
+                faces.append((k, k + 1, k + nx + 2))
+                faces.append((k, k + nx + 2, k + nx + 1))
+        mesh.from_pydata(verts, [], faces)
+        mesh.validate()
+        obj = bpy.data.objects.new(name, mesh)
+        bpy.context.collection.objects.link(obj)
+        return obj
+
+    tw = make_tri_wall("AutoFit", 4, 3, cell=1.0)
+    bm = enter_edit(tw)
+    for e in bm.edges:
+        e.select = True
+    reset_settings()
+    s = settings()
+    r = bpy.ops.agr.uv_grid_capture()
+    check("autofit capture FINISHED", r == {'FINISHED'})
+    check("autofit cell ~1x1 despite noise and diagonals",
+          abs(s.cell_u - 1.0) < 0.005 and abs(s.cell_v - 1.0) < 0.005,
+          f"cell={s.cell_u:.4f}x{s.cell_v:.4f}")
+    ud, vd = Vector(s.u_dir), Vector(s.v_dir)
+    check("autofit axes along X and Z",
+          abs(abs(ud.x) - 1.0) < 0.01 and abs(abs(vd.z) - 1.0) < 0.01,
+          f"u={tuple(round(c, 3) for c in ud)} v={tuple(round(c, 3) for c in vd)}")
+    check("autofit origin near the wall corner",
+          (Vector(s.origin) - Vector((0, 0, 0))).length < 0.01,
+          f"origin={tuple(round(c, 4) for c in s.origin)}")
+    # end-to-end: snap (5mm default) absorbs the ~1mm noise -> exact tiles
+    s.selection_mode = 'ALL'
+    r = bpy.ops.agr.uv_grid_unwrap()
+    check("autofit unwrap FINISHED", r == {'FINISHED'})
+    bm = bmesh.from_edit_mesh(tw.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    check("autofit UVs in unit square (snap ate the noise)",
+          all_uvs_in_unit(bm, uv_layer))
+    # only diagonals selected -> no perpendicular families -> clean cancel
+    bm = bmesh.from_edit_mesh(tw.data)
+    deselect_all(bm)
+    ndiag = 0
+    for e in bm.edges:
+        d = e.verts[1].co - e.verts[0].co
+        if abs(d.x) > 0.5 and abs(d.z) > 0.5:  # cell diagonals
+            e.select = True
+            ndiag += 1
+    check("selected only diagonals (3+)", ndiag >= 3, f"n={ndiag}")
+    check("autofit with only diagonals CANCELLED",
+          expect_cancel(bpy.ops.agr.uv_grid_capture))
+    bpy.ops.object.mode_set(mode='OBJECT')
+    # trimmed border cells: the median must ignore the 0.4m leftovers
+    tm = bpy.data.meshes.new("TrimStrip")
+    xs = [0.0, 1.0, 2.0, 3.0, 3.4]
+    tv = []
+    for x in xs:
+        tv += [(x, 0.0, 0.0), (x, 0.0, 1.0)]
+    tf = [(i * 2, i * 2 + 2, i * 2 + 3, i * 2 + 1) for i in range(4)]
+    tm.from_pydata(tv, [], tf)
+    tm.validate()
+    tmo = bpy.data.objects.new("TrimStrip", tm)
+    bpy.context.collection.objects.link(tmo)
+    bm = enter_edit(tmo)
+    for e in bm.edges:
+        e.select = True
+    reset_settings()
+    s = settings()
+    r = bpy.ops.agr.uv_grid_capture()
+    check("trimmed-strip autofit FINISHED", r == {'FINISHED'})
+    check("median ignores the 0.4m trims (cell = 1x1)",
+          abs(s.cell_u - 1.0) < 1e-5 and abs(s.cell_v - 1.0) < 1e-5,
+          f"cell={s.cell_u:.4f}x{s.cell_v:.4f}")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 31: autofit angle re-centering — triangulated 3:1 cells")
+    # Diagonals (18.4°) drag a plain circular-mean angle by ~8°; the ±15°
+    # window anchored there keeps them, and with border edges excluded the
+    # interior median lands on the diagonal: cell_u = √10 ≈ 3.162.  The
+    # weighted-median re-centering must snap the axis back to the true 0°
+    # so the window expels the diagonals on the next pass.
+    t31 = make_tri_wall("AutoFit31", 3, 3, cell=3.0, cell_z=1.0)
+    bm = enter_edit(t31)
+    for e in bm.edges:
+        e.select = True
+    reset_settings()
+    s = settings()
+    r = bpy.ops.agr.uv_grid_capture()
+    check("3:1 autofit capture FINISHED", r == {'FINISHED'})
+    check("3:1 cell is 3x1 (diagonal √10 rejected)",
+          abs(s.cell_u - 3.0) < 0.01 and abs(s.cell_v - 1.0) < 0.005,
+          f"cell={s.cell_u:.4f}x{s.cell_v:.4f}")
+    ud, vd = Vector(s.u_dir), Vector(s.v_dir)
+    check("3:1 axes not tilted by diagonal votes",
+          abs(abs(ud.x) - 1.0) < 0.001 and abs(abs(vd.z) - 1.0) < 0.001,
+          f"u={tuple(round(c, 4) for c in ud)} v={tuple(round(c, 4) for c in vd)}")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 32: autofit diagonal length signature — 4:1 cells")
+    # A 4:1 diagonal is only 14° off the U axis — INSIDE the ±15° window,
+    # no angle filter can reject it; only the hypot(cell_u, cell_v) length
+    # test can (old result: cell_u = √17 ≈ 4.123, axis tilted ~6°)
+    t32 = make_tri_wall("AutoFit32", 3, 3, cell=4.0, cell_z=1.0)
+    bm = enter_edit(t32)
+    for e in bm.edges:
+        e.select = True
+    reset_settings()
+    s = settings()
+    r = bpy.ops.agr.uv_grid_capture()
+    check("4:1 autofit capture FINISHED", r == {'FINISHED'})
+    check("4:1 cell is 4x1 (diagonal √17 rejected by length)",
+          abs(s.cell_u - 4.0) < 0.01 and abs(s.cell_v - 1.0) < 0.005,
+          f"cell={s.cell_u:.4f}x{s.cell_v:.4f}")
+    ud, vd = Vector(s.u_dir), Vector(s.v_dir)
+    check("4:1 axes not tilted by diagonal votes",
+          abs(abs(ud.x) - 1.0) < 0.001 and abs(abs(vd.z) - 1.0) < 0.001,
+          f"u={tuple(round(c, 4) for c in ud)} v={tuple(round(c, 4) for c in vd)}")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 33: autofit coplanarity — wall with perpendicular returns")
+
+    def make_finned_wall(name, nfins, depth, alternate):
+        """3x3-cell XZ wall + perpendicular return strips (window reveals)
+        at the first nfins vertical grid lines.  alternate=True flips every
+        other fin so their area normals cancel (mean normal stays clean);
+        False leaves one-sided fins that TILT the mean normal (refit path).
+        Perpendicular depth edges are 0.625 m — with enough of them the old
+        3D-length median voted cell_u = 0.625 instead of 1.0."""
+        verts, faces, idx = [], [], {}
+
+        def vid(p):
+            if p not in idx:
+                idx[p] = len(verts)
+                verts.append(p)
+            return idx[p]
+
+        for j in range(3):
+            for i in range(3):
+                faces.append((vid((i, 0.0, j)), vid((i + 1, 0.0, j)),
+                              vid((i + 1, 0.0, j + 1)), vid((i, 0.0, j + 1))))
+        for f in range(nfins):
+            flip = alternate and f % 2
+            for j in range(3):
+                quad = (vid((f, 0.0, j)), vid((f, -depth, j)),
+                        vid((f, -depth, j + 1)), vid((f, 0.0, j + 1)))
+                faces.append(tuple(reversed(quad)) if flip else quad)
+        mesh = bpy.data.meshes.new(name)
+        mesh.from_pydata(verts, [], faces)
+        mesh.validate()
+        obj = bpy.data.objects.new(name, mesh)
+        bpy.context.collection.objects.link(obj)
+        return obj
+
+    fw33 = make_finned_wall("AutoFit33", 4, 0.625, alternate=True)
+    bm = enter_edit(fw33)
+    for e in bm.edges:
+        e.select = True
+    reset_settings()
+    s = settings()
+    r = bpy.ops.agr.uv_grid_capture()
+    check("finned-wall autofit capture FINISHED", r == {'FINISHED'})
+    check("perpendicular 0.625m edges dropped (cell = 1x1)",
+          abs(s.cell_u - 1.0) < 0.005 and abs(s.cell_v - 1.0) < 0.005,
+          f"cell={s.cell_u:.4f}x{s.cell_v:.4f}")
+    ud, vd = Vector(s.u_dir), Vector(s.v_dir)
+    check("finned-wall axes along X and Z",
+          abs(abs(ud.x) - 1.0) < 0.001 and abs(abs(vd.z) - 1.0) < 0.001,
+          f"u={tuple(round(c, 4) for c in ud)} v={tuple(round(c, 4) for c in vd)}")
+    og = Vector(s.origin)
+    check("finned-wall origin at the wall corner (in-plane)",
+          abs(og.x) < 0.01 and abs(og.z) < 0.01,
+          f"origin={tuple(round(c, 4) for c in og)}")
+    bpy.ops.object.mode_set(mode='OBJECT')
+    # one-sided return: the fin's face area TILTS the mean normal ~12°,
+    # shrinking every projected length by ~2% — the refit against the
+    # families' own plane normal must restore the exact 1.0 cell
+    fw33b = make_finned_wall("AutoFit33b", 1, 0.625, alternate=False)
+    bm = enter_edit(fw33b)
+    for e in bm.edges:
+        e.select = True
+    reset_settings()
+    s = settings()
+    r = bpy.ops.agr.uv_grid_capture()
+    check("one-sided return capture FINISHED", r == {'FINISHED'})
+    check("refit restores exact cell despite tilted mean normal",
+          abs(s.cell_u - 1.0) < 0.005 and abs(s.cell_v - 1.0) < 0.005,
+          f"cell={s.cell_u:.4f}x{s.cell_v:.4f}")
+    ud, vd = Vector(s.u_dir), Vector(s.v_dir)
+    check("refit axes along X and Z",
+          abs(abs(ud.x) - 1.0) < 0.001 and abs(abs(vd.z) - 1.0) < 0.001,
+          f"u={tuple(round(c, 4) for c in ud)} v={tuple(round(c, 4) for c in vd)}")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 34: autofit refuses when grid edges are a minority")
+    # 26 unit spokes at 7° steps (each backed by a thin triangle for the
+    # normal): directions are near-uniform in the plane, the two ±15°
+    # windows can keep at most 10 of 26 edges (~38% of the weight) —
+    # the capture must refuse instead of committing a garbage basis
+    mm = bpy.data.meshes.new("AutoFitMess")
+    mv, mf = [], []
+    for k in range(26):
+        ang = k * 7.0 * pi / 180.0
+        c = Vector((k * 3.0, 0.0, 0.0))
+        d = Vector((cos(ang), 0.0, sin(ang)))
+        p = Vector((-d.z * 0.05, 0.0, d.x * 0.05))
+        base = len(mv)
+        mv += [tuple(c), tuple(c + d), tuple(c + p)]
+        mf.append((base, base + 1, base + 2))
+    mm.from_pydata(mv, [], mf)
+    mm.validate()
+    mo = bpy.data.objects.new("AutoFitMess", mm)
+    bpy.context.collection.objects.link(mo)
+    bm = enter_edit(mo)
+    deselect_all(bm)
+    nspokes = 0
+    for e in bm.edges:
+        if abs((e.verts[1].co - e.verts[0].co).length - 1.0) < 1e-4:
+            e.select = True   # only the unit spokes, not the triangle backs
+            nspokes += 1
+    check("mess: 26 spokes selected", nspokes == 26, f"n={nspokes}")
+    reset_settings()
+    check("minority-grid autofit CANCELLED",
+          expect_cancel(bpy.ops.agr.uv_grid_capture))
     bpy.ops.object.mode_set(mode='OBJECT')
 
 except Exception:
