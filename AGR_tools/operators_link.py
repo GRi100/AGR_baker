@@ -1,0 +1,1655 @@
+"""
+AGR Link - join linked (instanced) objects with full memory of what was
+joined, and disassemble the result back into the original linked objects
+at any time.
+
+How it works:
+- Every face of every participant is stamped with an INT face attribute
+  ``agr_link_id`` (instance number) before the join.
+- The joined object ("container") carries a JSON table in the object
+  custom property ``agr_link_data``: per instance - original name,
+  matrix RELATIVE to the container, collections, material slots, parent,
+  custom props, face count; per link group - the shared mesh datablock
+  name + counts.
+- Storing matrices relative to the container makes the math invariant:
+  moving/rotating the container after the join transfers to every
+  restored object automatically, and nested joins only need a single
+  matrix conversion for the merged-in container's entries.
+- Disassembly cuts the CURRENT geometry by the attribute (edits made
+  after the join survive), transforms each piece back into its original
+  local space and re-links identical pieces of one group to a single
+  mesh datablock.  Pieces whose geometry no longer matches stay unique
+  (reported as a warning).  If the original datablock is still alive in
+  the file (some copies were never joined), restored objects re-attach
+  to it and become linked with the survivors again.
+
+Origin recovery does NOT rely on the container matrix: at join time every
+vertex stores its original LOCAL coordinate (attributes agr_link_co +
+agr_link_orig), and disassembly fits the affine frame "stored -> current"
+per instance.  This survives Apply Transform / Set Origin on the container,
+whole-piece moves in Edit Mode (the origin follows the piece and linking is
+kept), and FBX matrix rebuilds.  Containers created by older versions fall
+back to the matrix_rel path, where Apply Transform still breaks.
+
+FBX transport: containers are FULLY self-contained - a plain DEFAULT
+File->Export/Import FBX carries everything, no checkboxes needed.  Generic
+mesh attributes do not survive FBX and the importer quantises colors to
+BYTE_COLOR on the sRGB grid, so ALL color-carried data is byte-robust:
+written/read through color_srgb (the exact b/255 grid the importer rounds
+to), coordinates/ids split hi/lo = 16 bit per value (AGR_Link_CO /
+AGR_Link_ID), and the JSON table itself zlib+CRC32-encoded into
+AGR_Link_T0..Tn at 1 byte per channel.  Restoration is BIT-EXACT: the full
+float32 originals ride inside the byte-exact table blob and each vertex
+finds its precise record through its quantised 16-bit key
+(order-independent), the quantised channels doubling as correspondence key
+and fallback.  After import the idprop table is rebuilt from the colors on
+first touch.  UV channels are never used - the
+delivered file keeps exactly the user's single UV channel.  "Удалить
+память (сдача)" strips everything for a fully clean delivery.
+
+Known limitations (documented, not bugs):
+- Material slot overrides with link='OBJECT' are baked into mesh data
+  by Blender's join; such instances come back with the override as a
+  data material.
+- Disassembly copies the container mesh once per instance (quadratic);
+  fine for typical containers, slow above several hundred instances.
+
+Modifiers: Blender's join silently DROPS modifiers of all non-active
+objects, so the join here is blocked while any participant has
+modifiers (modifier support is a possible future step).
+"""
+
+import base64
+import json
+import zlib
+
+import bpy
+import bmesh
+import numpy as np
+from bpy.props import IntProperty
+from bpy.types import Operator, Panel
+from mathutils import Matrix
+
+from .log import agr_report
+
+ATTR_NAME = "agr_link_id"
+CO_ATTR = "agr_link_co"      # per-vertex ORIGINAL local coordinates
+ORIG_ATTR = "agr_link_orig"  # per-vertex "existed at join" flag
+# FBX cannot carry generic mesh attributes, but vertex colors travel through
+# the STANDARD exporter by default - the tracking data is mirrored into two
+# permanent color attributes on the container.  Coordinates are normalised to
+# [0,1] (bounds stored in the JSON table) to stay safe under the exporter's
+# sRGB handling; binary flags ride in alpha, which color management never
+# touches.  UV channels are never used (city requirement: 1 UV per object).
+# The FBX importer quantises colors to BYTE_COLOR (8 bit/channel on the
+# sRGB grid), so ALL color-carried data is byte-robust: written and read
+# through "color_srgb" (the exact b/255 grid the importer rounds to).
+# Coordinates and ids are split hi/lo into two channels = 16 bit/value.
+COL_CO = "AGR_Link_CO"   # RGBA = (x_hi, x_lo, y_hi, y_lo)
+COL_ID = "AGR_Link_ID"   # RGBA = (z_hi, z_lo, flag<<7|id_hi, id_lo)
+# The JSON table itself is ALSO encoded into color attributes
+# (AGR_Link_T0..Tn): zlib-compressed bytes, 1 byte per channel, with a
+# CRC32-guarded header.  A container is therefore fully self-contained -
+# a plain default FBX export carries EVERYTHING.
+TABLE_COL_PREFIX = "AGR_Link_T"
+TABLE_MAGIC = b"AGRL"
+PROP_KEY = "agr_link_data"
+TABLE_VERSION = 1
+# Marker for the scene master collection (it has no entry in bpy.data.collections)
+SCENE_ROOT = "*SCENE_ROOT*"
+
+
+# ----------------------------------------------------------------------------
+# Metadata table helpers
+# ----------------------------------------------------------------------------
+
+def _matrix_to_list(m):
+    return [list(row) for row in m]
+
+
+def _new_table():
+    return {
+        "version": TABLE_VERSION,
+        "groups": {},      # str(gid) -> {data_name, verts, faces}
+        "instances": {},   # str(iid) -> instance entry
+        "next_instance": 1,
+        "next_group": 1,
+    }
+
+
+def _parse_table(raw):
+    """The ONE parse/validate step shared by read_table and _peek_table."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        table = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(table, dict) or "instances" not in table:
+        return None
+    return table
+
+
+def read_table(obj):
+    """Fresh, mutation-safe parse of the container table (or None).
+    Falls back to the color-encoded table (fresh FBX import with default
+    settings - no idprop yet).  Operators use this; poll/draw must use the
+    cached _peek_table."""
+    table = _parse_table(obj.get(PROP_KEY))
+    if table is None and obj.type == 'MESH':
+        table = _decode_table_from_colors(obj.data)
+    return table
+
+
+def write_table(obj, table):
+    # precise_* blobs live ONLY in the color encoding - keeping megabytes of
+    # base64 out of the idprop (the .blend and the FBX user property)
+    lean = {k: v for k, v in table.items() if not k.startswith("precise_")}
+    obj[PROP_KEY] = json.dumps(lean, ensure_ascii=False, separators=(",", ":"))
+
+
+# poll() and draw() run on every redraw - a full json.loads of a big table
+# each time lags the UI (same reasoning as object_has_udim in operators_udim).
+# The cache is module-side because draw() may not mutate ID data; entries are
+# validated against the raw string so renames/edits never serve stale data.
+_TABLE_CACHE = {}
+
+
+def _peek_table(obj):
+    raw = obj.get(PROP_KEY)
+    if isinstance(raw, str):
+        cached = _TABLE_CACHE.get(obj.name)
+        if cached is not None and cached[0] == raw:
+            return cached[1]
+        table = _parse_table(raw)
+        if table is None:
+            return None
+        _TABLE_CACHE[obj.name] = (raw, table)
+        return table
+    # no idprop: maybe a colors-only container (fresh FBX import).  O(1)
+    # gate on the first table attribute keeps non-containers cheap in poll.
+    data = getattr(obj, "data", None)
+    if data is None or data.attributes.get(TABLE_COL_PREFIX + "0") is None:
+        return None
+    fingerprint = ("colors", data.name, len(data.loops))
+    cached = _TABLE_CACHE.get(obj.name)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    table = _decode_table_from_colors(data)
+    _TABLE_CACHE[obj.name] = (fingerprint, table)
+    return table
+
+
+def is_container(obj):
+    return obj is not None and obj.type == 'MESH' and _peek_table(obj) is not None
+
+
+def _match_or_add_group(table, ginfo):
+    """Reuse an existing group when the datablock identity matches
+    (name + vert/face counts), otherwise register a new one.  This is what
+    lets 'join more copies into an existing container later' land in the
+    same link group."""
+    for gid, existing in table["groups"].items():
+        if (existing["data_name"] == ginfo["data_name"]
+                and existing["verts"] == ginfo["verts"]
+                and existing["faces"] == ginfo["faces"]):
+            return int(gid)
+    gid = table["next_group"]
+    table["next_group"] += 1
+    table["groups"][str(gid)] = dict(ginfo)
+    return gid
+
+
+def _capture_collections(obj, context):
+    names = []
+    master = context.scene.collection
+    for coll in obj.users_collection:
+        names.append(SCENE_ROOT if coll == master else coll.name)
+    return names
+
+
+def _capture_props(obj):
+    """Shallow, JSON-safe snapshot of the object's custom properties."""
+    props = {}
+    for key in obj.keys():
+        if key == PROP_KEY:
+            continue
+        value = obj[key]
+        if hasattr(value, "to_dict"):
+            value = value.to_dict()
+        elif hasattr(value, "to_list"):
+            value = value.to_list()
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError):
+            continue  # datablock pointers etc. - not restorable from JSON
+        props[key] = value
+    return props
+
+
+def _capture_instance(obj, inv_container, context):
+    return {
+        "name": obj.name,
+        "matrix_rel": _matrix_to_list(inv_container @ obj.matrix_world),
+        "faces": len(obj.data.polygons),
+        "collections": _capture_collections(obj, context),
+        "materials": [ms.material.name if ms.material else "" for ms in obj.material_slots],
+        "parent": obj.parent.name if obj.parent else None,
+        "parent_type": obj.parent_type,
+        "parent_bone": obj.parent_bone,
+        "parent_vertices": list(obj.parent_vertices) if obj.parent_type in {'VERTEX', 'VERTEX_3'} else [],
+        "matrix_parent_inverse": _matrix_to_list(obj.matrix_parent_inverse),
+        "props": _capture_props(obj),
+    }
+
+
+# ----------------------------------------------------------------------------
+# Face attribute helpers (OBJECT mode only)
+# ----------------------------------------------------------------------------
+
+def _ensure_attr(mesh):
+    attr = mesh.attributes.get(ATTR_NAME)
+    if attr is not None and (attr.domain != 'FACE' or attr.data_type != 'INT'):
+        mesh.attributes.remove(attr)
+        attr = None
+    if attr is None:
+        attr = mesh.attributes.new(ATTR_NAME, 'INT', 'FACE')
+    return attr
+
+
+def _stamp_fill(mesh, iid):
+    attr = _ensure_attr(mesh)
+    attr.data.foreach_set("value", np.full(len(mesh.polygons), iid, dtype=np.intc))
+
+
+def _stamp_remap(mesh, id_map):
+    """Remap existing attribute values old->new; unknown values become 0."""
+    attr = _ensure_attr(mesh)
+    n = len(mesh.polygons)
+    arr = np.zeros(n, dtype=np.intc)
+    attr.data.foreach_get("value", arr)
+    max_old = max(id_map.keys(), default=0)
+    lut = np.zeros(max_old + 1, dtype=np.intc)
+    for old, new in id_map.items():
+        lut[old] = new
+    # ids outside the map (e.g. faces added by a foreign plain Ctrl+J) -> 0
+    arr = np.where((arr < 0) | (arr > max_old), 0, arr)
+    attr.data.foreach_set("value", lut[arr])
+
+
+def _stamp_original_coords(mesh):
+    """Store each vertex's current local coordinate + an "existed at join"
+    flag as POINT attributes.  This makes every instance self-describing:
+    disassembly recovers the origin by fitting stored->current coordinates,
+    so Apply Transform / Set Origin / whole-piece edit-mode moves on the
+    container no longer break origins or linking."""
+    co = mesh.attributes.get(CO_ATTR)
+    if co is not None and (co.domain != 'POINT' or co.data_type != 'FLOAT_VECTOR'):
+        mesh.attributes.remove(co)
+        co = None
+    if co is None:
+        co = mesh.attributes.new(CO_ATTR, 'FLOAT_VECTOR', 'POINT')
+    n = len(mesh.vertices)
+    arr = np.zeros(n * 3, dtype=np.float32)
+    mesh.vertices.foreach_get("co", arr)
+    co.data.foreach_set("vector", arr)
+
+    flag = mesh.attributes.get(ORIG_ATTR)
+    if flag is not None and (flag.domain != 'POINT' or flag.data_type != 'BOOLEAN'):
+        mesh.attributes.remove(flag)
+        flag = None
+    if flag is None:
+        flag = mesh.attributes.new(ORIG_ATTR, 'BOOLEAN', 'POINT')
+    flag.data.foreach_set("value", np.ones(n, dtype=bool))
+
+
+def _remove_tracking_attrs(mesh):
+    doomed = [a.name for a in mesh.attributes
+              if a.name in (ATTR_NAME, CO_ATTR, ORIG_ATTR, COL_CO, COL_ID)
+              or a.name.startswith(TABLE_COL_PREFIX)]
+    for name in doomed:
+        attr = mesh.attributes.get(name)
+        if attr is not None:
+            mesh.attributes.remove(attr)
+
+
+def _read_face_ids(mesh):
+    attr = mesh.attributes.get(ATTR_NAME)
+    if attr is None or attr.domain != 'FACE' or attr.data_type != 'INT':
+        return None
+    arr = np.zeros(len(mesh.polygons), dtype=np.intc)
+    attr.data.foreach_get("value", arr)
+    return arr
+
+
+def _read_attr_values(mesh):
+    attr = mesh.attributes.get(ATTR_NAME)
+    if attr is None:
+        return None
+    arr = np.zeros(len(mesh.polygons), dtype=np.intc)
+    attr.data.foreach_get("value", arr)
+    return arr
+
+
+def _solve_instance_frame(mesh, extra_tol=0.0):
+    """Recover the instance frame from the stored per-vertex original
+    coordinates: least-squares affine fit original-local -> current
+    container-local.  Immune to container Apply Transform / Set Origin /
+    whole-piece edit-mode moves (the frame follows the piece) and to FBX
+    matrix rebuilds - vertex order is irrelevant, the pairing rides with
+    each vertex.  Rewrites the mesh vertices back into original local space
+    (snapping unedited verts to their exact stored coords) and returns the
+    frame Matrix, or None when the attributes are absent or the point cloud
+    is degenerate (legacy containers fall back to the matrix path)."""
+    co_attr = mesh.attributes.get(CO_ATTR)
+    flag_attr = mesh.attributes.get(ORIG_ATTR)
+    if (co_attr is None or co_attr.domain != 'POINT' or co_attr.data_type != 'FLOAT_VECTOR'
+            or flag_attr is None or flag_attr.domain != 'POINT' or flag_attr.data_type != 'BOOLEAN'):
+        return None
+    n = len(mesh.vertices)
+    if n == 0:
+        return None
+    p32 = np.zeros(n * 3, dtype=np.float32)
+    co_attr.data.foreach_get("vector", p32)
+    p = p32.reshape(-1, 3).astype(np.float64)
+    mask = np.zeros(n, dtype=bool)
+    flag_attr.data.foreach_get("value", mask)
+    q32 = np.zeros(n * 3, dtype=np.float32)
+    mesh.vertices.foreach_get("co", q32)
+    q = q32.reshape(-1, 3).astype(np.float64)
+
+    if int(mask.sum()) < 3:
+        return None
+
+    def fit(sel):
+        pm, qm = p[sel].mean(axis=0), q[sel].mean(axis=0)
+        pc, qc = p[sel] - pm, q[sel] - qm
+        s_vals = np.linalg.svd(pc, compute_uv=False)
+        if s_vals[1] < 1e-6 * max(s_vals[0], 1e-9):
+            return None  # collinear/degenerate point cloud
+        x, *_ = np.linalg.lstsq(pc, qc, rcond=None)
+        a = x.T
+        if s_vals[2] < 1e-6 * s_vals[0]:
+            # planar piece: the normal direction is unconstrained by the fit -
+            # complete it so the frame stays invertible and orientation-true
+            _u, _s, vt = np.linalg.svd(pc, full_matrices=False)
+            u1, u2 = vt[0], vt[1]
+            n_src = np.cross(u1, u2)
+            v1, v2 = a @ u1, a @ u2
+            n_img = np.cross(v1, v2)
+            ln = float(np.linalg.norm(n_img))
+            if ln < 1e-12:
+                return None
+            scale = np.sqrt(np.linalg.norm(v1) * np.linalg.norm(v2))
+            a = a + np.outer(n_img / ln * scale, n_src)
+        t = qm - a @ pm
+        return a, t
+
+    result = fit(mask)
+    if result is None:
+        return None
+    a, t = result
+    res = np.linalg.norm(q[mask] - (p[mask] @ a.T + t), axis=1)
+    diag = float(np.linalg.norm(p[mask].max(axis=0) - p[mask].min(axis=0)))
+    tol = max(1e-4, diag * 1e-4, float(np.linalg.norm(t)) * 1e-6, extra_tol)
+    if res.max() > tol:
+        # part of the piece was edited - refit on the rigid majority
+        thr = max(tol, 3.0 * float(np.median(res)))
+        inliers = np.zeros(n, dtype=bool)
+        inliers[np.flatnonzero(mask)[res <= thr]] = True
+        if int(inliers.sum()) >= 3:
+            refit = fit(inliers)
+            if refit is not None:
+                a, t = refit
+                res = np.linalg.norm(q[mask] - (p[mask] @ a.T + t), axis=1)
+                tol = max(1e-4, diag * 1e-4, float(np.linalg.norm(t)) * 1e-6, extra_tol)
+
+    if abs(np.linalg.det(a)) < 1e-12:
+        return None
+
+    # final vertex coords: exact stored originals for unedited verts (kills
+    # float32 container-space noise), frame-inverse for edited/new verts
+    a_inv = np.linalg.inv(a)
+    final = (q - t) @ a_inv.T
+    snap = np.zeros(n, dtype=bool)
+    snap[np.flatnonzero(mask)[res <= tol]] = True
+    final[snap] = p[snap]
+    mesh.vertices.foreach_set("co", final.astype(np.float32).ravel())
+
+    return Matrix((
+        (a[0][0], a[0][1], a[0][2], t[0]),
+        (a[1][0], a[1][1], a[1][2], t[1]),
+        (a[2][0], a[2][1], a[2][2], t[2]),
+        (0.0, 0.0, 0.0, 1.0),
+    ))
+
+
+def _has_loose_geometry(mesh):
+    if len(mesh.polygons) == 0:
+        return len(mesh.vertices) > 0
+    used = np.zeros(len(mesh.loops), dtype=np.intc)
+    mesh.loops.foreach_get("vertex_index", used)
+    return len(np.unique(used)) < len(mesh.vertices)
+
+
+# ----------------------------------------------------------------------------
+# FBX transport: permanent color-attribute mirror of the tracking data.
+# The STANDARD FBX exporter carries vertex colors by default, so a plain
+# File→Export/Import moves the memory with no special operators.
+# ----------------------------------------------------------------------------
+
+def _table_color_names(mesh):
+    # digits-only filter: a foreign/duplicated name like "AGR_Link_T0.001"
+    # must not crash the sort - this runs inside poll()/draw()
+    names = [a.name for a in mesh.attributes
+             if a.name.startswith(TABLE_COL_PREFIX)
+             and a.name[len(TABLE_COL_PREFIX):].isdigit()]
+    return sorted(names, key=lambda n: int(n[len(TABLE_COL_PREFIX):]))
+
+
+def _remove_color_mirror(mesh):
+    """Remove ONLY the color-mirror attributes (keep the internal tracking
+    attrs) - used when the mirror could not be (re)written, so a stale
+    mirror never contradicts the idprop table."""
+    doomed = [a.name for a in mesh.attributes
+              if a.name in (COL_CO, COL_ID) or a.name.startswith(TABLE_COL_PREFIX)]
+    for name in doomed:
+        attr = mesh.attributes.get(name)
+        if attr is not None:
+            mesh.attributes.remove(attr)
+
+
+def _pack_table_to_colors(mesh, table):
+    """Encode the JSON table into AGR_Link_T* color attributes: zlib bytes,
+    ONE byte per channel on the sRGB b/255 grid (survives the importer's
+    BYTE_COLOR quantisation).  Returns False when the mesh cannot hold it -
+    capacity is checked BEFORE the old mirror is removed."""
+    n_loops = len(mesh.loops)
+    if n_loops == 0:
+        return False
+    raw = json.dumps(table, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    payload = zlib.compress(raw, 9)
+    blob = (TABLE_MAGIC + bytes([1, 0])
+            + len(payload).to_bytes(4, "little")
+            + zlib.crc32(payload).to_bytes(4, "little")
+            + payload)
+    per_attr = n_loops * 4  # 4 channels x 1 byte
+    k = -(-len(blob) // per_attr)
+    if k > 128:
+        return False
+    for name in _table_color_names(mesh):
+        attr = mesh.attributes.get(name)
+        if attr is not None:
+            mesh.attributes.remove(attr)
+    blob = blob.ljust(k * per_attr, b"\x00")
+    floats = (np.frombuffer(blob, dtype=np.uint8).astype(np.float32)) / 255.0
+    for i in range(k):
+        attr = mesh.color_attributes.new(name=f"{TABLE_COL_PREFIX}{i}",
+                                         type='FLOAT_COLOR', domain='CORNER')
+        chunk = floats[i * n_loops * 4:(i + 1) * n_loops * 4]
+        attr.data.foreach_set("color_srgb", chunk)
+    return True
+
+
+def _read_srgb_bytes(attr):
+    """Read a color attribute as bytes on the sRGB b/255 grid — identical
+    for the FLOAT_COLOR we write and the BYTE_COLOR the importer creates."""
+    cnt = len(attr.data)
+    arr = np.zeros(cnt * 4, dtype=np.float32)
+    attr.data.foreach_get("color_srgb", arr)
+    return np.clip(np.rint(arr.astype(np.float64) * 255.0), 0, 255).astype(np.uint8)
+
+
+def _decode_table_from_colors(mesh):
+    """Decode the JSON table from AGR_Link_T* color attributes (after an
+    FBX round trip with default settings).  CRC-guarded: returns None on
+    any corruption instead of a plausible-but-wrong table."""
+    names = _table_color_names(mesh)
+    if not names:
+        return None
+    n_loops = len(mesh.loops)
+    if n_loops == 0:
+        return None
+    chunks = []
+    for name in names:
+        attr = mesh.attributes.get(name)
+        if attr is None or attr.domain != 'CORNER' or len(attr.data) != n_loops:
+            return None
+        chunks.append(_read_srgb_bytes(attr))
+    blob = np.concatenate(chunks).tobytes()
+    if len(blob) < 14 or blob[:4] != TABLE_MAGIC:
+        return None
+    length = int.from_bytes(blob[6:10], "little")
+    crc = int.from_bytes(blob[10:14], "little")
+    if length <= 0 or length > 16 * 1024 * 1024 or 14 + length > len(blob):
+        return None
+    payload = blob[14:14 + length]
+    if zlib.crc32(payload) != crc:
+        return None
+    try:
+        table = json.loads(zlib.decompress(payload).decode("utf-8"))
+    except (zlib.error, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(table, dict) or "instances" not in table:
+        return None
+    return table
+
+
+def _pack_tracking_to_colors(mesh, table):
+    """Mirror the tracking attributes into the two color attributes and
+    store the normalisation bounds in the table.  Overwrites any previous
+    mirror (called after every join).  Finishes by encoding the table
+    itself into AGR_Link_T* - the container becomes fully self-contained
+    for a plain default FBX export."""
+    attr = mesh.attributes.get(ATTR_NAME)
+    co_attr = mesh.attributes.get(CO_ATTR)
+    flag_attr = mesh.attributes.get(ORIG_ATTR)
+    if attr is None or co_attr is None or flag_attr is None:
+        _remove_color_mirror(mesh)  # never leave a stale mirror behind
+        return False
+    n_verts = len(mesh.vertices)
+    n_loops = len(mesh.loops)
+    n_polys = len(mesh.polygons)
+    if n_verts == 0 or n_loops == 0:
+        _remove_color_mirror(mesh)
+        return False
+
+    co = np.zeros(n_verts * 3, dtype=np.float32)
+    co_attr.data.foreach_get("vector", co)
+    co32 = co.reshape(-1, 3)
+    co = co32.astype(np.float64)
+    flags = np.zeros(n_verts, dtype=bool)
+    flag_attr.data.foreach_get("value", flags)
+    ids = np.zeros(n_polys, dtype=np.intc)
+    attr.data.foreach_get("value", ids)
+
+    co_min = co.min(axis=0)
+    co_size = np.maximum(co.max(axis=0) - co_min, 1e-6)
+    table["co_min"] = [float(v) for v in co_min]
+    table["co_size"] = [float(v) for v in co_size]
+
+    vidx = np.zeros(n_loops, dtype=np.intc)
+    mesh.loops.foreach_get("vertex_index", vidx)
+    loop_total = np.zeros(n_polys, dtype=np.intc)
+    mesh.polygons.foreach_get("loop_total", loop_total)
+    ids_per_loop = np.repeat(ids.astype(np.float64), loop_total)
+
+    active_name = (mesh.color_attributes.active_color.name
+                   if mesh.color_attributes.active_color else None)
+    render_idx = mesh.color_attributes.render_color_index
+    render_name = (mesh.color_attributes[render_idx].name
+                   if 0 <= render_idx < len(mesh.color_attributes) else None)
+    for name in (COL_CO, COL_ID):
+        old = mesh.attributes.get(name)
+        if old is not None:
+            mesh.attributes.remove(old)
+    col_co = mesh.color_attributes.new(name=COL_CO, type='FLOAT_COLOR', domain='CORNER')
+    col_id = mesh.color_attributes.new(name=COL_ID, type='FLOAT_COLOR', domain='CORNER')
+    # re-fetch: the second new() may reallocate the CustomData layer array,
+    # leaving the first reference dangling
+    col_co = mesh.attributes.get(COL_CO)
+
+    # 16-bit hi/lo per value on the byte-robust sRGB grid
+    v16 = np.clip(np.rint((co - co_min) / co_size * 65535.0), 0, 65535).astype(np.uint32)
+    v16_loop = v16[vidx]
+    ids_loop = np.clip(ids_per_loop, 0, 32767).astype(np.uint32)
+    flag_loop = flags[vidx].astype(np.uint32)
+    data_co = np.empty((n_loops, 4), dtype=np.float32)
+    data_co[:, 0] = (v16_loop[:, 0] >> 8) / 255.0
+    data_co[:, 1] = (v16_loop[:, 0] & 255) / 255.0
+    data_co[:, 2] = (v16_loop[:, 1] >> 8) / 255.0
+    data_co[:, 3] = (v16_loop[:, 1] & 255) / 255.0
+    data_id = np.empty((n_loops, 4), dtype=np.float32)
+    data_id[:, 0] = (v16_loop[:, 2] >> 8) / 255.0
+    data_id[:, 1] = (v16_loop[:, 2] & 255) / 255.0
+    data_id[:, 2] = ((flag_loop << 7) | (ids_loop >> 8)) / 255.0
+    data_id[:, 3] = (ids_loop & 255) / 255.0
+    col_co.data.foreach_set("color_srgb", data_co.ravel())
+    col_id.data.foreach_set("color_srgb", data_id.ravel())
+
+    # bit-exact layer: full float32 originals ride inside the byte-exact
+    # table blob; the quantised channels above serve as the per-vertex
+    # correspondence key (order-independent) and as a fallback
+    table["precise_n"] = int(n_verts)
+    table["precise_co"] = base64.b64encode(co32.astype("<f4").tobytes()).decode("ascii")
+    table_ok = _pack_table_to_colors(mesh, table)
+
+    # never leave an AGR service layer as the mesh's active/render color:
+    # a material with a blank-name Color Attribute node would render the
+    # packed bytes as vertex-colour noise
+    if active_name is not None and mesh.color_attributes.get(active_name) is not None:
+        mesh.color_attributes.active_color = mesh.color_attributes.get(active_name)
+    else:
+        try:
+            mesh.color_attributes.active_color_index = -1
+        except (ValueError, RuntimeError):
+            pass
+    if render_name is not None and mesh.color_attributes.get(render_name) is not None:
+        for i, layer in enumerate(mesh.color_attributes):
+            if layer.name == render_name:
+                mesh.color_attributes.render_color_index = i
+                break
+    else:
+        try:
+            mesh.color_attributes.render_color_index = -1
+        except (ValueError, RuntimeError):
+            pass
+
+    if not table_ok:
+        _remove_color_mirror(mesh)
+        return False
+    return True
+
+
+def _unpack_tracking_from_colors(mesh, table):
+    """Rebuild the internal tracking attributes from the color mirror after
+    an FBX round trip.  Tolerates the importer changing the domain
+    (CORNER/POINT) and BYTE_COLOR degradation."""
+    col_co = mesh.attributes.get(COL_CO)
+    col_id = mesh.attributes.get(COL_ID)
+    co_min = table.get("co_min")
+    co_size = table.get("co_size")
+    if col_co is None or col_id is None or co_min is None or co_size is None:
+        return False
+    n_verts = len(mesh.vertices)
+    n_loops = len(mesh.loops)
+    n_polys = len(mesh.polygons)
+    if n_verts == 0 or n_loops == 0:
+        return False
+    vidx = np.zeros(n_loops, dtype=np.intc)
+    mesh.loops.foreach_get("vertex_index", vidx)
+    loop_start = np.zeros(n_polys, dtype=np.intc)
+    mesh.polygons.foreach_get("loop_start", loop_start)
+
+    def per_vertex_bytes(attr_):
+        b = _read_srgb_bytes(attr_).reshape(-1, 4).astype(np.uint32)
+        if attr_.domain == 'CORNER' and len(b) == n_loops:
+            out = np.zeros((n_verts, 4), dtype=np.uint32)
+            out[vidx] = b
+            return out, b
+        if attr_.domain == 'POINT' and len(b) == n_verts:
+            return b, b[vidx]
+        return None, None
+
+    b_co_v, _b_co_l = per_vertex_bytes(col_co)
+    b_id_v, b_id_l = per_vertex_bytes(col_id)
+    if b_co_v is None or b_id_v is None:
+        return False
+
+    v16 = np.empty((n_verts, 3), dtype=np.int64)
+    v16[:, 0] = b_co_v[:, 0] * 256 + b_co_v[:, 1]
+    v16[:, 1] = b_co_v[:, 2] * 256 + b_co_v[:, 3]
+    v16[:, 2] = b_id_v[:, 0] * 256 + b_id_v[:, 1]
+    co = v16.astype(np.float64) / 65535.0 * np.asarray(co_size) + np.asarray(co_min)
+    flags = b_id_v[:, 2] >= 128
+
+    id_hi = b_id_l[loop_start, 2]
+    id_lo = b_id_l[loop_start, 3]
+    face_ids = ((id_hi & 127) * 256 + id_lo).astype(np.intc)
+
+    # bit-exact overlay: the color-encoded table blob carries the full
+    # float32 originals; each vertex finds its precise record through the
+    # quantised 16-bit key (order-independent, collisions only within one
+    # quantum where any candidate is equally right)
+    full_precision = False
+    blob_table = _decode_table_from_colors(mesh)
+    if blob_table is not None and "precise_co" in blob_table and "precise_n" in blob_table:
+        try:
+            raw = base64.b64decode(blob_table["precise_co"])
+            precise = np.frombuffer(raw, dtype="<f4")
+        except (ValueError, TypeError):
+            precise = None
+        if precise is not None and len(precise) == int(blob_table["precise_n"]) * 3:
+            precise = precise.reshape(-1, 3)
+            b_min = np.asarray(blob_table.get("co_min", co_min))
+            b_size = np.asarray(blob_table.get("co_size", co_size))
+            k16 = np.clip(np.rint((precise.astype(np.float64) - b_min) / b_size * 65535.0),
+                          0, 65535).astype(np.int64)
+            keys_pack = (k16[:, 0] << 32) | (k16[:, 1] << 16) | k16[:, 2]
+            keys_mesh = (v16[:, 0] << 32) | (v16[:, 1] << 16) | v16[:, 2]
+            order = np.argsort(keys_pack, kind="stable")
+            sorted_keys = keys_pack[order]
+            pos = np.clip(np.searchsorted(sorted_keys, keys_mesh), 0, len(sorted_keys) - 1)
+            hit = sorted_keys[pos] == keys_mesh
+            co[hit] = precise[order[pos[hit]]]
+            # loop-less (loose) verts carry no CORNER data by construction -
+            # they can never key-match and must not veto full precision
+            covered = np.zeros(n_verts, dtype=bool)
+            covered[vidx] = True
+            full_precision = bool(hit[covered].all()) if covered.any() else False
+
+    attr = _ensure_attr(mesh)
+    attr.data.foreach_set("value", face_ids)
+    co_attr = mesh.attributes.get(CO_ATTR)
+    if co_attr is not None and (co_attr.domain != 'POINT' or co_attr.data_type != 'FLOAT_VECTOR'):
+        mesh.attributes.remove(co_attr)
+        co_attr = None
+    if co_attr is None:
+        co_attr = mesh.attributes.new(CO_ATTR, 'FLOAT_VECTOR', 'POINT')
+    co_attr.data.foreach_set("vector", co.astype(np.float32).ravel())
+    flag_attr = mesh.attributes.get(ORIG_ATTR)
+    if flag_attr is not None and (flag_attr.domain != 'POINT' or flag_attr.data_type != 'BOOLEAN'):
+        mesh.attributes.remove(flag_attr)
+        flag_attr = None
+    if flag_attr is None:
+        flag_attr = mesh.attributes.new(ORIG_ATTR, 'BOOLEAN', 'POINT')
+    flag_attr.data.foreach_set("value", flags)
+    # remember the 16-bit quantisation step UNLESS every vertex got its
+    # bit-exact original back: the fit/snap/relink tolerances must absorb
+    # the quantum or copies diverge by a hair after the FBX roundtrip
+    if full_precision:
+        table["co_quant"] = 0.0
+    else:
+        table["co_quant"] = float(np.max(np.asarray(co_size)) / 65535.0 * 2.0)
+    return True
+
+
+# ----------------------------------------------------------------------------
+# Join
+# ----------------------------------------------------------------------------
+
+def _rollback_join(mutated):
+    """Undo pre-join mutations after a failed join: restore replaced
+    datablocks and stamped attribute values."""
+    for obj, orig_data, saved_ids in reversed(mutated):
+        try:
+            if orig_data is not None:
+                copy = obj.data
+                obj.data = orig_data
+                if copy.users == 0:
+                    bpy.data.meshes.remove(copy)
+            elif saved_ids is not None:
+                attr = obj.data.attributes.get(ATTR_NAME)
+                if attr is not None:
+                    attr.data.foreach_set("value", saved_ids)
+            else:
+                _remove_tracking_attrs(obj.data)
+        except (ReferenceError, RuntimeError):
+            pass
+
+
+class AGR_OT_link_join(Operator):
+    """Заджоинить выбранные меши в один объект с памятью линков:
+контейнер можно в любой момент разобрать обратно на исходные
+линкованные объекты (панель AGR Link)"""
+    bl_idname = "agr.link_join"
+    bl_label = "Джоин с памятью линков"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'OBJECT'
+                and context.active_object is not None
+                and context.active_object.type == 'MESH')
+
+    def execute(self, context):
+        active = context.active_object
+        participants = [o for o in context.selected_objects if o.type == 'MESH']
+        skipped = [o for o in context.selected_objects if o.type != 'MESH']
+
+        if active not in participants:
+            agr_report(self, 'ERROR', "❌ AGR Link: активный объект должен быть выделенным мешем")
+            return {'CANCELLED'}
+        if len(participants) < 2:
+            agr_report(self, 'ERROR', "❌ AGR Link: выделите минимум 2 меш-объекта")
+            return {'CANCELLED'}
+
+        # --- blockers (all BEFORE any mutation) -----------------------------
+        from_library = [o.name for o in participants
+                        if o.library is not None or o.data.library is not None]
+        if from_library:
+            names = ", ".join(from_library[:5]) + ("…" if len(from_library) > 5 else "")
+            agr_report(self, 'ERROR',
+                       f"❌ AGR Link: объекты из линкованной библиотеки нельзя джоинить: {names}")
+            return {'CANCELLED'}
+
+        with_modifiers = [o.name for o in participants if o.modifiers]
+        if with_modifiers:
+            names = ", ".join(with_modifiers[:5]) + ("…" if len(with_modifiers) > 5 else "")
+            agr_report(self, 'ERROR',
+                       f"❌ AGR Link: у объектов есть модификаторы (пропадут при джоине) — "
+                       f"примените или удалите их: {names}")
+            return {'CANCELLED'}
+        with_keys = [o.name for o in participants if o.data.shape_keys]
+        if with_keys:
+            names = ", ".join(with_keys[:5]) + ("…" if len(with_keys) > 5 else "")
+            agr_report(self, 'ERROR', f"❌ AGR Link: у объектов есть shape keys: {names}")
+            return {'CANCELLED'}
+
+        # Zero-scale matrices are not invertible - the restore math needs M⁻¹
+        singular = [o.name for o in participants
+                    if abs(o.matrix_world.determinant()) < 1e-12]
+        if singular:
+            names = ", ".join(singular[:5]) + ("…" if len(singular) > 5 else "")
+            agr_report(self, 'ERROR',
+                       f"❌ AGR Link: нулевой масштаб (матрица необратима), исправьте scale: {names}")
+            return {'CANCELLED'}
+
+        if not bpy.ops.object.join.poll():
+            agr_report(self, 'ERROR', "❌ AGR Link: join невозможен в текущем контексте")
+            return {'CANCELLED'}
+
+        # Zero-face participants cannot be tracked by a face attribute
+        no_faces = [o for o in participants if len(o.data.polygons) == 0]
+        if no_faces:
+            for o in no_faces:
+                o.select_set(False)
+            participants = [o for o in participants if o not in no_faces]
+            agr_report(self, 'WARNING',
+                       f"⚠️ AGR Link: без граней, исключены из джоина: "
+                       + ", ".join(o.name for o in no_faces[:5]))
+            if active not in participants or len(participants) < 2:
+                agr_report(self, 'ERROR', "❌ AGR Link: после исключения объектов джоинить нечего")
+                return {'CANCELLED'}
+
+        loose = [o.name for o in participants if _has_loose_geometry(o.data)]
+        if loose:
+            agr_report(self, 'WARNING',
+                       "⚠️ AGR Link: свободные вершины/рёбра не отслеживаются атрибутом и при "
+                       "разборке останутся в контейнере: " + ", ".join(loose[:5]))
+
+        # join unions UV layers BY NAME and zero-fills the missing ones -
+        # mismatched layer names silently break the 1-UV delivery rule
+        uv_sets = {tuple(sorted(l.name for l in o.data.uv_layers)) for o in participants}
+        if len(uv_sets) > 1:
+            agr_report(self, 'WARNING',
+                       "⚠️ AGR Link: у объектов РАЗНЫЕ наборы UV-слоёв — join объединит их в "
+                       "несколько каналов, грани без слоя получат нулевые UV")
+
+        a_mat = active.matrix_world.copy()
+        inv_active = a_mat.inverted()
+
+        # --- build the merged table (pure computation, no scene mutation yet)
+        active_table = read_table(active)
+        if active_table is not None:
+            table = active_table  # own ids stay valid, matrices stay verbatim
+            # a freshly FBX-imported container has no internal attributes yet -
+            # rebuild them from the color mirror before anything is stamped;
+            # stamping over MISSING attributes would zero-fill every face id
+            if active.data.attributes.get(ATTR_NAME) is None:
+                if not _unpack_tracking_from_colors(active.data, table):
+                    agr_report(self, 'ERROR',
+                               "❌ AGR Link: у контейнера нет разметки (ни атрибутов, ни "
+                               "цветового зеркала) — джоин отменён, разметка была бы потеряна")
+                    return {'CANCELLED'}
+        else:
+            table = _new_table()
+
+        others = [o for o in participants if o != active]
+
+        # (obj, iid, needs_fill, id_map) - stamping plan, applied after all
+        # entries are computed
+        stamp_plan = []
+        # Same live datablock => same link group (this is what "linked" means)
+        plain_group_by_data = {}
+
+        if active_table is None:
+            # active itself becomes instance #1 with identity rel-matrix
+            ginfo = {"data_name": active.data.name,
+                     "verts": len(active.data.vertices),
+                     "faces": len(active.data.polygons)}
+            gid = _match_or_add_group(table, ginfo)
+            plain_group_by_data[active.data] = gid
+            iid = table["next_instance"]
+            table["next_instance"] += 1
+            entry = _capture_instance(active, inv_active, context)
+            entry["group"] = gid
+            table["instances"][str(iid)] = entry
+            stamp_plan.append((active, iid, True, None))
+
+        merged_containers = 0
+        for obj in others:
+            sub = read_table(obj)
+            if sub is not None:
+                if obj.data.attributes.get(ATTR_NAME) is None:
+                    # freshly imported container joined without a prior
+                    # disassembly - restore its attributes from colors first
+                    if not _unpack_tracking_from_colors(obj.data, sub):
+                        agr_report(self, 'ERROR',
+                                   f"❌ AGR Link: у контейнера '{obj.name}' нет разметки — "
+                                   f"джоин отменён, его геометрия стала бы неразборной")
+                        return {'CANCELLED'}
+                # the merged-in container's quantisation budget must survive
+                # the merge or its copies won't re-link at disassembly
+                sub_quant = float(sub.get("co_quant", 0.0) or 0.0)
+                if sub_quant > float(table.get("co_quant", 0.0) or 0.0):
+                    table["co_quant"] = sub_quant
+                # merge a nested container: one matrix conversion for all entries
+                conv = inv_active @ obj.matrix_world
+                group_map = {}
+                for gid_str, ginfo in sub.get("groups", {}).items():
+                    group_map[int(gid_str)] = _match_or_add_group(table, ginfo)
+                id_map = {}
+                for iid_str, inst in sub.get("instances", {}).items():
+                    nid = table["next_instance"]
+                    table["next_instance"] += 1
+                    inst = dict(inst)
+                    inst["group"] = group_map.get(inst.get("group", 0), 0)
+                    inst["matrix_rel"] = _matrix_to_list(conv @ Matrix(inst["matrix_rel"]))
+                    table["instances"][str(nid)] = inst
+                    id_map[int(iid_str)] = nid
+                stamp_plan.append((obj, None, False, id_map))
+                merged_containers += 1
+            else:
+                data = obj.data
+                gid = plain_group_by_data.get(data)
+                if gid is None:
+                    ginfo = {"data_name": data.name,
+                             "verts": len(data.vertices),
+                             "faces": len(data.polygons)}
+                    gid = _match_or_add_group(table, ginfo)
+                    plain_group_by_data[data] = gid
+                iid = table["next_instance"]
+                table["next_instance"] += 1
+                entry = _capture_instance(obj, inv_active, context)
+                entry["group"] = gid
+                table["instances"][str(iid)] = entry
+                stamp_plan.append((obj, iid, True, None))
+
+        # --- mutations: single-user data, then stamp the face attribute.
+        # Linked copies share one mesh datablock, so each participant must own
+        # its data before per-object ids can be written into it.  The join
+        # bakes geometry anyway, so nothing is lost by the copy.  Every
+        # mutation is recorded so a failed join can roll back.
+        mutated = []  # (obj, replaced_original_data | None, saved_attr_ids | None)
+        try:
+            for obj, iid, fill, id_map in stamp_plan:
+                orig_data = None
+                saved_ids = None
+                if obj.data.users > 1:
+                    orig_data = obj.data
+                    obj.data = obj.data.copy()
+                elif id_map:
+                    saved_ids = _read_attr_values(obj.data)
+                mutated.append((obj, orig_data, saved_ids))
+                if fill:
+                    _stamp_fill(obj.data, iid)
+                    _stamp_original_coords(obj.data)
+                elif id_map:
+                    _stamp_remap(obj.data, id_map)
+            # Active container with no id conflicts: attribute is already correct.
+            if active.data.users > 1:
+                orig_data = active.data
+                active.data = active.data.copy()
+                mutated.append((active, orig_data, None))
+        except Exception as exc:
+            _rollback_join(mutated)
+            agr_report(self, 'ERROR', f"❌ AGR Link: сбой подготовки, изменения откачены: {exc}")
+            return {'CANCELLED'}
+
+        # --- join
+        for o in skipped:
+            o.select_set(False)
+        context.view_layer.objects.active = active
+        try:
+            ret = bpy.ops.object.join()
+        except RuntimeError as exc:
+            _rollback_join(mutated)
+            agr_report(self, 'ERROR', f"❌ AGR Link: join не удался, изменения откачены: {exc}")
+            return {'CANCELLED'}
+        if 'FINISHED' not in ret:
+            _rollback_join(mutated)
+            agr_report(self, 'ERROR', "❌ AGR Link: join не выполнился, изменения откачены")
+            return {'CANCELLED'}
+
+        # idprop FIRST: even if the color mirror fails, the table must exist -
+        # a container with stamped geometry and no table is unrecoverable
+        write_table(active, table)
+        try:
+            mirror_ok = _pack_tracking_to_colors(active.data, table)
+        except Exception:
+            _remove_color_mirror(active.data)
+            mirror_ok = False
+        if mirror_ok:
+            write_table(active, table)  # now includes the co_min/co_size bounds
+        else:
+            agr_report(self, 'WARNING',
+                       "⚠️ AGR Link: цветовое зеркало не записано — контейнер не переживёт "
+                       "FBX-перенос (в .blend разборка работает)")
+
+        n_inst = len(table["instances"])
+        n_groups = len({inst["group"] for inst in table["instances"].values()})
+        msg = (f"✅ AGR Link: заджоинено {len(participants)} объектов → '{active.name}' "
+               f"(в памяти {n_inst} объектов, {n_groups} групп)")
+        if merged_containers:
+            msg += f", влито контейнеров: {merged_containers}"
+        agr_report(self, 'INFO', msg)
+        return {'FINISHED'}
+
+
+# ----------------------------------------------------------------------------
+# Disassembly
+# ----------------------------------------------------------------------------
+
+def _prune_mesh_to_faces(mesh, keep_mask_fn, keep_preexisting_loose=False):
+    """Delete every face for which keep_mask_fn(attr_value) is False, plus
+    loose geometry ORPHANED by that deletion.  With keep_preexisting_loose,
+    verts that were already loose before (untracked by the face attribute)
+    survive - the container prune must honour the join-time promise that
+    loose geometry stays in the container.  Returns (faces_left, verts_left)."""
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    layer = bm.faces.layers.int.get(ATTR_NAME)
+    if layer is None:
+        bm.free()
+        return len(mesh.polygons), len(mesh.vertices)
+    pre_loose = {v for v in bm.verts if not v.link_faces} if keep_preexisting_loose else set()
+    doomed = [f for f in bm.faces if not keep_mask_fn(f[layer])]
+    if doomed:
+        bmesh.ops.delete(bm, geom=doomed, context='FACES')
+    loose = [v for v in bm.verts if not v.link_faces and v not in pre_loose]
+    if loose:
+        bmesh.ops.delete(bm, geom=loose, context='VERTS')
+    faces_left, verts_left = len(bm.faces), len(bm.verts)
+    bm.to_mesh(mesh)
+    bm.free()
+    return faces_left, verts_left
+
+
+def _restore_materials(mesh):
+    """Compact the container's material slots down to the ones this chunk's
+    faces actually use, keeping the container's slot order.  CONTAINER
+    materials and UV win by design (user decision): re-assigning a shared
+    UDIM material or re-unwrapping on the container must survive disassembly
+    with linking intact, so the stored per-instance material names are kept
+    only as table metadata and never forced back."""
+    n = len(mesh.polygons)
+    idx = np.zeros(n, dtype=np.intc)
+    if n:
+        mesh.polygons.foreach_get("material_index", idx)
+    old_mats = list(mesh.materials)
+
+    final = []
+    remap = {}
+    for oi in (sorted(set(idx.tolist())) if n else []):
+        mat = old_mats[oi] if 0 <= oi < len(old_mats) else None
+        if mat is None and not old_mats:
+            # container has no materials at all - no phantom empty slot
+            remap[oi] = 0
+            continue
+        pos = None
+        for i, m in enumerate(final):  # collapse duplicate slots of one material
+            if m is mat:
+                pos = i
+                break
+        if pos is None:
+            final.append(mat)
+            pos = len(final) - 1
+        remap[oi] = pos
+
+    mesh.materials.clear()
+    for mat in final:
+        mesh.materials.append(mat)
+    if n and remap:
+        lut_size = max(remap.keys()) + 1
+        lut = np.zeros(lut_size, dtype=np.intc)
+        for oi, pos in remap.items():
+            lut[oi] = pos
+        safe_idx = np.where((idx < 0) | (idx >= lut_size), 0, idx)
+        mesh.polygons.foreach_set("material_index", lut[safe_idx])
+
+
+def _mesh_coords(mesh):
+    arr = np.zeros(len(mesh.vertices) * 3, dtype=np.float32)
+    mesh.vertices.foreach_get("co", arr)
+    return arr
+
+
+def _mesh_mat_indices(mesh):
+    arr = np.zeros(len(mesh.polygons), dtype=np.intc)
+    if len(mesh.polygons):
+        mesh.polygons.foreach_get("material_index", arr)
+    return arr
+
+
+def _mesh_poly_normals(mesh):
+    # mesh.polygon_normals (unlike polygons.foreach_get("normal")) forces a
+    # recompute of the lazy normal cache after transform()/flip_normals()
+    arr = np.zeros(len(mesh.polygons) * 3, dtype=np.float32)
+    if len(mesh.polygons):
+        mesh.polygon_normals.foreach_get("vector", arr)
+    return arr
+
+
+def _geometry_matches(mesh_a, mesh_b, check_materials=True, extra_atol=0.0):
+    """extra_atol absorbs float32 roundtrip noise that grows with the
+    instance's CONTAINER-relative offset (city-scale scenes): the joined
+    verts are stored as float32 at container magnitudes, so the M⁻¹ trip
+    leaves ~2.4e-7 error per metre of offset regardless of mesh size."""
+    if (len(mesh_a.vertices) != len(mesh_b.vertices)
+            or len(mesh_a.polygons) != len(mesh_b.polygons)
+            or len(mesh_a.loops) != len(mesh_b.loops)):
+        return False
+    ca, cb = _mesh_coords(mesh_a), _mesh_coords(mesh_b)
+    scale = float(max(np.max(np.abs(ca), initial=1.0), 1.0))
+    atol = max(1e-5, scale * 1e-5, extra_atol)
+    if not np.allclose(ca, cb, atol=atol):
+        return False
+    # same coords but flipped winding is NOT the same mesh - a silent link
+    # would discard the flip (matters for mirrored instances).  0.1 catches
+    # orientation flips (delta ~2.0) while tolerating normal noise from
+    # quantised coords on small faces - genuine edits are caught by coords
+    if not np.allclose(_mesh_poly_normals(mesh_a), _mesh_poly_normals(mesh_b), atol=0.1):
+        return False
+    if check_materials:
+        if not np.array_equal(_mesh_mat_indices(mesh_a), _mesh_mat_indices(mesh_b)):
+            return False
+        names_a = [m.name if m else "" for m in mesh_a.materials]
+        names_b = [m.name if m else "" for m in mesh_b.materials]
+        if names_a != names_b:
+            return False
+    return True
+
+
+def _uv_matches(mesh_a, mesh_b, atol=1e-5):
+    """Same UV layer names and values.  Used ONLY for adopting an alive
+    datablock: re-attaching to a mesh with a different (old) unwrap would
+    resurrect it; between chunks of one container UV is never compared -
+    they link and the container's unwrap wins by design."""
+    names_a = [l.name for l in mesh_a.uv_layers]
+    names_b = [l.name for l in mesh_b.uv_layers]
+    if names_a != names_b:
+        return False
+    for la, lb in zip(mesh_a.uv_layers, mesh_b.uv_layers):
+        na, nb = len(la.data), len(lb.data)
+        if na != nb:
+            return False
+        if na == 0:
+            continue
+        ua = np.zeros(na * 2, dtype=np.float32)
+        la.data.foreach_get("uv", ua)
+        ub = np.zeros(nb * 2, dtype=np.float32)
+        lb.data.foreach_get("uv", ub)
+        if not np.allclose(ua, ub, atol=atol):
+            return False
+    return True
+
+
+def _link_to_collections(obj, names, context, fallback_collections):
+    linked = False
+    for name in names:
+        coll = context.scene.collection if name == SCENE_ROOT else bpy.data.collections.get(name)
+        if coll is not None:
+            try:
+                coll.objects.link(obj)
+                linked = True
+            except RuntimeError:
+                pass  # already linked
+    if not linked:
+        for coll in fallback_collections:
+            try:
+                coll.objects.link(obj)
+                linked = True
+            except RuntimeError:
+                pass
+        if not linked:
+            context.scene.collection.objects.link(obj)
+
+
+def _extract_instances(op, context, container, target_ids):
+    """Core disassembly: pull the given instance ids out of the container.
+    Returns the list of created objects or None on error."""
+    table = read_table(container)
+    if table is None:
+        agr_report(op, 'ERROR', "❌ AGR Link: активный объект — не контейнер AGR Link")
+        return None
+    if container.modifiers:
+        agr_report(op, 'ERROR',
+                   "❌ AGR Link: на контейнере есть модификаторы — примените или удалите "
+                   "их перед разборкой")
+        return None
+    if container.data.shape_keys:
+        agr_report(op, 'ERROR', "❌ AGR Link: на контейнере есть shape keys — разборка невозможна")
+        return None
+
+    mesh = container.data
+    # A linked duplicate of the container (Alt+D) shares this datablock;
+    # pruning it in place would silently empty the twin - mirror the join
+    # path's single-user policy.
+    real_users = mesh.users - (1 if mesh.use_fake_user else 0)
+    if real_users > 1:
+        mesh = mesh.copy()
+        container.data = mesh
+
+    # container came through FBX: generic attributes are gone, but the color
+    # mirror survived - rebuild the internal attributes from it, and
+    # materialise the idprop table when it was decoded from colors
+    if mesh.attributes.get(ATTR_NAME) is None:
+        _unpack_tracking_from_colors(mesh, table)
+    if not isinstance(container.get(PROP_KEY), str):
+        write_table(container, table)
+
+    face_ids = _read_face_ids(mesh)
+    if face_ids is None:
+        agr_report(op, 'ERROR', f"❌ AGR Link: на контейнере нет атрибута {ATTR_NAME}")
+        return None
+
+    target_ids = {int(i) for i in target_ids if str(i) in table["instances"]}
+    if not target_ids:
+        agr_report(op, 'ERROR', "❌ AGR Link: нечего разбирать (экземпляры не найдены в таблице)")
+        return None
+
+    available = set(np.unique(face_ids).tolist())
+    missing = sorted(target_ids - available)
+    extract = sorted(target_ids & available)
+
+    c_mat = container.matrix_world.copy()
+    fallback_colls = list(container.users_collection)
+
+    # Free the container's name so a restored instance with the same name
+    # does not get a ".001" suffix while the soon-to-die husk still holds it.
+    original_container_name = container.name
+    container.name = original_container_name + ".__agr_link_tmp"
+    container_deleted = False
+    container_final_name = original_container_name
+
+    mirror_failed = False
+    try:
+        created = []  # (obj, entry, matrix_rel, group_id)
+        done_ids = []
+        skipped_singular = 0
+        face_count_changed = 0
+        for iid in extract:
+            entry = table["instances"][str(iid)]
+            m_rel = Matrix(entry["matrix_rel"])
+            stored_faces = entry.get("faces")
+            if stored_faces is not None:
+                if int(np.count_nonzero(face_ids == iid)) != stored_faces:
+                    face_count_changed += 1
+
+            new_mesh = mesh.copy()
+            _prune_mesh_to_faces(new_mesh, lambda v, _iid=iid: v == _iid)
+
+            # Primary path: recover the frame from the stored per-vertex
+            # original coords (robust to container Apply Transform / Set
+            # Origin / whole-piece edit-mode moves / FBX matrix rebuilds).
+            # Legacy containers fall back to the matrix path.
+            frame = _solve_instance_frame(new_mesh,
+                                          extra_tol=float(table.get("co_quant", 0.0)))
+            _remove_tracking_attrs(new_mesh)
+            if frame is None:
+                if abs(m_rel.determinant()) < 1e-12:
+                    # non-invertible stored matrix and no coord attributes -
+                    # keep the instance's faces and table entry
+                    bpy.data.meshes.remove(new_mesh)
+                    skipped_singular += 1
+                    continue
+                frame = m_rel
+                # Self-inverse also for mirrored (negative determinant)
+                # instances: join bakes M without flipping the winding, M⁻¹
+                # restores the original orientation exactly (verified on 5.2)
+                new_mesh.transform(m_rel.inverted())
+            _restore_materials(new_mesh)
+
+            obj = bpy.data.objects.new(entry["name"], new_mesh)
+            _link_to_collections(obj, entry.get("collections", []), context, fallback_colls)
+            for key, value in entry.get("props", {}).items():
+                obj[key] = value
+            created.append((obj, entry, frame, entry.get("group", 0)))
+            done_ids.append(iid)
+
+        # Second pass: parents.  Resolution order matters: (1) the batch
+        # itself, by ORIGINAL entry name; (2) the surviving container when
+        # the parent name is the container's real name (it is parked under
+        # .__agr_link_tmp right now, so a bare name lookup would miss it);
+        # (3) the scene by name.
+        created_by_name = {}
+        for obj, entry, m_rel, gid in created:
+            created_by_name.setdefault(entry["name"], obj)
+        container_survives = len(table["instances"]) > len(done_ids)
+        for obj, entry, m_rel, gid in created:
+            parent_name = entry.get("parent")
+            if parent_name:
+                parent = created_by_name.get(parent_name)
+                if (parent is None and container_survives
+                        and parent_name == original_container_name):
+                    parent = container
+                if parent is None:
+                    parent = bpy.data.objects.get(parent_name)
+                if parent is not None:
+                    obj.parent = parent
+                    obj.parent_type = entry.get("parent_type", 'OBJECT')
+                    if obj.parent_type == 'BONE':
+                        obj.parent_bone = entry.get("parent_bone", "")
+                    elif obj.parent_type in {'VERTEX', 'VERTEX_3'}:
+                        pv = entry.get("parent_vertices") or []
+                        for i, v in enumerate(pv[:3]):
+                            obj.parent_vertices[i] = v
+                    obj.matrix_parent_inverse = Matrix(entry["matrix_parent_inverse"])
+
+        # Third pass: world matrices, PARENTS FIRST.  matrix_world assignment
+        # solves the local basis against the parent's CURRENT transform, so a
+        # child placed before its in-batch parent would end up at
+        # parent_world @ target (verified on 5.2).
+        context.view_layer.update()
+        unplaced = {obj: m_rel for obj, entry, m_rel, gid in created}
+        while unplaced:
+            progressed = False
+            for obj in list(unplaced.keys()):
+                parent = obj.parent
+                if parent is not None and parent in unplaced:
+                    continue
+                obj.matrix_world = c_mat @ unplaced.pop(obj)
+                progressed = True
+            if not progressed:  # parent cycle - place the rest as-is
+                for obj in list(unplaced.keys()):
+                    obj.matrix_world = c_mat @ unplaced.pop(obj)
+
+        # Fourth pass: re-link identical geometry of each group to one datablock
+        unlinked_edited = 0
+        by_group = {}
+        for obj, entry, m_rel, gid in created:
+            by_group.setdefault(gid, []).append((obj, m_rel))
+        new_meshes = {obj.data for obj, *_ in created}
+        for gid, members in by_group.items():
+            ginfo = table["groups"].get(str(gid), {})
+            member_objs = [o for o, _m in members]
+            data_name = ginfo.get("data_name", member_objs[0].data.name)
+            # float32 noise budget grows with container-relative offset;
+            # after an FBX roundtrip the 16-bit quantisation step dominates
+            extra_atol = max(max(m.translation.length for _o, m in members) * 5e-6,
+                             float(table.get("co_quant", 0.0)))
+
+            target = None
+            alive = bpy.data.meshes.get(data_name)
+            alive_ok = (alive is not None and alive is not mesh
+                        and alive not in new_meshes)
+            if alive_ok and alive.attributes.get(ATTR_NAME) is not None and alive.users > 0:
+                # a LIVE container's mesh elsewhere (e.g. the twin after
+                # Alt+D) - adopting it would strip its tracking attribute
+                alive_ok = False
+            # FULL test including materials AND UV: chunks carry the
+            # CONTAINER's materials/unwrap, so an alive datablock with
+            # different slots or an old unwrap must not be adopted (the
+            # group then links onto itself instead)
+            if alive_ok and _geometry_matches(member_objs[0].data, alive,
+                                              check_materials=True,
+                                              extra_atol=extra_atol) \
+                    and _uv_matches(member_objs[0].data, alive):
+                # copies of this group still live in the file - re-attach
+                target = alive
+                _remove_tracking_attrs(target)
+            if target is None:
+                target = member_objs[0].data
+                target.name = data_name
+
+            for member in member_objs:
+                if member.data == target:
+                    continue
+                if _geometry_matches(member.data, target, extra_atol=extra_atol):
+                    old = member.data
+                    member.data = target
+                    bpy.data.meshes.remove(old)
+                else:
+                    unlinked_edited += 1
+
+        # --- shrink the container (keep untracked loose geometry, as the
+        # join-time warning promises)
+        done_set = set(done_ids)
+        faces_left, verts_left = _prune_mesh_to_faces(
+            mesh, lambda v: v not in done_set, keep_preexisting_loose=True)
+
+        for iid in done_ids:
+            table["instances"].pop(str(iid), None)
+        used_groups = {inst.get("group", 0) for inst in table["instances"].values()}
+        for gid in list(table["groups"].keys()):
+            if int(gid) not in used_groups:
+                del table["groups"][gid]
+
+        container_renamed = False
+        if table["instances"]:
+            # idprop first, then refresh the color mirror (it went stale)
+            write_table(container, table)
+            try:
+                mirror_failed = not _pack_tracking_to_colors(mesh, table)
+            except Exception:
+                _remove_color_mirror(mesh)
+                mirror_failed = True
+            if not mirror_failed:
+                write_table(container, table)
+            container.name = original_container_name
+            container_final_name = container.name
+            container_renamed = container.name != original_container_name
+        else:
+            if verts_left == 0:
+                husk_mesh = container.data
+                # hand the container's children over to the restored namesake
+                # instance (or unparent), preserving world transforms - else
+                # deleting the container would snap them to wrong positions
+                replacement = created_by_name.get(original_container_name)
+                for child in list(container.children):
+                    world = child.matrix_world.copy()
+                    child.parent = replacement
+                    child.matrix_world = world
+                bpy.data.objects.remove(container, do_unlink=True)
+                if husk_mesh.users == 0:
+                    bpy.data.meshes.remove(husk_mesh)
+                container_deleted = True
+            else:
+                # untracked leftovers (loose geometry / foreign Ctrl+J faces):
+                # never delete silently
+                container.name = original_container_name + "_leftover"
+                container_final_name = container.name
+                del container[PROP_KEY]
+                _remove_tracking_attrs(mesh)
+                agr_report(op, 'WARNING',
+                           f"⚠️ AGR Link: в '{container.name}' остались непомеченные "
+                           f"вершины ({verts_left}) — контейнер сохранён")
+    except Exception as exc:
+        if not container_deleted:
+            try:
+                container.name = original_container_name
+            except ReferenceError:
+                pass
+        agr_report(op, 'ERROR', f"❌ AGR Link: сбой разборки: {exc}")
+        return None
+
+    # selection: restored objects selected, first reachable one active
+    for o in context.selected_objects:
+        o.select_set(False)
+    for obj, *_ in created:
+        try:
+            obj.select_set(True)
+        except RuntimeError:
+            pass  # restored into a collection excluded from this view layer
+    for obj, *_ in created:
+        try:
+            context.view_layer.objects.active = obj
+            break
+        except RuntimeError:
+            continue
+
+    renamed = [obj.name for obj, entry, *_ in created if obj.name != entry["name"]]
+    warn_bits = []
+    if missing:
+        warn_bits.append(f"без граней (пропущены, записи сохранены): {len(missing)}")
+    if skipped_singular:
+        warn_bits.append(f"необратимая матрица (пропущены): {skipped_singular}")
+    if face_count_changed:
+        warn_bits.append(f"изменилось число граней (правки или сторонний Ctrl+J): {face_count_changed}")
+    if unlinked_edited:
+        warn_bits.append(f"правленых копий оставлено уникальными: {unlinked_edited}")
+    if renamed:
+        warn_bits.append("имена заняты, переименованы: " + ", ".join(renamed[:3]))
+    if mirror_failed:
+        warn_bits.append("цветовое зеркало контейнера не обновлено (FBX-перенос недоступен)")
+    if not container_deleted and container_final_name != original_container_name \
+            and not container_final_name.endswith("_leftover"):
+        warn_bits.append(f"контейнер переименован: {container_final_name}")
+    level = 'WARNING' if warn_bits else 'INFO'
+    icon = "⚠️" if warn_bits else "✅"
+    msg = f"{icon} AGR Link: восстановлено {len(created)} объектов"
+    if warn_bits:
+        msg += " (" + "; ".join(warn_bits) + ")"
+    agr_report(op, level, msg)
+    return [obj for obj, *_ in created]
+
+
+class AGR_OT_link_extract_group(Operator):
+    """Разобрать из контейнера одну группу линков (или один объект):
+восстановить исходные объекты с их именами, позициями и линкованностью"""
+    bl_idname = "agr.link_extract_group"
+    bl_label = "Разобрать группу"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    group_id: IntProperty(name="Group ID", default=0)
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and is_container(context.active_object)
+
+    def execute(self, context):
+        container = context.active_object
+        table = read_table(container)
+        if table is None:
+            agr_report(self, 'ERROR', "❌ AGR Link: таблица контейнера не читается (данные повреждены)")
+            return {'CANCELLED'}
+        ids = [int(iid) for iid, inst in table["instances"].items()
+               if inst.get("group", 0) == self.group_id]
+        if not ids:
+            agr_report(self, 'ERROR', "❌ AGR Link: группа не найдена в контейнере")
+            return {'CANCELLED'}
+        result = _extract_instances(self, context, container, ids)
+        return {'FINISHED'} if result is not None else {'CANCELLED'}
+
+
+class AGR_OT_link_separate_all(Operator):
+    """Разобрать контейнер полностью: восстановить ВСЕ исходные объекты
+с их именами, позициями, коллекциями и линкованностью"""
+    bl_idname = "agr.link_separate_all"
+    bl_label = "Разобрать всё"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and is_container(context.active_object)
+
+    def execute(self, context):
+        container = context.active_object
+        table = read_table(container)
+        if table is None:
+            agr_report(self, 'ERROR', "❌ AGR Link: таблица контейнера не читается (данные повреждены)")
+            return {'CANCELLED'}
+        ids = [int(iid) for iid in table["instances"].keys()]
+        result = _extract_instances(self, context, container, ids)
+        return {'FINISHED'} if result is not None else {'CANCELLED'}
+
+
+# ----------------------------------------------------------------------------
+# Strip memory (clean delivery)
+# ----------------------------------------------------------------------------
+
+class AGR_OT_link_strip(Operator):
+    """Удалить память AGR Link с выделенных контейнеров (для полностью
+чистой сдачи): таблица, служебные атрибуты и color attributes.
+Разборка после этого станет НЕВОЗМОЖНА"""
+    bl_idname = "agr.link_strip"
+    bl_label = "Удалить память (сдача)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'OBJECT'
+                and any(o.type == 'MESH' and is_container(o)
+                        for o in context.selected_objects))
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        count = 0
+        for obj in context.selected_objects:
+            if obj.type != 'MESH' or read_table(obj) is None:
+                continue
+            # colors-only container (fresh FBX import) has no idprop - pop, not del
+            obj.pop(PROP_KEY, None)
+            _remove_tracking_attrs(obj.data)
+            _TABLE_CACHE.pop(obj.name, None)
+            count += 1
+        agr_report(self, 'INFO', f"✅ AGR Link: память удалена у {count} объектов — разборка невозможна")
+        return {'FINISHED'}
+
+
+# ----------------------------------------------------------------------------
+# Panel
+# ----------------------------------------------------------------------------
+
+class AGR_PT_LinkPanel(Panel):
+    bl_label = "AGR Link"
+    bl_idname = "AGR_PT_link_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'AGR Tools'
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 50  # after AGR UV (40), before AGR Share (100)
+
+    def draw(self, context):
+        layout = self.layout
+
+        meshes = [o for o in context.selected_objects if o.type == 'MESH']
+        groups = {o.data for o in meshes}
+        col = layout.column(align=True)
+        col.operator("agr.link_join", icon='OBJECT_DATAMODE')
+        if meshes:
+            col.label(text=f"Выбрано: {len(meshes)} мешей, {len(groups)} групп данных")
+
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            return
+        table = _peek_table(obj)
+        if table is None:
+            layout.label(text="Активный объект — не контейнер", icon='INFO')
+            return
+
+        instances = table.get("instances", {})
+        by_group = {}
+        for inst in instances.values():
+            by_group.setdefault(inst.get("group", 0), []).append(inst)
+        n_groups = len(by_group)
+
+        layout.separator()
+        layout.label(text=f"Контейнер: {len(instances)} объектов, {n_groups} групп",
+                     icon='PACKAGE')
+
+        def group_label(gid, members):
+            if len(members) > 1:
+                data_name = table.get("groups", {}).get(str(gid), {}).get("data_name", "?")
+                return f"{data_name} · {len(members)} шт.", 'LINKED'
+            return members[0].get("name", "?"), 'OBJECT_DATA'
+
+        box = layout.column(align=True)
+        for gid in sorted(by_group.keys(), key=lambda g: group_label(g, by_group[g])[0]):
+            members = by_group[gid]
+            text, icon = group_label(gid, members)
+            row = box.row(align=True)
+            row.label(text=text, icon=icon)
+            op = row.operator("agr.link_extract_group", text="", icon='EXPORT')
+            op.group_id = gid
+
+        layout.operator("agr.link_separate_all", icon='OUTLINER_OB_GROUP_INSTANCE')
+        layout.operator("agr.link_strip", icon='TRASH')
+
+
+# ----------------------------------------------------------------------------
+# Registration
+# ----------------------------------------------------------------------------
+
+classes = (
+    AGR_OT_link_join,
+    AGR_OT_link_extract_group,
+    AGR_OT_link_separate_all,
+    AGR_OT_link_strip,
+    AGR_PT_LinkPanel,
+)
+
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    print("✅ AGR Link operators registered")
+
+
+def unregister():
+    _TABLE_CACHE.clear()
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)

@@ -6,10 +6,10 @@ Author: computer_invader
 bl_info = {
     "name": "AGR Tools",
     "author": "computer_invader",
-    "version": (2, 4, 0),
+    "version": (2, 5, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > AGR Tools",
-    "description": "Texture baking, atlas creation, UDIM workflows, grid UV mapping, asset renaming, lights, sync and team tools",
+    "description": "Texture baking, atlas creation, UDIM workflows, grid UV mapping, linked-object join/restore, asset renaming, lights, sync and team tools",
     "category": "Object",
 }
 
