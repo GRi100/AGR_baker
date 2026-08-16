@@ -12,6 +12,7 @@ from bpy.types import Panel, UIList
 from bpy.props import BoolProperty
 
 from .log import LOG_PATH, STATUS_ICONS
+from .operators_atlas import calculate_multi_atlas_packing
 from .operators_rename import parse_sm_name, RENAME_ALLOWED_TYPES
 from .operators_udim import object_has_udim
 
@@ -209,6 +210,8 @@ class AGR_PT_MainPanel(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'AGR Tools'
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 0
 
     def draw(self, context):
         layout = self.layout
@@ -304,15 +307,15 @@ class AGR_PT_BakeConvertPanel(Panel):
 # ===== TEXTURE SETS =====
 
 class AGR_PT_TextureSetsPanel(Panel):
-    """Texture sets management panel (sub-panel of AGR Baker)"""
-    bl_label = "Texture Sets"
+    """Texture sets management panel (top-level tab; children keep pointing
+    at AGR_PT_texture_sets_panel, so the whole subtree moves with it)"""
+    bl_label = "AGR Texture Sets"
     bl_idname = "AGR_PT_texture_sets_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'AGR Tools'
-    bl_parent_id = "AGR_PT_main_panel"
     bl_options = {'DEFAULT_CLOSED'}
-    bl_order = 2
+    bl_order = 5  # after AGR Baker (0), before AGR Rename (10)
 
     def draw(self, context):
         layout = self.layout
@@ -556,6 +559,59 @@ class AGR_PT_DeleteOpsPanel(Panel):
         col.operator("agr.delete_selected_sets", text="Delete Selected Sets", icon='TRASH')
 
 
+def _ru_plural(n, one, few, many):
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
+        return few
+    return many
+
+
+# Forecast for the Atlas Ops panel: how many atlases Create Multi-Atlas
+# would produce for the active object.  draw() runs on every redraw, so the
+# packing is cached by a cheap fingerprint (object, atlas size, matched sets).
+_ATLAS_FORECAST_CACHE = {}
+
+
+def _multi_atlas_forecast(context):
+    """(bins, n_sets, missing, oversize) for the active object, or None."""
+    obj = context.active_object
+    if obj is None or obj.type != 'MESH' or not obj.material_slots:
+        return None
+    mats = []
+    for slot in obj.material_slots:
+        if slot.material and slot.material.name not in mats:
+            mats.append(slot.material.name)
+    if not mats:
+        return None
+    atlas_size = int(context.scene.agr_baker_settings.atlas_size)
+    sets = []
+    fp = []
+    missing = 0
+    for name in mats:
+        ts = next((t for t in context.scene.agr_texture_sets
+                   if t.material_name == name and not t.is_atlas), None)
+        if ts is None:
+            missing += 1
+        else:
+            sets.append(ts)
+            fp.append((ts.name, ts.resolution))
+    fingerprint = (obj.name, atlas_size, tuple(fp), missing)
+    cached = _ATLAS_FORECAST_CACHE.get("forecast")
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    oversize = sum(1 for ts in sets if ts.resolution > atlas_size)
+    bins = 0
+    if sets and not oversize:
+        try:
+            bins = len(calculate_multi_atlas_packing(sets, atlas_size))
+        except Exception:
+            bins = 0  # draw() must never traceback
+    info = (bins, len(sets), missing, oversize)
+    _ATLAS_FORECAST_CACHE["forecast"] = (fingerprint, info)
+    return info
+
+
 class AGR_PT_AtlasOpsPanel(Panel):
     """Atlas creation / application"""
     bl_label = "Atlas Operations"
@@ -573,10 +629,21 @@ class AGR_PT_AtlasOpsPanel(Panel):
 
         layout.prop(settings, "atlas_size", text="Atlas Size")
 
+        # Forecast: how many atlases the (multi) create operator will produce
+        forecast = _multi_atlas_forecast(context)
+        if forecast is not None:
+            bins, n_sets, missing, oversize = forecast
+            if oversize:
+                layout.label(text=f"Сетов крупнее атласа: {oversize}", icon='ERROR')
+            elif bins:
+                word = _ru_plural(bins, "атлас", "атласа", "атласов")
+                layout.label(text=f"Получится {bins} {word} (сетов: {n_sets})", icon='INFO')
+            if missing:
+                layout.label(text=f"Материалов без texture set: {missing}", icon='ERROR')
+
         # Poll() greys unavailable buttons and puts the reason in the tooltip
         col = layout.column(align=True)
         col.operator("agr.preview_atlas_layout_from_object", text="Preview Atlas from Object", icon='HIDE_OFF')
-        col.operator("agr.create_atlas_from_object", text="Create Atlas from Object", icon='OBJECT_DATA')
         col.operator("agr.create_multi_atlas_from_object", text="Create Multi-Atlas from Object", icon='IMGDISPLAY')
 
         col = layout.column(align=True)
@@ -672,11 +739,6 @@ class AGR_PT_SettingsPanel(Panel):
         else:
             col.label(text="Save blend file to see path", icon='ERROR')
 
-        layout.separator()
-        col = layout.column(align=True)
-        col.label(text="Maintenance", icon='TOOL_SETTINGS')
-        col.prop(settings, "auto_strip_alpha")
-
 
 # ===== AGR RENAME =====
 
@@ -688,15 +750,18 @@ class AGR_PT_RenamePanel(Panel):
     bl_region_type = 'UI'
     bl_category = 'AGR Tools'
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 10
 
     def draw(self, context):
         layout = self.layout
         scene = context.scene
 
-        # Address input
+        # Address input (+ autofill from the NNNN_Address lowpoly collection)
         col = layout.column(align=True)
         col.label(text="Settings", icon='SETTINGS')
-        col.prop(scene, "agr_rename_address", text="Address")
+        row = col.row(align=True)
+        row.prop(scene, "agr_rename_address", text="Address")
+        row.operator("agr.rename_autofill_address", text="", icon='EYEDROPPER')
         col.prop(scene, "agr_rp_project_lowpoly_number", text="Lowpoly Number")
 
         layout.separator()
@@ -816,6 +881,7 @@ class AGR_PT_JsonPanel(Panel):
     bl_region_type = 'UI'
     bl_category = 'AGR Tools'
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 15
 
     def draw(self, context):
         layout = self.layout

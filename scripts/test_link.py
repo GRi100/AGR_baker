@@ -606,7 +606,7 @@ check("incr: all restored linked",
 check("incr: A3 matrix", mat_close(restored["A3"].matrix_world, orig["A3"]))
 
 # ---------------------------------------------------------------------------
-print("\n=== 20. Foreign plain Ctrl+J of two containers -> honest warning ===")
+print("\n=== 20. Plain Ctrl+J of two containers -> absorbed, full restore ===")
 reset_scene()
 mesh_a = make_cube_mesh("MeshA")
 mesh_b = make_cube_mesh("MeshB")
@@ -614,6 +614,7 @@ a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
 a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
 b1 = add_obj("B1", mesh_b, TRS((0, 5, 0)))
 b2 = add_obj("B2", mesh_b, TRS((3, 5, 0)))
+orig20 = {o.name: o.matrix_world.copy() for o in (a1, a2, b1, b2)}
 select_only([a1, a2], a1)
 bpy.ops.agr.link_join()
 c_a = bpy.data.objects.get("A1")
@@ -621,13 +622,25 @@ select_only([b1, b2], b1)
 bpy.ops.agr.link_join()
 c_b = bpy.data.objects.get("B1")
 select_only([c_a, c_b], c_a)
-bpy.ops.object.join()  # PLAIN join outside the addon - ids collide
+bpy.ops.object.join()  # PLAIN join outside the addon - absorbed via windows
+tbl20, extra20 = linkmod._peek_merged(c_a)
+check("foreign: peek sees the merged view", tbl20 is not None
+      and len(tbl20["instances"]) == 4, str(extra20))
+check("foreign: one foreign window reported", extra20 == 1)
 select_only([c_a], c_a)
-check("foreign: separate still FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
-wm = bpy.context.window_manager
-check("foreign: warning fired", wm.agr_last_status_level == 'WARNING')
-check("foreign: face-count mismatch named", "число граней" in wm.agr_last_status,
-      wm.agr_last_status)
+check("foreign: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+check("foreign: all 4 restored", {o.name for o in bpy.data.objects}
+      == {"A1", "A2", "B1", "B2"}, str(sorted(o.name for o in bpy.data.objects)))
+check("foreign: positions exact",
+      all(mat_close(bpy.data.objects[n].matrix_world, orig20[n]) for n in orig20))
+check("foreign: A group linked",
+      bpy.data.objects["A1"].data == bpy.data.objects["A2"].data)
+check("foreign: B group linked",
+      bpy.data.objects["B1"].data == bpy.data.objects["B2"].data)
+check("foreign: groups distinct",
+      bpy.data.objects["A1"].data != bpy.data.objects["B1"].data)
+check("foreign: local coords intact",
+      all(local_coords_match(bpy.data.objects[n]) for n in orig20))
 
 # ---------------------------------------------------------------------------
 print("\n=== 21. Renamed material: re-link still works, no phantom slot ===")
@@ -1036,6 +1049,277 @@ check("pwin: parent handed over to restored Par",
       chi_r.parent == par_r and par_r is not None)
 check("pwin: Chi world kept through handover", mat_close(chi_r.matrix_world, orig["Chi"]))
 check("pwin: Par matrix restored", mat_close(par_r.matrix_world, orig["Par"]))
+
+# ---------------------------------------------------------------------------
+print("\n=== 35. Plain Ctrl+J: container INTO a plain object (plain active) ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0), rot=(0, 0, 45)))
+d1 = add_obj("D1", make_cube_mesh("MeshD"), TRS((0, 5, 0), scale=(1, 2, 1)))
+orig = {o.name: o.matrix_world.copy() for o in (a1, a2, d1)}
+select_only([a1, a2], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects.get("A1")
+select_only([cont, d1], d1)          # PLAIN object is the ACTIVE one
+bpy.ops.object.join()                # the old idprop dies with the container
+merged_obj = bpy.data.objects.get("D1")
+check("absorb: idprop is gone", merged_obj.get(KEY) is None)
+check("absorb: still a container (colors)", linkmod.is_container(merged_obj))
+tbl, extra = linkmod._peek_merged(merged_obj)
+check("absorb: view has 3 instances (A1, A2, D1)",
+      tbl is not None and len(tbl["instances"]) == 3,
+      str(len(tbl["instances"])) if tbl else "-")
+check("absorb: D1 registered as an instance",
+      tbl is not None and any(i["name"] == "D1" for i in tbl["instances"].values()))
+select_only([merged_obj], merged_obj)
+check("absorb: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+names = {o.name for o in bpy.data.objects}
+check("absorb: all three restored (no _leftover)", names == {"A1", "A2", "D1"}, str(names))
+check("absorb: positions exact",
+      all(mat_close(bpy.data.objects[n].matrix_world, orig[n]) for n in orig))
+check("absorb: A group linked again",
+      bpy.data.objects["A1"].data == bpy.data.objects["A2"].data)
+check("absorb: local coords intact",
+      all(local_coords_match(bpy.data.objects[n]) for n in ("A1", "A2", "D1")))
+
+# ---------------------------------------------------------------------------
+print("\n=== 36. Plain Ctrl+J merges SHARED link groups (same datablock) ===")
+reset_scene()
+mesh_x = make_cube_mesh("MeshX")
+x1 = add_obj("X1", mesh_x, TRS((0, 0, 0)))
+x2 = add_obj("X2", mesh_x, TRS((3, 0, 0)))
+x3 = add_obj("X3", mesh_x, TRS((0, 5, 0)))
+x4 = add_obj("X4", mesh_x, TRS((3, 5, 0)))
+orig = {o.name: o.matrix_world.copy() for o in (x1, x2, x3, x4)}
+select_only([x1, x2], x1)
+bpy.ops.agr.link_join()
+c1 = bpy.data.objects.get("X1")
+select_only([x3, x4], x3)
+bpy.ops.agr.link_join()
+c2 = bpy.data.objects.get("X3")
+select_only([c1, c2], c1)
+bpy.ops.object.join()
+select_only([c1], c1)
+check("groupmerge: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("groupmerge: all four restored", set(restored) == {"X1", "X2", "X3", "X4"})
+check("groupmerge: ONE shared datablock for all four",
+      len({restored[n].data for n in restored}) == 1)
+check("groupmerge: positions exact",
+      all(mat_close(restored[n].matrix_world, orig[n]) for n in orig))
+
+# ---------------------------------------------------------------------------
+print("\n=== 37. Chained plain Ctrl+J: three containers, three windows ===")
+reset_scene()
+conts = []
+orig = {}
+for tag, y in (("A", 0), ("B", 5), ("C", 10)):
+    mesh_t = make_cube_mesh(f"Mesh{tag}")
+    o1 = add_obj(f"{tag}1", mesh_t, TRS((0, y, 0)))
+    o2 = add_obj(f"{tag}2", mesh_t, TRS((3, y, 0)))
+    orig[o1.name] = o1.matrix_world.copy()
+    orig[o2.name] = o2.matrix_world.copy()
+    select_only([o1, o2], o1)
+    bpy.ops.agr.link_join()
+    conts.append(bpy.data.objects.get(f"{tag}1"))
+select_only([conts[0], conts[1]], conts[0])
+bpy.ops.object.join()                       # A absorbs B's window
+select_only([conts[0], conts[2]], conts[0])
+bpy.ops.object.join()                       # then C's window on top
+tbl, extra = linkmod._peek_merged(conts[0])
+check("chain: both foreign windows visible", extra == 2, str(extra))
+check("chain: six instances in the view", tbl is not None and len(tbl["instances"]) == 6)
+select_only([conts[0]], conts[0])
+check("chain: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("chain: all six restored", set(restored) == set(orig), str(set(restored)))
+check("chain: positions exact",
+      all(mat_close(restored[n].matrix_world, orig[n]) for n in orig))
+for tag in ("A", "B", "C"):
+    check(f"chain: {tag} group linked",
+          restored[f"{tag}1"].data == restored[f"{tag}2"].data)
+
+# ---------------------------------------------------------------------------
+print("\n=== 38. link_join right after a plain Ctrl+J absorbs the windows ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+mesh_b = make_cube_mesh("MeshB")
+b1 = add_obj("B1", mesh_b, TRS((0, 5, 0)))
+b2 = add_obj("B2", mesh_b, TRS((3, 5, 0)))
+e1 = add_obj("E1", make_cube_mesh("MeshE"), TRS((0, 10, 0)))
+orig = {o.name: o.matrix_world.copy() for o in (a1, a2, b1, b2, e1)}
+select_only([a1, a2], a1)
+bpy.ops.agr.link_join()
+c_a = bpy.data.objects.get("A1")
+select_only([b1, b2], b1)
+bpy.ops.agr.link_join()
+c_b = bpy.data.objects.get("B1")
+select_only([c_a, c_b], c_a)
+bpy.ops.object.join()                       # plain join first
+select_only([bpy.data.objects["A1"], e1], bpy.data.objects["A1"])
+check("joinafter: link_join FINISHED", bpy.ops.agr.link_join() == {'FINISHED'})
+cont = next(o for o in bpy.data.objects if linkmod.is_container(o))
+table = linkmod.read_table(cont)
+check("joinafter: five instances tracked", len(table["instances"]) == 5,
+      str(len(table["instances"])))
+check("joinafter: no stale matrices left",
+      not any(i.get("matrix_stale") for i in table["instances"].values()))
+select_only([cont], cont)
+check("joinafter: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("joinafter: all five restored", set(restored) == set(orig), str(set(restored)))
+check("joinafter: positions exact",
+      all(mat_close(restored[n].matrix_world, orig[n]) for n in orig))
+check("joinafter: A linked", restored["A1"].data == restored["A2"].data)
+check("joinafter: B linked", restored["B1"].data == restored["B2"].data)
+
+# ---------------------------------------------------------------------------
+print("\n=== 39. FBX roundtrip AFTER a plain Ctrl+J (windows survive export) ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0), rot=(0, 0, 30)))
+d1 = add_obj("D1", make_cube_mesh("MeshD"), TRS((0, 5, 0)))
+orig = {o.name: o.matrix_world.copy() for o in (a1, a2, d1)}
+select_only([a1, a2], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects.get("A1")
+select_only([cont, d1], d1)
+bpy.ops.object.join()                       # plain join, NO reconcile before export
+merged_obj = bpy.data.objects.get("D1")
+fbx5 = os.path.join(bpy.app.tempdir, "agr_link_absorb.fbx")
+select_only([merged_obj], merged_obj)
+bpy.ops.export_scene.fbx(filepath=fbx5, use_selection=True)
+reset_scene()
+bpy.ops.import_scene.fbx(filepath=fbx5)
+cont2 = next((o for o in bpy.data.objects
+              if o.type == 'MESH' and linkmod.is_container(o)), None)
+check("absorb-fbx: container recognised after import", cont2 is not None)
+tbl, _extra = linkmod._peek_merged(cont2)
+check("absorb-fbx: three instances in the view",
+      tbl is not None and len(tbl["instances"]) == 3)
+select_only([cont2], cont2)
+check("absorb-fbx: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects if o.type == 'MESH'}
+check("absorb-fbx: all three restored", set(restored) == {"A1", "A2", "D1"},
+      str(set(restored)))
+check("absorb-fbx: positions restored",
+      all(mat_close(restored[n].matrix_world, orig[n], tol=1e-3) for n in restored))
+check("absorb-fbx: A group linked", restored["A1"].data == restored["A2"].data)
+check("absorb-fbx: coords BIT-EXACT (per-window precise layer)",
+      all(local_coords_match(restored[n], tol=1e-7) for n in ("A1", "A2", "D1")))
+
+# ---------------------------------------------------------------------------
+print("\n=== 40. Absorption safety: idempotence + Alt+D twin of the merged mesh ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+d1 = add_obj("D1", make_cube_mesh("MeshD"), TRS((0, 5, 0)))
+select_only([a1, a2], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects.get("A1")
+select_only([cont, d1], d1)
+bpy.ops.object.join()
+merged_obj = bpy.data.objects.get("D1")
+# Alt+D twin BEFORE any AGR operator touches the merged mesh
+twin = merged_obj.copy()                      # linked duplicate (shares mesh)
+bpy.context.scene.collection.objects.link(twin)
+twin_mesh = twin.data
+st1 = linkmod._reconcile_container(bpy.context, merged_obj)
+check("idem: first reconcile materialised", st1 is not None)
+check("idem: reconcile made the mesh single-user (twin protected)",
+      merged_obj.data is not twin_mesh and twin.data is twin_mesh)
+st2 = linkmod._reconcile_container(bpy.context, merged_obj)
+check("idem: second reconcile is a no-op", st2 is None)
+tblm = linkmod.read_table(merged_obj)
+check("idem: materialised table has 3 instances",
+      isinstance(merged_obj.get(KEY), str) and tblm is not None
+      and len(tblm["instances"]) == 3)
+check("idem: twin still a container on its own",
+      linkmod.is_container(twin))
+select_only([merged_obj], merged_obj)
+check("idem: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+check("idem: twin survived the disassembly",
+      bpy.data.objects.get(twin.name) is not None
+      and len(twin.data.vertices) == len(twin_mesh.vertices))
+
+# ---------------------------------------------------------------------------
+print("\n=== 41. Destroyed foreign window degrades honestly (edit after Ctrl+J) ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+mesh_b = make_cube_mesh("MeshB")
+b1 = add_obj("B1", mesh_b, TRS((0, 5, 0)))
+b2 = add_obj("B2", mesh_b, TRS((3, 5, 0)))
+select_only([a1, a2], a1)
+bpy.ops.agr.link_join()
+c_a = bpy.data.objects.get("A1")
+select_only([b1, b2], b1)
+bpy.ops.agr.link_join()
+c_b = bpy.data.objects.get("B1")
+select_only([c_a, c_b], c_a)
+bpy.ops.object.join()
+# delete one face inside B's block: loops shift, B's window CRC dies
+import bmesh as _bmesh
+me = c_a.data
+bm = _bmesh.new()
+bm.from_mesh(me)
+bm.faces.ensure_lookup_table()
+_bmesh.ops.delete(bm, geom=[bm.faces[-1]], context='FACES')
+bm.to_mesh(me)
+bm.free()
+select_only([c_a], c_a)
+check("degrade: separate still FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+wm = bpy.context.window_manager
+check("degrade: warning fired", wm.agr_last_status_level == 'WARNING',
+      wm.agr_last_status)
+
+# ---------------------------------------------------------------------------
+print("\n=== 42. Plain tail AFTER a merged container (multi-layer window cut exactly) ===")
+# The v1 framing lost B's table here: its blob spans several layers and the
+# plain block after it gave no magic candidate, so the window overshot and
+# failed CRC.  v2 frames carry the carrier loop count - the cut is exact.
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+mesh_b = make_cube_mesh("MeshB")
+b1 = add_obj("B1", mesh_b, TRS((0, 5, 0)))
+b2 = add_obj("B2", mesh_b, TRS((3, 5, 0), rot=(0, 0, 30)))
+p1 = add_obj("P1", make_cube_mesh("MeshP"), TRS((0, 10, 0)))
+orig = {o.name: o.matrix_world.copy() for o in (a1, a2, b1, b2, p1)}
+select_only([a1, a2], a1)
+bpy.ops.agr.link_join()
+c_a = bpy.data.objects.get("A1")
+select_only([b1, b2], b1)
+bpy.ops.agr.link_join()
+c_b = bpy.data.objects.get("B1")
+select_only([c_a, c_b, p1], c_a)  # ONE plain Ctrl+J: [A][B][P] block order
+bpy.ops.object.join()
+tbl42, extra42 = linkmod._peek_merged(c_a)
+check("tail42: B's window survives the plain tail", extra42 == 1, str(extra42))
+check("tail42: all four instances in the view",
+      tbl42 is not None and len(tbl42["instances"]) == 4,
+      str(len(tbl42["instances"])) if tbl42 else "-")
+select_only([c_a], c_a)
+check("tail42: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+names42 = {o.name for o in bpy.data.objects}
+check("tail42: A and B fully restored",
+      {"A1", "A2", "B1", "B2"} <= names42, str(sorted(names42)))
+for n in ("A1", "A2", "B1", "B2"):
+    o = bpy.data.objects.get(n)
+    check(f"tail42: {n} matrix exact", o is not None and mat_close(o.matrix_world, orig[n]))
+    check(f"tail42: {n} geometry clean (8 verts)",
+          o is not None and len(o.data.vertices) == 8)
+check("tail42: B group linked",
+      bpy.data.objects["B1"].data == bpy.data.objects["B2"].data)
+check("tail42: foreign P kept as leftover (idprop semantics)",
+      any(n.endswith("_leftover") for n in names42), str(sorted(names42)))
 
 # ---------------------------------------------------------------------------
 print("\n" + "=" * 60)

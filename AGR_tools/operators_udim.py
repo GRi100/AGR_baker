@@ -12,6 +12,10 @@ import re
 import shutil
 from pathlib import Path
 
+from .core.udim_store import (UDIM_STORE, read_udim_record, write_udim_record,
+                              strip_udim_record)
+from .log import agr_report
+
 
 def process_object_name(obj_name):
     """Extract address and object type from SM_Address_Type format
@@ -119,6 +123,54 @@ def load_udim_mapping_json(udim_dir):
     except Exception as e:
         print(f"❌ Error loading UDIM mapping: {e}")
         return None
+
+
+def load_udim_mapping(obj, udim_dir, migrate=True):
+    """UDIM mapping for the object: per-object record first, the legacy
+    on-disk udim_mapping.json as a fallback (migrated onto the object on
+    first use).  NEVER call with migrate=True from draw()/poll()."""
+    record = read_udim_record(obj)
+    if record is not None:
+        return record
+    legacy = load_udim_mapping_json(str(udim_dir))
+    if legacy is not None and obj is not None and migrate:
+        if write_udim_record(obj, legacy):
+            print(f"📍 UDIM: legacy JSON mapping migrated onto '{obj.name}'")
+    return legacy
+
+
+def save_udim_mapping(obj, udim_dir, mapping):
+    """Store the mapping ON THE OBJECT (idprop + color mirror).  The
+    on-disk udim_mapping.json stays legacy: read as a fallback, never
+    written anymore (udim_dir is kept in the signature for symmetry)."""
+    return write_udim_record(obj, mapping)
+
+
+def find_udim_record_carrier(udim_dir, exclude=None):
+    """Object of this .blend carrying a UDIM record for the given tile
+    folder.  The folder is SHARED by every non-Main type of one address
+    (Ground/GroundEl/Flora all collapse into SM_<addr>_Ground), but the
+    record lives on whichever object created the UDIM — operators running
+    from a sibling object must find and update THAT record instead of
+    forking a second, diverging one.  Returns (obj, mapping) or (None,
+    None)."""
+    want = os.path.basename(str(udim_dir))
+    for other in bpy.data.objects:
+        if other is exclude or other.type != 'MESH':
+            continue
+        # O(1) gate: only true record carriers are read
+        if other.get(UDIM_STORE.prop_key) is None:
+            data = getattr(other, "data", None)
+            if data is None or data.attributes.get(UDIM_STORE.prefix + "0") is None:
+                continue
+        rec = read_udim_record(other)
+        if not rec:
+            continue
+        addr = rec.get("address")
+        otype = rec.get("obj_type", "Ground")
+        if addr and get_udim_directory_name(addr, otype) == want:
+            return other, rec
+    return None, None
 
 
 def find_udim_directory(address, obj_type, base_dir, use_main_dir=False):
@@ -765,8 +817,8 @@ class AGR_OT_CreateUDIM(Operator):
                     except Exception as e:
                         print(f"    ❌ Error copying {tex_type}: {e}")
         
-        # Save JSON mapping
-        save_udim_mapping_json(str(udim_dir), material_mapping)
+        # Save the mapping on the object (idprop + color mirror)
+        save_udim_mapping(obj, udim_dir, material_mapping)
         
         # Create texture nodes
         for tex_type, info in texture_info.items():
@@ -920,12 +972,22 @@ class AGR_OT_AddToUDIM(Operator):
                 self.report({'ERROR'}, f"UDIM directory not found for {address}")
                 return {'CANCELLED'}
             
-            # Load existing JSON mapping
-            mapping = load_udim_mapping_json(str(udim_dir))
-            
+            # Load existing mapping (object record, legacy JSON fallback)
+            mapping = load_udim_mapping(obj, udim_dir)
+            record_carrier = obj
+
             if not mapping:
-                self.report({'WARNING'}, "No JSON mapping found - sets will be added without JSON recording")
-                print("⚠️ No JSON mapping found - sets will be added without JSON recording")
+                # per-object records + a SHARED Ground folder: the record
+                # may live on a sibling object of the same address - update
+                # that one instead of forking a diverging copy
+                carrier, mapping = find_udim_record_carrier(udim_dir, exclude=obj)
+                if carrier is not None:
+                    record_carrier = carrier
+                    print(f"📍 UDIM mapping found on sibling object '{carrier.name}'")
+
+            if not mapping:
+                self.report({'WARNING'}, "No UDIM mapping found - sets will be added without recording")
+                print("⚠️ No UDIM mapping found - sets will be added without recording")
             
             # Get existing UDIM tiles
             existing_tiles = self.scan_existing_udim_tiles(udim_dir, mapping)
@@ -970,9 +1032,10 @@ class AGR_OT_AddToUDIM(Operator):
             
             print(f"Found {len(new_sets)} new texture sets to add")
             
-            # Add new sets to UDIM
+            # Add new sets to UDIM (the record goes to its actual carrier)
             added_count = self.add_sets_to_udim(
-                new_sets, udim_dir, address, obj_type, max_udim + 1, mapping
+                record_carrier, new_sets, udim_dir, address, obj_type,
+                max_udim + 1, mapping
             )
             
             if added_count == 0:
@@ -1085,8 +1148,8 @@ class AGR_OT_AddToUDIM(Operator):
         return texture_sets
 
     
-    def add_sets_to_udim(self, texture_sets, udim_dir, address, obj_type, start_udim, mapping):
-        """Add texture sets to UDIM folder and update JSON"""
+    def add_sets_to_udim(self, obj, texture_sets, udim_dir, address, obj_type, start_udim, mapping):
+        """Add texture sets to UDIM folder and update the object record"""
         added_count = 0
         new_tiles = []
         
@@ -1125,13 +1188,13 @@ class AGR_OT_AddToUDIM(Operator):
             if success:
                 added_count += 1
         
-        # Update JSON mapping if it exists
+        # Update the object record if a mapping exists
         if mapping and new_tiles:
             mapping['udim_tiles'].extend(new_tiles)
-            save_udim_mapping_json(str(udim_dir), mapping)
-            print(f"✅ Updated JSON mapping with {len(new_tiles)} new tiles")
+            save_udim_mapping(obj, udim_dir, mapping)
+            print(f"✅ Updated UDIM mapping with {len(new_tiles)} new tiles")
         elif new_tiles:
-            print(f"⚠️ No JSON mapping to update (added {len(new_tiles)} tiles without JSON)")
+            print(f"⚠️ No UDIM mapping to update (added {len(new_tiles)} tiles unrecorded)")
         
         return added_count
     
@@ -1208,9 +1271,9 @@ class AGR_OT_RevertUDIM(Operator):
                 self.report({'ERROR'}, "No UDIM tiles found in directory")
                 return {'CANCELLED'}
             
-            # Load JSON mapping
-            mapping = load_udim_mapping_json(str(udim_dir))
-            
+            # Load mapping (object record, legacy JSON fallback)
+            mapping = load_udim_mapping(obj, udim_dir)
+
             # Check if we need to show warning
             show_warning = False
             warning_lines = []
@@ -1319,9 +1382,9 @@ class AGR_OT_RevertUDIM(Operator):
                 self.report({'ERROR'}, "No UDIM tiles found")
                 return {'CANCELLED'}
             
-            # Load JSON mapping
-            mapping = load_udim_mapping_json(str(udim_dir))
-            
+            # Load mapping (object record, legacy JSON fallback)
+            mapping = load_udim_mapping(obj, udim_dir)
+
             result = {'CANCELLED'}
             
             if not mapping:
@@ -1344,8 +1407,11 @@ class AGR_OT_RevertUDIM(Operator):
                     result = self.revert_with_json(obj, mapping, udim_dir)
             
             # Clean up old UDIM material if revert was successful
-            if result == {'FINISHED'} and old_udim_material:
-                self.cleanup_udim_material(old_udim_material)
+            if result == {'FINISHED'}:
+                if old_udim_material:
+                    self.cleanup_udim_material(old_udim_material)
+                # UDIM disassembled - the per-object record is obsolete
+                strip_udim_record(obj)
             
             return result
             
@@ -1828,7 +1894,10 @@ def _resolve_udim_context(op, context):
         op.report({'ERROR'}, "No UDIM tiles found on disk")
         return None
 
-    mapping = load_udim_mapping_json(str(udim_dir))
+    # migrate=False: this runs from the HUD operators' invoke() (some are
+    # REGISTER-only, no UNDO) - merely OPENING a tile picker must not
+    # permanently write a record onto the mesh outside the undo stack
+    mapping = load_udim_mapping(obj, udim_dir, migrate=False)
     tile_to_material = {}
     if mapping:
         for tile_info in mapping.get('udim_tiles', []):
@@ -1867,6 +1936,7 @@ class AGR_OT_ConvertTileToSet(Operator, AGR_UDIMGridHUD):
 
         self._address = address
         self._agr_bake_dir = str(base_dir / _get_output_folder())
+        self._obj_name = context.active_object.name
         self._hud_start(context, udim_dir, tiles, tile_to_material,
                         "Кликните тайл — он будет извлечён в текстурный сет; Esc — выход")
         return {'RUNNING_MODAL'}
@@ -1901,7 +1971,7 @@ class AGR_OT_ConvertTileToSet(Operator, AGR_UDIMGridHUD):
                 return {'CANCELLED'}
 
             # Original set/material name from mapping, fallback to a generic one
-            mapping = load_udim_mapping_json(self._udim_dir)
+            mapping = load_udim_mapping(bpy.data.objects.get(self._obj_name), self._udim_dir)
             material_name = None
             if mapping:
                 for tile_info in mapping.get('udim_tiles', []):
@@ -1978,7 +2048,7 @@ class AGR_OT_ConvertTileToSet(Operator, AGR_UDIMGridHUD):
 
             # Refresh the sets list so the new set appears
             try:
-                bpy.ops.agr.refresh_texture_sets()
+                bpy.ops.agr.refresh_texture_sets(skip_alpha_strip=True)
             except Exception as e:
                 print(f"⚠️ Could not refresh texture sets: {e}")
 
@@ -2155,14 +2225,15 @@ class AGR_OT_UDIMLayoutEditor(Operator, AGR_UDIMGridHUD):
         print(f"📐 UDIM layout: shifted UVs of {moved} faces")
 
     def _update_mapping(self, changes):
-        mapping = load_udim_mapping_json(self._udim_dir)
+        obj = bpy.data.objects.get(self._obj_name)
+        mapping = load_udim_mapping(obj, self._udim_dir)
         if not mapping:
             return
         for tile_info in mapping.get('udim_tiles', []):
             old = tile_info.get('udim_number')
             if old in changes:
                 tile_info['udim_number'] = changes[old]
-        save_udim_mapping_json(self._udim_dir, mapping)
+        save_udim_mapping(obj, self._udim_dir, mapping)
 
     def _reload_images(self, obj):
         for slot in obj.material_slots:
@@ -2283,13 +2354,25 @@ class AGR_OT_ReplaceUDIMTile(Operator, AGR_UDIMGridHUD):
             self.report({'ERROR'}, "Не удалось заменить ни одной текстуры (нет подходящих файлов в сете)")
             return {'CANCELLED'}
 
-        # The tile now shows another material — record it in the mapping
-        mapping = load_udim_mapping_json(self._udim_dir)
-        if mapping:
+        # The tile now shows another material — record it in the mapping.
+        # The tile files are ALREADY replaced on disk at this point, so a
+        # lost record must be reported, never dropped silently.
+        obj_rec = bpy.data.objects.get(self._obj_name)
+        mapping = load_udim_mapping(obj_rec, self._udim_dir) if obj_rec else None
+        if not mapping:
+            obj_rec, mapping = find_udim_record_carrier(self._udim_dir)
+        if mapping is not None and obj_rec is not None:
             for tile_info in mapping.get('udim_tiles', []):
                 if tile_info.get('udim_number') == tile:
                     tile_info['material_name'] = self._set_material
-            save_udim_mapping_json(self._udim_dir, mapping)
+            if not save_udim_mapping(obj_rec, self._udim_dir, mapping):
+                agr_report(self, 'WARNING',
+                           "⚠️ UDIM: тайл заменён, но запись не сохранилась — "
+                           "маппинг разойдётся с файлами")
+        else:
+            agr_report(self, 'WARNING',
+                       "⚠️ UDIM: тайл заменён, но запись не найдена (объект "
+                       "переименован/удалён?) — маппинг не обновлён")
 
         # Refresh viewport
         obj = bpy.data.objects.get(self._obj_name)
@@ -2459,12 +2542,23 @@ class AGR_OT_DeleteUDIMTile(Operator, AGR_UDIMGridHUD):
                 except OSError as e:
                     print(f"  ❌ Error deleting {fname}: {e}")
 
-        # Drop the tile from the mapping as well
-        mapping = load_udim_mapping_json(self._udim_dir)
-        if mapping:
+        # Drop the tile from the mapping as well.  The tile files are
+        # ALREADY deleted on disk - a lost record must be reported.
+        obj_rec = bpy.data.objects.get(self._obj_name)
+        mapping = load_udim_mapping(obj_rec, self._udim_dir) if obj_rec else None
+        if not mapping:
+            obj_rec, mapping = find_udim_record_carrier(self._udim_dir)
+        if mapping is not None and obj_rec is not None:
             tiles_list = mapping.get('udim_tiles', [])
             mapping['udim_tiles'] = [t for t in tiles_list if t.get('udim_number') != tile]
-            save_udim_mapping_json(self._udim_dir, mapping)
+            if not save_udim_mapping(obj_rec, self._udim_dir, mapping):
+                agr_report(self, 'WARNING',
+                           "⚠️ UDIM: тайл удалён, но запись не сохранилась — "
+                           "маппинг разойдётся с файлами")
+        else:
+            agr_report(self, 'WARNING',
+                       "⚠️ UDIM: тайл удалён с диска, но запись не найдена "
+                       "(объект переименован/удалён?) — маппинг не обновлён")
 
         # Remove from the HUD state (stay open for further deletions)
         self._slots.pop(tile, None)

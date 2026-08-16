@@ -61,7 +61,6 @@ modifiers (modifier support is a possible future step).
 
 import base64
 import json
-import zlib
 
 import bpy
 import bmesh
@@ -71,6 +70,9 @@ from bpy.types import Operator, Panel
 from mathutils import Matrix
 
 from .log import agr_report
+from .core.attr_store import ColorBlobStore, preserve_active_color, read_srgb_bytes
+from .core.atlas_store import ATLAS_STORE
+from .core.udim_store import UDIM_STORE
 
 ATTR_NAME = "agr_link_id"
 CO_ATTR = "agr_link_co"      # per-vertex ORIGINAL local coordinates
@@ -117,67 +119,49 @@ def _new_table():
     }
 
 
+# The generic idprop+color-mirror transport lives in core/attr_store.py
+# (extracted from this module).  Link keeps its old function names as thin
+# delegates so the ~35 internal call sites and the test suite stay put.
+_LINK_STORE = ColorBlobStore(
+    prefix=TABLE_COL_PREFIX,
+    magic=TABLE_MAGIC,
+    prop_key=PROP_KEY,
+    validator=lambda table: "instances" in table,
+    idprop_exclude=("precise_",),
+)
+# Link's own poll/draw cache is _MERGED_CACHE (below); the store-level
+# cache is only populated if future code calls _LINK_STORE.peek/read
+# directly.  Both are cleared together (strip/reconcile/unregister), and
+# the alias must keep pointing at the store's own dict (never reassigned).
+_TABLE_CACHE = _LINK_STORE.cache
+
+
 def _parse_table(raw):
     """The ONE parse/validate step shared by read_table and _peek_table."""
-    if not isinstance(raw, str):
-        return None
-    try:
-        table = json.loads(raw)
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(table, dict) or "instances" not in table:
-        return None
-    return table
+    return _LINK_STORE.parse_idprop(raw)
 
 
 def read_table(obj):
     """Fresh, mutation-safe parse of the container table (or None).
     Falls back to the color-encoded table (fresh FBX import with default
-    settings - no idprop yet).  Operators use this; poll/draw must use the
-    cached _peek_table."""
-    table = _parse_table(obj.get(PROP_KEY))
-    if table is None and obj.type == 'MESH':
-        table = _decode_table_from_colors(obj.data)
+    settings - no idprop yet).  When the mesh carries foreign plain-Ctrl+J
+    table windows the result is a VIRTUAL merged view - operators that
+    stamp or write must run _reconcile_container(context, obj) first (it
+    materialises exactly the same ids).  poll/draw must use the cached
+    _peek_table."""
+    table, _extras = _merged_view(obj)
     return table
 
 
 def write_table(obj, table):
     # precise_* blobs live ONLY in the color encoding - keeping megabytes of
     # base64 out of the idprop (the .blend and the FBX user property)
-    lean = {k: v for k, v in table.items() if not k.startswith("precise_")}
-    obj[PROP_KEY] = json.dumps(lean, ensure_ascii=False, separators=(",", ":"))
-
-
-# poll() and draw() run on every redraw - a full json.loads of a big table
-# each time lags the UI (same reasoning as object_has_udim in operators_udim).
-# The cache is module-side because draw() may not mutate ID data; entries are
-# validated against the raw string so renames/edits never serve stale data.
-_TABLE_CACHE = {}
+    _LINK_STORE.write_idprop(obj, table)
 
 
 def _peek_table(obj):
-    raw = obj.get(PROP_KEY)
-    if isinstance(raw, str):
-        cached = _TABLE_CACHE.get(obj.name)
-        if cached is not None and cached[0] == raw:
-            return cached[1]
-        table = _parse_table(raw)
-        if table is None:
-            return None
-        _TABLE_CACHE[obj.name] = (raw, table)
-        return table
-    # no idprop: maybe a colors-only container (fresh FBX import).  O(1)
-    # gate on the first table attribute keeps non-containers cheap in poll.
-    data = getattr(obj, "data", None)
-    if data is None or data.attributes.get(TABLE_COL_PREFIX + "0") is None:
-        return None
-    fingerprint = ("colors", data.name, len(data.loops))
-    cached = _TABLE_CACHE.get(obj.name)
-    if cached is not None and cached[0] == fingerprint:
-        return cached[1]
-    table = _decode_table_from_colors(data)
-    _TABLE_CACHE[obj.name] = (fingerprint, table)
-    return table
+    """Cached, poll()/draw()-safe read (merged view - see _peek_merged)."""
+    return _peek_merged(obj)[0]
 
 
 def is_container(obj):
@@ -262,8 +246,11 @@ def _stamp_fill(mesh, iid):
     attr.data.foreach_set("value", np.full(len(mesh.polygons), iid, dtype=np.intc))
 
 
-def _stamp_remap(mesh, id_map):
-    """Remap existing attribute values old->new; unknown values become 0."""
+def _stamp_remap(mesh, id_map, loop_range=None):
+    """Remap existing attribute values old->new; unknown values become 0.
+    With ``loop_range=(lo, hi)`` only faces whose loop_start falls in the
+    range are touched — used to remap ONE absorbed window of a plain
+    Ctrl+J while the ids of the other blocks stay intact."""
     attr = _ensure_attr(mesh)
     n = len(mesh.polygons)
     arr = np.zeros(n, dtype=np.intc)
@@ -273,8 +260,15 @@ def _stamp_remap(mesh, id_map):
     for old, new in id_map.items():
         lut[old] = new
     # ids outside the map (e.g. faces added by a foreign plain Ctrl+J) -> 0
-    arr = np.where((arr < 0) | (arr > max_old), 0, arr)
-    attr.data.foreach_set("value", lut[arr])
+    clipped = np.where((arr < 0) | (arr > max_old), 0, arr)
+    remapped = lut[clipped]
+    if loop_range is not None:
+        lo, hi = loop_range
+        starts = np.zeros(n, dtype=np.intc)
+        mesh.polygons.foreach_get("loop_start", starts)
+        seg = (starts >= lo) & (starts < hi)
+        remapped = np.where(seg, remapped, arr)
+    attr.data.foreach_set("value", remapped)
 
 
 def _stamp_original_coords(mesh):
@@ -331,33 +325,12 @@ def _read_attr_values(mesh):
     return arr
 
 
-def _solve_instance_frame(mesh, extra_tol=0.0):
-    """Recover the instance frame from the stored per-vertex original
-    coordinates: least-squares affine fit original-local -> current
-    container-local.  Immune to container Apply Transform / Set Origin /
-    whole-piece edit-mode moves (the frame follows the piece) and to FBX
-    matrix rebuilds - vertex order is irrelevant, the pairing rides with
-    each vertex.  Rewrites the mesh vertices back into original local space
-    (snapping unedited verts to their exact stored coords) and returns the
-    frame Matrix, or None when the attributes are absent or the point cloud
-    is degenerate (legacy containers fall back to the matrix path)."""
-    co_attr = mesh.attributes.get(CO_ATTR)
-    flag_attr = mesh.attributes.get(ORIG_ATTR)
-    if (co_attr is None or co_attr.domain != 'POINT' or co_attr.data_type != 'FLOAT_VECTOR'
-            or flag_attr is None or flag_attr.domain != 'POINT' or flag_attr.data_type != 'BOOLEAN'):
-        return None
-    n = len(mesh.vertices)
-    if n == 0:
-        return None
-    p32 = np.zeros(n * 3, dtype=np.float32)
-    co_attr.data.foreach_get("vector", p32)
-    p = p32.reshape(-1, 3).astype(np.float64)
-    mask = np.zeros(n, dtype=bool)
-    flag_attr.data.foreach_get("value", mask)
-    q32 = np.zeros(n * 3, dtype=np.float32)
-    mesh.vertices.foreach_get("co", q32)
-    q = q32.reshape(-1, 3).astype(np.float64)
-
+def _fit_affine_core(p, q, mask, extra_tol=0.0):
+    """Least-squares affine fit p[mask] -> q[mask] with trimmed-outlier
+    refit and SVD normal-completion for planar clouds.  Pure computation
+    (no mesh access).  Returns (a, t, res, tol) or None when degenerate;
+    ``res`` are residuals over the masked points, ``tol`` the accept
+    threshold used for snapping decisions."""
     if int(mask.sum()) < 3:
         return None
 
@@ -395,7 +368,7 @@ def _solve_instance_frame(mesh, extra_tol=0.0):
     if res.max() > tol:
         # part of the piece was edited - refit on the rigid majority
         thr = max(tol, 3.0 * float(np.median(res)))
-        inliers = np.zeros(n, dtype=bool)
+        inliers = np.zeros(len(mask), dtype=bool)
         inliers[np.flatnonzero(mask)[res <= thr]] = True
         if int(inliers.sum()) >= 3:
             refit = fit(inliers)
@@ -406,6 +379,49 @@ def _solve_instance_frame(mesh, extra_tol=0.0):
 
     if abs(np.linalg.det(a)) < 1e-12:
         return None
+    return a, t, res, tol
+
+
+def _affine_to_matrix(a, t):
+    return Matrix((
+        (a[0][0], a[0][1], a[0][2], t[0]),
+        (a[1][0], a[1][1], a[1][2], t[1]),
+        (a[2][0], a[2][1], a[2][2], t[2]),
+        (0.0, 0.0, 0.0, 1.0),
+    ))
+
+
+def _solve_instance_frame(mesh, extra_tol=0.0):
+    """Recover the instance frame from the stored per-vertex original
+    coordinates: least-squares affine fit original-local -> current
+    container-local.  Immune to container Apply Transform / Set Origin /
+    whole-piece edit-mode moves (the frame follows the piece) and to FBX
+    matrix rebuilds - vertex order is irrelevant, the pairing rides with
+    each vertex.  Rewrites the mesh vertices back into original local space
+    (snapping unedited verts to their exact stored coords) and returns the
+    frame Matrix, or None when the attributes are absent or the point cloud
+    is degenerate (legacy containers fall back to the matrix path)."""
+    co_attr = mesh.attributes.get(CO_ATTR)
+    flag_attr = mesh.attributes.get(ORIG_ATTR)
+    if (co_attr is None or co_attr.domain != 'POINT' or co_attr.data_type != 'FLOAT_VECTOR'
+            or flag_attr is None or flag_attr.domain != 'POINT' or flag_attr.data_type != 'BOOLEAN'):
+        return None
+    n = len(mesh.vertices)
+    if n == 0:
+        return None
+    p32 = np.zeros(n * 3, dtype=np.float32)
+    co_attr.data.foreach_get("vector", p32)
+    p = p32.reshape(-1, 3).astype(np.float64)
+    mask = np.zeros(n, dtype=bool)
+    flag_attr.data.foreach_get("value", mask)
+    q32 = np.zeros(n * 3, dtype=np.float32)
+    mesh.vertices.foreach_get("co", q32)
+    q = q32.reshape(-1, 3).astype(np.float64)
+
+    core = _fit_affine_core(p, q, mask, extra_tol)
+    if core is None:
+        return None
+    a, t, res, tol = core
 
     # final vertex coords: exact stored originals for unedited verts (kills
     # float32 container-space noise), frame-inverse for edited/new verts
@@ -416,12 +432,7 @@ def _solve_instance_frame(mesh, extra_tol=0.0):
     final[snap] = p[snap]
     mesh.vertices.foreach_set("co", final.astype(np.float32).ravel())
 
-    return Matrix((
-        (a[0][0], a[0][1], a[0][2], t[0]),
-        (a[1][0], a[1][1], a[1][2], t[1]),
-        (a[2][0], a[2][1], a[2][2], t[2]),
-        (0.0, 0.0, 0.0, 1.0),
-    ))
+    return _affine_to_matrix(a, t)
 
 
 def _has_loose_geometry(mesh):
@@ -438,15 +449,6 @@ def _has_loose_geometry(mesh):
 # File→Export/Import moves the memory with no special operators.
 # ----------------------------------------------------------------------------
 
-def _table_color_names(mesh):
-    # digits-only filter: a foreign/duplicated name like "AGR_Link_T0.001"
-    # must not crash the sort - this runs inside poll()/draw()
-    names = [a.name for a in mesh.attributes
-             if a.name.startswith(TABLE_COL_PREFIX)
-             and a.name[len(TABLE_COL_PREFIX):].isdigit()]
-    return sorted(names, key=lambda n: int(n[len(TABLE_COL_PREFIX):]))
-
-
 def _remove_color_mirror(mesh):
     """Remove ONLY the color-mirror attributes (keep the internal tracking
     attrs) - used when the mirror could not be (re)written, so a stale
@@ -460,79 +462,22 @@ def _remove_color_mirror(mesh):
 
 
 def _pack_table_to_colors(mesh, table):
-    """Encode the JSON table into AGR_Link_T* color attributes: zlib bytes,
-    ONE byte per channel on the sRGB b/255 grid (survives the importer's
-    BYTE_COLOR quantisation).  Returns False when the mesh cannot hold it -
-    capacity is checked BEFORE the old mirror is removed."""
-    n_loops = len(mesh.loops)
-    if n_loops == 0:
-        return False
-    raw = json.dumps(table, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    payload = zlib.compress(raw, 9)
-    blob = (TABLE_MAGIC + bytes([1, 0])
-            + len(payload).to_bytes(4, "little")
-            + zlib.crc32(payload).to_bytes(4, "little")
-            + payload)
-    per_attr = n_loops * 4  # 4 channels x 1 byte
-    k = -(-len(blob) // per_attr)
-    if k > 128:
-        return False
-    for name in _table_color_names(mesh):
-        attr = mesh.attributes.get(name)
-        if attr is not None:
-            mesh.attributes.remove(attr)
-    blob = blob.ljust(k * per_attr, b"\x00")
-    floats = (np.frombuffer(blob, dtype=np.uint8).astype(np.float32)) / 255.0
-    for i in range(k):
-        attr = mesh.color_attributes.new(name=f"{TABLE_COL_PREFIX}{i}",
-                                         type='FLOAT_COLOR', domain='CORNER')
-        chunk = floats[i * n_loops * 4:(i + 1) * n_loops * 4]
-        attr.data.foreach_set("color_srgb", chunk)
-    return True
+    """Encode the JSON table into AGR_Link_T* color attributes (zlib bytes
+    on the sRGB b/255 grid, CRC-guarded — see core/attr_store.py).  Returns
+    False when the mesh cannot hold it; capacity is checked BEFORE the old
+    mirror is removed."""
+    return _LINK_STORE.pack_colors(mesh, table)
 
 
 def _read_srgb_bytes(attr):
-    """Read a color attribute as bytes on the sRGB b/255 grid — identical
-    for the FLOAT_COLOR we write and the BYTE_COLOR the importer creates."""
-    cnt = len(attr.data)
-    arr = np.zeros(cnt * 4, dtype=np.float32)
-    attr.data.foreach_get("color_srgb", arr)
-    return np.clip(np.rint(arr.astype(np.float64) * 255.0), 0, 255).astype(np.uint8)
+    return read_srgb_bytes(attr)
 
 
 def _decode_table_from_colors(mesh):
     """Decode the JSON table from AGR_Link_T* color attributes (after an
     FBX round trip with default settings).  CRC-guarded: returns None on
     any corruption instead of a plausible-but-wrong table."""
-    names = _table_color_names(mesh)
-    if not names:
-        return None
-    n_loops = len(mesh.loops)
-    if n_loops == 0:
-        return None
-    chunks = []
-    for name in names:
-        attr = mesh.attributes.get(name)
-        if attr is None or attr.domain != 'CORNER' or len(attr.data) != n_loops:
-            return None
-        chunks.append(_read_srgb_bytes(attr))
-    blob = np.concatenate(chunks).tobytes()
-    if len(blob) < 14 or blob[:4] != TABLE_MAGIC:
-        return None
-    length = int.from_bytes(blob[6:10], "little")
-    crc = int.from_bytes(blob[10:14], "little")
-    if length <= 0 or length > 16 * 1024 * 1024 or 14 + length > len(blob):
-        return None
-    payload = blob[14:14 + length]
-    if zlib.crc32(payload) != crc:
-        return None
-    try:
-        table = json.loads(zlib.decompress(payload).decode("utf-8"))
-    except (zlib.error, ValueError, UnicodeDecodeError):
-        return None
-    if not isinstance(table, dict) or "instances" not in table:
-        return None
-    return table
+    return _LINK_STORE.decode_colors(mesh)
 
 
 def _pack_tracking_to_colors(mesh, table):
@@ -574,66 +519,45 @@ def _pack_tracking_to_colors(mesh, table):
     mesh.polygons.foreach_get("loop_total", loop_total)
     ids_per_loop = np.repeat(ids.astype(np.float64), loop_total)
 
-    active_name = (mesh.color_attributes.active_color.name
-                   if mesh.color_attributes.active_color else None)
-    render_idx = mesh.color_attributes.render_color_index
-    render_name = (mesh.color_attributes[render_idx].name
-                   if 0 <= render_idx < len(mesh.color_attributes) else None)
-    for name in (COL_CO, COL_ID):
-        old = mesh.attributes.get(name)
-        if old is not None:
-            mesh.attributes.remove(old)
-    col_co = mesh.color_attributes.new(name=COL_CO, type='FLOAT_COLOR', domain='CORNER')
-    col_id = mesh.color_attributes.new(name=COL_ID, type='FLOAT_COLOR', domain='CORNER')
-    # re-fetch: the second new() may reallocate the CustomData layer array,
-    # leaving the first reference dangling
-    col_co = mesh.attributes.get(COL_CO)
-
-    # 16-bit hi/lo per value on the byte-robust sRGB grid
-    v16 = np.clip(np.rint((co - co_min) / co_size * 65535.0), 0, 65535).astype(np.uint32)
-    v16_loop = v16[vidx]
-    ids_loop = np.clip(ids_per_loop, 0, 32767).astype(np.uint32)
-    flag_loop = flags[vidx].astype(np.uint32)
-    data_co = np.empty((n_loops, 4), dtype=np.float32)
-    data_co[:, 0] = (v16_loop[:, 0] >> 8) / 255.0
-    data_co[:, 1] = (v16_loop[:, 0] & 255) / 255.0
-    data_co[:, 2] = (v16_loop[:, 1] >> 8) / 255.0
-    data_co[:, 3] = (v16_loop[:, 1] & 255) / 255.0
-    data_id = np.empty((n_loops, 4), dtype=np.float32)
-    data_id[:, 0] = (v16_loop[:, 2] >> 8) / 255.0
-    data_id[:, 1] = (v16_loop[:, 2] & 255) / 255.0
-    data_id[:, 2] = ((flag_loop << 7) | (ids_loop >> 8)) / 255.0
-    data_id[:, 3] = (ids_loop & 255) / 255.0
-    col_co.data.foreach_set("color_srgb", data_co.ravel())
-    col_id.data.foreach_set("color_srgb", data_id.ravel())
-
-    # bit-exact layer: full float32 originals ride inside the byte-exact
-    # table blob; the quantised channels above serve as the per-vertex
-    # correspondence key (order-independent) and as a fallback
-    table["precise_n"] = int(n_verts)
-    table["precise_co"] = base64.b64encode(co32.astype("<f4").tobytes()).decode("ascii")
-    table_ok = _pack_table_to_colors(mesh, table)
-
     # never leave an AGR service layer as the mesh's active/render color:
     # a material with a blank-name Color Attribute node would render the
-    # packed bytes as vertex-colour noise
-    if active_name is not None and mesh.color_attributes.get(active_name) is not None:
-        mesh.color_attributes.active_color = mesh.color_attributes.get(active_name)
-    else:
-        try:
-            mesh.color_attributes.active_color_index = -1
-        except (ValueError, RuntimeError):
-            pass
-    if render_name is not None and mesh.color_attributes.get(render_name) is not None:
-        for i, layer in enumerate(mesh.color_attributes):
-            if layer.name == render_name:
-                mesh.color_attributes.render_color_index = i
-                break
-    else:
-        try:
-            mesh.color_attributes.render_color_index = -1
-        except (ValueError, RuntimeError):
-            pass
+    # packed bytes as vertex-colour noise (the guard spans COL_CO/COL_ID
+    # creation too - pack_colors below only covers the table layers)
+    with preserve_active_color(mesh):
+        for name in (COL_CO, COL_ID):
+            old = mesh.attributes.get(name)
+            if old is not None:
+                mesh.attributes.remove(old)
+        col_co = mesh.color_attributes.new(name=COL_CO, type='FLOAT_COLOR', domain='CORNER')
+        col_id = mesh.color_attributes.new(name=COL_ID, type='FLOAT_COLOR', domain='CORNER')
+        # re-fetch: the second new() may reallocate the CustomData layer
+        # array, leaving the first reference dangling
+        col_co = mesh.attributes.get(COL_CO)
+
+        # 16-bit hi/lo per value on the byte-robust sRGB grid
+        v16 = np.clip(np.rint((co - co_min) / co_size * 65535.0), 0, 65535).astype(np.uint32)
+        v16_loop = v16[vidx]
+        ids_loop = np.clip(ids_per_loop, 0, 32767).astype(np.uint32)
+        flag_loop = flags[vidx].astype(np.uint32)
+        data_co = np.empty((n_loops, 4), dtype=np.float32)
+        data_co[:, 0] = (v16_loop[:, 0] >> 8) / 255.0
+        data_co[:, 1] = (v16_loop[:, 0] & 255) / 255.0
+        data_co[:, 2] = (v16_loop[:, 1] >> 8) / 255.0
+        data_co[:, 3] = (v16_loop[:, 1] & 255) / 255.0
+        data_id = np.empty((n_loops, 4), dtype=np.float32)
+        data_id[:, 0] = (v16_loop[:, 2] >> 8) / 255.0
+        data_id[:, 1] = (v16_loop[:, 2] & 255) / 255.0
+        data_id[:, 2] = ((flag_loop << 7) | (ids_loop >> 8)) / 255.0
+        data_id[:, 3] = (ids_loop & 255) / 255.0
+        col_co.data.foreach_set("color_srgb", data_co.ravel())
+        col_id.data.foreach_set("color_srgb", data_id.ravel())
+
+        # bit-exact layer: full float32 originals ride inside the byte-exact
+        # table blob; the quantised channels above serve as the per-vertex
+        # correspondence key (order-independent) and as a fallback
+        table["precise_n"] = int(n_verts)
+        table["precise_co"] = base64.b64encode(co32.astype("<f4").tobytes()).decode("ascii")
+        table_ok = _pack_table_to_colors(mesh, table)
 
     if not table_ok:
         _remove_color_mirror(mesh)
@@ -742,6 +666,458 @@ def _unpack_tracking_from_colors(mesh, table):
     else:
         table["co_quant"] = float(np.max(np.asarray(co_size)) / 65535.0 * 2.0)
     return True
+
+
+# ----------------------------------------------------------------------------
+# Plain-Ctrl+J absorption.
+#
+# A plain Blender join keeps every source mesh's loops as ONE contiguous
+# block, merges same-named attributes (missing layers zero-filled) and
+# keeps the ACTIVE object's idprops.  So after a plain Ctrl+J:
+#   - the table of every merged-in container survives in the color layers
+#     as a "window" at its own loop offset (found by magic scan + CRC);
+#   - agr_link_id/agr_link_co/agr_link_orig survive with correct values in
+#     each block (foreign faces get id=0 / orig=False by zero-fill).
+# Absorption merges those window tables into one canonical container, so
+# containers survive ANY join - the AGR button is no longer mandatory.
+# ----------------------------------------------------------------------------
+
+def _window_matches_table(win_tbl, table):
+    """Same instance set (name + face count) — identifies the container's
+    OWN mirror window among the scanned ones (robust even if json key
+    order or precise_* payloads differ)."""
+    def sig(t):
+        return sorted((str(i.get("name", "")), int(i.get("faces", 0) or 0))
+                      for i in t.get("instances", {}).values())
+    return sig(win_tbl) == sig(table)
+
+
+def _compose_merged(idprop_tbl, windows, zero_faces=0, container_name="", mesh_name=""):
+    """Pure merge of the idprop table with FOREIGN table windows (no mesh
+    access, no mutation of the inputs).  Base = the idprop table (its own
+    mirror window is dropped), or the first window when there is no idprop
+    (the ex-active was a plain object or a fresh import).  Every other
+    window's instances are appended under fresh ids with matrix_stale=True
+    (their matrix_rel is relative to the OLD container; the reconcile step
+    refits it).  With zero_faces > 0 and no idprop, the untracked ex-active
+    geometry becomes a regular instance named after the container.
+    Returns (merged, extras, zero_iid) where extras = [(loop_start,
+    loop_count, id_map)] — deterministic, so the poll/draw VIEW and the
+    materialisation produce identical ids."""
+    windows = list(windows)
+    if idprop_tbl is not None:
+        base_src = idprop_tbl
+        for i, (_s, _c, wt) in enumerate(windows):
+            if _window_matches_table(wt, idprop_tbl):
+                windows.pop(i)  # the container's own mirror
+                break
+    else:
+        if not windows:
+            return None, [], None
+        base_src = {k: v for k, v in windows.pop(0)[2].items()
+                    if not k.startswith("precise_")}
+    merged = json.loads(json.dumps(base_src))
+    merged.setdefault("groups", {})
+    merged.setdefault("instances", {})
+    merged.setdefault("next_instance", 1)
+    merged.setdefault("next_group", 1)
+
+    extras = []
+    for s, cnt, wt in windows:
+        group_map = {}
+        for gid_str, ginfo in wt.get("groups", {}).items():
+            group_map[int(gid_str)] = _match_or_add_group(merged, ginfo)
+        id_map = {}
+        for iid_str, inst in wt.get("instances", {}).items():
+            nid = merged["next_instance"]
+            merged["next_instance"] += 1
+            entry = dict(inst)
+            entry["group"] = group_map.get(entry.get("group", 0), 0)
+            entry["matrix_stale"] = True
+            merged["instances"][str(nid)] = entry
+            id_map[int(iid_str)] = nid
+        q = float(wt.get("co_quant", 0.0) or 0.0)
+        if q > float(merged.get("co_quant", 0.0) or 0.0):
+            merged["co_quant"] = q
+        extras.append((s, cnt, id_map))
+
+    zero_iid = None
+    if idprop_tbl is None and zero_faces > 0:
+        zero_iid = _add_zero_instance(merged, zero_faces, container_name, mesh_name)
+    return merged, extras, zero_iid
+
+
+def _add_zero_instance(merged, zero_faces, container_name, mesh_name):
+    """Register the untracked (id=0) geometry as a regular instance of the
+    container itself: identity rel-matrix, its own fresh group (never
+    matched into an existing one — the concatenated geometry is not an
+    instance of anything).  Keeps the ex-active object recoverable."""
+    gid = merged["next_group"]
+    merged["next_group"] += 1
+    merged["groups"][str(gid)] = {"data_name": mesh_name or container_name,
+                                  "verts": 0, "faces": int(zero_faces)}
+    zero_iid = merged["next_instance"]
+    merged["next_instance"] += 1
+    merged["instances"][str(zero_iid)] = {
+        "name": container_name,
+        "matrix_rel": _matrix_to_list(Matrix.Identity(4)),
+        "faces": int(zero_faces),
+        "collections": [],
+        "materials": [],
+        "parent": None,
+        "parent_type": 'OBJECT',
+        "parent_bone": "",
+        "parent_vertices": [],
+        "matrix_parent_inverse": _matrix_to_list(Matrix.Identity(4)),
+        "props": {},
+        "group": gid,
+    }
+    return zero_iid
+
+
+def _merged_view(obj):
+    """(table, extra_windows_count) WITHOUT mutating anything.  When the
+    mesh carries foreign table windows the returned table is a VIRTUAL
+    merge — operators must run _reconcile_container() before stamping or
+    writing (it materialises exactly the same ids)."""
+    idp = _parse_table(obj.get(PROP_KEY))
+    data = getattr(obj, "data", None)
+    if getattr(obj, "type", None) != 'MESH' or data is None:
+        return idp, 0
+    if data.attributes.get(TABLE_COL_PREFIX + "0") is None:
+        return idp, 0
+    # canonical container: exactly one magic hit = its own mirror.  The
+    # cheap first-layer count avoids decompressing the whole (multi-MB
+    # with precise_*) blob from poll()/draw() just to conclude "nothing
+    # to absorb".
+    if idp is not None and _LINK_STORE.count_window_candidates(data) <= 1:
+        return idp, 0
+    windows = _LINK_STORE.scan_windows(data)
+    if not windows:
+        return idp, 0
+    if idp is not None:
+        own = any(_window_matches_table(wt, idp) for _s, _c, wt in windows)
+        if len(windows) - (1 if own else 0) <= 0:
+            return idp, 0
+    zero = 0
+    if idp is None:
+        ids = _read_face_ids(data)
+        if ids is not None:
+            zero = int((ids == 0).sum())
+        else:  # FBX path: no attrs yet - estimate from the window metadata
+            total = sum(int(i.get("faces", 0) or 0)
+                        for _s, _c, wt in windows
+                        for i in wt.get("instances", {}).values())
+            zero = max(0, len(data.polygons) - total)
+    merged, extras, _z = _compose_merged(idp, windows, zero, obj.name, data.name)
+    if merged is None:
+        return idp, 0
+    return merged, len(extras)
+
+
+# poll/draw cache for the merged view: obj.name -> (fingerprint, result)
+_MERGED_CACHE = {}
+
+
+def _peek_merged(obj):
+    """Cached, poll()/draw()-safe merged view — see _merged_view."""
+    raw = obj.get(PROP_KEY)
+    raw_key = raw if isinstance(raw, str) else None
+    data = getattr(obj, "data", None)
+    if getattr(obj, "type", None) != 'MESH' or data is None:
+        return (_parse_table(raw_key), 0)
+    if raw_key is None and data.attributes.get(TABLE_COL_PREFIX + "0") is None:
+        return (None, 0)  # plain mesh - answer without polluting the cache
+    fp = (raw_key, data.name, len(data.loops))
+    hit = _MERGED_CACHE.get(obj.name)
+    if hit is not None and hit[0] == fp:
+        return hit[1]
+    result = _merged_view(obj)
+    _MERGED_CACHE[obj.name] = (fp, result)
+    return result
+
+
+def _unpack_tracking_windows(mesh, windows, merged):
+    """FBX path of the plain-Ctrl+J absorb: rebuild the internal tracking
+    attributes when the color mirror holds SEVERAL table windows.  Each
+    window's vertices are denormalised with ITS OWN co_min/co_size and
+    bit-exact precise_* records; verts outside every window (plain objects
+    merged without memory) keep their CURRENT coords with orig=False —
+    the zero-instance step stamps them afterwards.  Updates
+    merged["co_quant"] with the worst window quantum.  Returns True when
+    the mirror was usable."""
+    col_co = mesh.attributes.get(COL_CO)
+    col_id = mesh.attributes.get(COL_ID)
+    if col_co is None or col_id is None:
+        return False
+    n_verts = len(mesh.vertices)
+    n_loops = len(mesh.loops)
+    n_polys = len(mesh.polygons)
+    if n_verts == 0 or n_loops == 0:
+        return False
+    vidx = np.zeros(n_loops, dtype=np.intc)
+    mesh.loops.foreach_get("vertex_index", vidx)
+    loop_start = np.zeros(n_polys, dtype=np.intc)
+    mesh.polygons.foreach_get("loop_start", loop_start)
+
+    def per_vertex_bytes(attr_):
+        b = _read_srgb_bytes(attr_).reshape(-1, 4).astype(np.uint32)
+        if attr_.domain == 'CORNER' and len(b) == n_loops:
+            out = np.zeros((n_verts, 4), dtype=np.uint32)
+            out[vidx] = b
+            return out, b
+        if attr_.domain == 'POINT' and len(b) == n_verts:
+            return b, b[vidx]
+        return None, None
+
+    b_co_v, _b_co_l = per_vertex_bytes(col_co)
+    b_id_v, b_id_l = per_vertex_bytes(col_id)
+    if b_co_v is None or b_id_v is None:
+        return False
+
+    v16 = np.empty((n_verts, 3), dtype=np.int64)
+    v16[:, 0] = b_co_v[:, 0] * 256 + b_co_v[:, 1]
+    v16[:, 1] = b_co_v[:, 2] * 256 + b_co_v[:, 3]
+    v16[:, 2] = b_id_v[:, 0] * 256 + b_id_v[:, 1]
+    flags = b_id_v[:, 2] >= 128
+
+    id_hi = b_id_l[loop_start, 2]
+    id_lo = b_id_l[loop_start, 3]
+    face_ids = ((id_hi & 127) * 256 + id_lo).astype(np.intc)
+
+    # default: untracked current geometry (verts outside every window)
+    cur = np.zeros(n_verts * 3, dtype=np.float32)
+    mesh.vertices.foreach_get("co", cur)
+    co = cur.reshape(-1, 3).astype(np.float64)
+    quant_worst = float(merged.get("co_quant", 0.0) or 0.0)
+
+    for s, cnt, wtbl in windows:
+        w_verts = np.unique(vidx[s:s + cnt])
+        if len(w_verts) == 0:
+            continue
+        co_min = np.asarray(wtbl.get("co_min", [0.0, 0.0, 0.0]), dtype=np.float64)
+        co_size = np.asarray(wtbl.get("co_size", [1.0, 1.0, 1.0]), dtype=np.float64)
+        co[w_verts] = v16[w_verts].astype(np.float64) / 65535.0 * co_size + co_min
+        full_precision = False
+        if "precise_co" in wtbl and "precise_n" in wtbl:
+            try:
+                raw = base64.b64decode(wtbl["precise_co"])
+                precise = np.frombuffer(raw, dtype="<f4")
+            except (ValueError, TypeError):
+                precise = None
+            if precise is not None and len(precise) == int(wtbl["precise_n"]) * 3:
+                precise = precise.reshape(-1, 3)
+                k16 = np.clip(np.rint((precise.astype(np.float64) - co_min) / co_size * 65535.0),
+                              0, 65535).astype(np.int64)
+                keys_pack = (k16[:, 0] << 32) | (k16[:, 1] << 16) | k16[:, 2]
+                keys_mesh = (v16[w_verts, 0] << 32) | (v16[w_verts, 1] << 16) | v16[w_verts, 2]
+                order = np.argsort(keys_pack, kind="stable")
+                sorted_keys = keys_pack[order]
+                pos = np.clip(np.searchsorted(sorted_keys, keys_mesh), 0, len(sorted_keys) - 1)
+                hit = sorted_keys[pos] == keys_mesh
+                co[w_verts[hit]] = precise[order[pos[hit]]]
+                full_precision = bool(hit.all())
+        if not full_precision:
+            quant_worst = max(quant_worst, float(np.max(co_size) / 65535.0 * 2.0))
+
+    attr = _ensure_attr(mesh)
+    attr.data.foreach_set("value", face_ids)
+    co_attr = mesh.attributes.get(CO_ATTR)
+    if co_attr is not None and (co_attr.domain != 'POINT' or co_attr.data_type != 'FLOAT_VECTOR'):
+        mesh.attributes.remove(co_attr)
+        co_attr = None
+    if co_attr is None:
+        co_attr = mesh.attributes.new(CO_ATTR, 'FLOAT_VECTOR', 'POINT')
+    co_attr.data.foreach_set("vector", co.astype(np.float32).ravel())
+    flag_attr = mesh.attributes.get(ORIG_ATTR)
+    if flag_attr is not None and (flag_attr.domain != 'POINT' or flag_attr.data_type != 'BOOLEAN'):
+        mesh.attributes.remove(flag_attr)
+        flag_attr = None
+    if flag_attr is None:
+        flag_attr = mesh.attributes.new(ORIG_ATTR, 'BOOLEAN', 'POINT')
+    flag_attr.data.foreach_set("value", flags)
+    merged["co_quant"] = quant_worst
+    return True
+
+
+def _reconcile_container(context, obj):
+    """Absorb containers merged in by a PLAIN Blender Ctrl+J: merge all
+    foreign window tables into the idprop table (id remap per loop
+    segment), register the untracked ex-active geometry as a regular
+    instance, refit matrix_rel of absorbed instances against the new
+    container, and repack ONE fresh color mirror.  Idempotent — after the
+    repack no foreign window remains.  Returns a stats dict, or None when
+    there was nothing to absorb.  Mutates mesh/idprop: operators only,
+    never from poll()/draw()."""
+    if obj is None or getattr(obj, "type", None) != 'MESH':
+        return None
+    mesh = obj.data
+    if mesh.attributes.get(TABLE_COL_PREFIX + "0") is None:
+        return None
+    idp = _parse_table(obj.get(PROP_KEY))
+    windows = _LINK_STORE.scan_windows(mesh)
+    if not windows:
+        return None
+    if idp is not None:
+        own = any(_window_matches_table(wt, idp) for _s, _c, wt in windows)
+        if len(windows) - (1 if own else 0) <= 0:
+            return None  # canonical container - its own mirror only
+    elif len(windows) == 1 and windows[0][0] == 0:
+        # single window from loop 0: classic fresh FBX import UNLESS the
+        # mesh has an untracked tail (plain objects joined in afterwards)
+        total = sum(int(i.get("faces", 0) or 0)
+                    for i in windows[0][2].get("instances", {}).values())
+        if total >= len(mesh.polygons):
+            return None  # existing fresh-import path handles it
+
+    # Alt+D twin shares this datablock - never mutate the shared copy.
+    # The zero-instance group must carry the ORIGINAL datablock name (the
+    # copy gets a ".001" suffix, and the panel view already showed the
+    # original - diverging names would split link groups on later joins).
+    orig_mesh_name = mesh.name
+    real_users = mesh.users - (1 if mesh.use_fake_user else 0)
+    if real_users > 1:
+        mesh = mesh.copy()
+        obj.data = mesh
+
+    quant_unpacked = None
+    if mesh.attributes.get(ATTR_NAME) is None:
+        stub = {"co_quant": float((idp or {}).get("co_quant", 0.0) or 0.0)}
+        if not _unpack_tracking_windows(mesh, windows, stub):
+            return None  # no attrs and no usable mirror - cannot absorb
+        quant_unpacked = stub["co_quant"]
+
+    face_ids = _read_face_ids(mesh)
+    if face_ids is None:
+        return None
+    zero_pre = int((face_ids == 0).sum()) if idp is None else 0
+
+    merged, extras, zero_iid = _compose_merged(idp, windows, zero_pre, obj.name, orig_mesh_name)
+    if merged is None:
+        return None
+    if quant_unpacked is not None and quant_unpacked > float(merged.get("co_quant", 0.0) or 0.0):
+        merged["co_quant"] = quant_unpacked
+
+    for s, cnt, id_map in extras:
+        _stamp_remap(mesh, id_map, loop_range=(s, s + cnt))
+
+    n_loops = len(mesh.loops)
+    n_polys = len(mesh.polygons)
+    vidx = np.zeros(n_loops, dtype=np.intc)
+    mesh.loops.foreach_get("vertex_index", vidx)
+    loop_total = np.zeros(n_polys, dtype=np.intc)
+    mesh.polygons.foreach_get("loop_total", loop_total)
+    face_ids = _read_face_ids(mesh)
+
+    # untracked geometry -> instance of the container itself (idprop absent
+    # means the ex-active carried no memory; with an idprop the untracked
+    # faces keep today's foreign semantics)
+    zero_instance = False
+    if idp is None:
+        # ids OUTSIDE every window belong to no readable table (e.g. a
+        # merged-in container whose mirror was never written or died) -
+        # they would collide with the fresh merged numbering, so they are
+        # folded into the zero-instance instead of scrambling extraction
+        loop_start_arr = np.zeros(n_polys, dtype=np.intc)
+        mesh.polygons.foreach_get("loop_start", loop_start_arr)
+        in_win = np.zeros(n_polys, dtype=bool)
+        for w_s, w_cnt, _wt in windows:
+            in_win |= (loop_start_arr >= w_s) & (loop_start_arr < w_s + w_cnt)
+        stray = (~in_win) & (face_ids != 0)
+        if stray.any():
+            face_ids = np.where(stray, 0, face_ids).astype(np.intc)
+            _ensure_attr(mesh).data.foreach_set("value", face_ids)
+        zero_mask = face_ids == 0
+        zero_fact = int(zero_mask.sum())
+        if zero_fact:
+            if zero_iid is None:
+                zero_iid = _add_zero_instance(merged, zero_fact, obj.name, orig_mesh_name)
+            entry = merged["instances"][str(zero_iid)]
+            entry["faces"] = zero_fact
+            entry["collections"] = _capture_collections(obj, context)
+            entry["materials"] = [ms.material.name if ms.material else ""
+                                  for ms in obj.material_slots]
+            entry["parent"] = obj.parent.name if obj.parent else None
+            entry["parent_type"] = obj.parent_type
+            entry["parent_bone"] = obj.parent_bone
+            entry["parent_vertices"] = (list(obj.parent_vertices)
+                                        if obj.parent_type in {'VERTEX', 'VERTEX_3'} else [])
+            entry["matrix_parent_inverse"] = _matrix_to_list(obj.matrix_parent_inverse)
+            entry["props"] = _capture_props(obj)
+            zero_loops = np.repeat(zero_mask, loop_total)
+            zero_verts = np.unique(vidx[zero_loops])
+            merged["groups"][str(entry["group"])]["verts"] = int(len(zero_verts))
+            face_ids = np.where(zero_mask, zero_iid, face_ids).astype(np.intc)
+            _ensure_attr(mesh).data.foreach_set("value", face_ids)
+            # their original local coords ARE the current ones (the active
+            # object is never transformed by a join)
+            flag_attr = mesh.attributes.get(ORIG_ATTR)
+            co_attr = mesh.attributes.get(CO_ATTR)
+            if flag_attr is not None and co_attr is not None:
+                n_verts = len(mesh.vertices)
+                fl = np.zeros(n_verts, dtype=bool)
+                flag_attr.data.foreach_get("value", fl)
+                need = np.zeros(n_verts, dtype=bool)
+                need[zero_verts] = True
+                need &= ~fl
+                if need.any():
+                    cur = np.zeros(n_verts * 3, dtype=np.float32)
+                    mesh.vertices.foreach_get("co", cur)
+                    stored = np.zeros(n_verts * 3, dtype=np.float32)
+                    co_attr.data.foreach_get("vector", stored)
+                    stored.reshape(-1, 3)[need] = cur.reshape(-1, 3)[need]
+                    co_attr.data.foreach_set("vector", stored)
+                    flag_attr.data.foreach_set("value", fl | need)
+            zero_instance = True
+
+    # refit matrix_rel of absorbed instances against THIS container (the
+    # stored one is relative to the OLD container and would fling pieces)
+    stale = 0
+    if extras:
+        co_attr = mesh.attributes.get(CO_ATTR)
+        flag_attr = mesh.attributes.get(ORIG_ATTR)
+        if co_attr is not None and flag_attr is not None:
+            n_verts = len(mesh.vertices)
+            p32 = np.zeros(n_verts * 3, dtype=np.float32)
+            co_attr.data.foreach_get("vector", p32)
+            p = p32.reshape(-1, 3).astype(np.float64)
+            om = np.zeros(n_verts, dtype=bool)
+            flag_attr.data.foreach_get("value", om)
+            q32 = np.zeros(n_verts * 3, dtype=np.float32)
+            mesh.vertices.foreach_get("co", q32)
+            q = q32.reshape(-1, 3).astype(np.float64)
+            ids_per_loop = np.repeat(face_ids, loop_total)
+            extra_tol = float(merged.get("co_quant", 0.0) or 0.0)
+            for _s, _c, id_map in extras:
+                for nid in id_map.values():
+                    vmask = np.zeros(n_verts, dtype=bool)
+                    vmask[vidx[ids_per_loop == nid]] = True
+                    vmask &= om
+                    core = _fit_affine_core(p, q, vmask, extra_tol)
+                    entry = merged["instances"][str(nid)]
+                    if core is not None:
+                        a, t, _res, _tol = core
+                        entry["matrix_rel"] = _matrix_to_list(_affine_to_matrix(a, t))
+                        entry.pop("matrix_stale", None)
+                    else:
+                        stale += 1
+        else:
+            stale = sum(len(m) for _s, _c, m in extras)
+
+    # idprop FIRST (the table must survive even if the repack fails), then
+    # ONE fresh mirror over the whole mesh - absorption is now permanent
+    write_table(obj, merged)
+    try:
+        mirror_ok = _pack_tracking_to_colors(mesh, merged)
+    except Exception:
+        _remove_color_mirror(mesh)
+        mirror_ok = False
+    if mirror_ok:
+        write_table(obj, merged)
+    _TABLE_CACHE.pop(obj.name, None)
+    _MERGED_CACHE.pop(obj.name, None)
+    return {"absorbed": len(extras), "zero_instance": zero_instance,
+            "stale": stale, "mirror_ok": mirror_ok}
 
 
 # ----------------------------------------------------------------------------
@@ -855,6 +1231,15 @@ class AGR_OT_link_join(Operator):
             agr_report(self, 'WARNING',
                        "⚠️ AGR Link: у объектов РАЗНЫЕ наборы UV-слоёв — join объединит их в "
                        "несколько каналов, грани без слоя получат нулевые UV")
+
+        # plain-Ctrl+J leftovers: absorb foreign table windows first, so every
+        # participant is a canonical container before the tables are merged
+        # (a standalone improvement - deliberately NOT rolled back on failure)
+        absorbed_tables = 0
+        for obj in participants:
+            recon = _reconcile_container(context, obj)
+            if recon:
+                absorbed_tables += recon.get("absorbed", 0)
 
         a_mat = active.matrix_world.copy()
         inv_active = a_mat.inverted()
@@ -1013,6 +1398,8 @@ class AGR_OT_link_join(Operator):
                f"(в памяти {n_inst} объектов, {n_groups} групп)")
         if merged_containers:
             msg += f", влито контейнеров: {merged_containers}"
+        if absorbed_tables:
+            msg += f", поглощено таблиц обычного Ctrl+J: {absorbed_tables}"
         agr_report(self, 'INFO', msg)
         return {'FINISHED'}
 
@@ -1189,8 +1576,9 @@ def _link_to_collections(obj, names, context, fallback_collections):
 def _extract_instances(op, context, container, target_ids):
     """Core disassembly: pull the given instance ids out of the container.
     Returns the list of created objects or None on error."""
-    table = read_table(container)
-    if table is None:
+    # blockers FIRST (read_table is a mutation-free view): a CANCELLED
+    # outcome must not leave a reconcile mutation stranded outside undo
+    if read_table(container) is None:
         agr_report(op, 'ERROR', "❌ AGR Link: активный объект — не контейнер AGR Link")
         return None
     if container.modifiers:
@@ -1200,6 +1588,13 @@ def _extract_instances(op, context, container, target_ids):
         return None
     if container.data.shape_keys:
         agr_report(op, 'ERROR', "❌ AGR Link: на контейнере есть shape keys — разборка невозможна")
+        return None
+    # absorb plain-Ctrl+J leftovers: materialises the same ids the panel
+    # showed (deterministic merge), so target_ids stay valid
+    recon = _reconcile_container(context, container)
+    table = read_table(container)
+    if table is None:
+        agr_report(op, 'ERROR', "❌ AGR Link: таблица контейнера не читается (данные повреждены)")
         return None
 
     mesh = container.data
@@ -1248,6 +1643,7 @@ def _extract_instances(op, context, container, target_ids):
         created = []  # (obj, entry, matrix_rel, group_id)
         done_ids = []
         skipped_singular = 0
+        skipped_stale = 0
         face_count_changed = 0
         for iid in extract:
             entry = table["instances"][str(iid)]
@@ -1268,6 +1664,14 @@ def _extract_instances(op, context, container, target_ids):
                                           extra_tol=float(table.get("co_quant", 0.0)))
             _remove_tracking_attrs(new_mesh)
             if frame is None:
+                if entry.get("matrix_stale"):
+                    # absorbed from a plain Ctrl+J and the coordinate fit
+                    # failed: the stored matrix belongs to the OLD container,
+                    # transforming by it would fling the piece - keep the
+                    # faces and the table entry instead
+                    bpy.data.meshes.remove(new_mesh)
+                    skipped_stale += 1
+                    continue
                 if abs(m_rel.determinant()) < 1e-12:
                     # non-invertible stored matrix and no coord attributes -
                     # keep the instance's faces and table entry
@@ -1461,10 +1865,14 @@ def _extract_instances(op, context, container, target_ids):
 
     renamed = [obj.name for obj, entry, *_ in created if obj.name != entry["name"]]
     warn_bits = []
+    if recon and recon.get("absorbed"):
+        warn_bits.append(f"поглощены таблицы обычного Ctrl+J: {recon['absorbed']}")
     if missing:
         warn_bits.append(f"без граней (пропущены, записи сохранены): {len(missing)}")
     if skipped_singular:
         warn_bits.append(f"необратимая матрица (пропущены): {skipped_singular}")
+    if skipped_stale:
+        warn_bits.append(f"позиция не восстановима после Ctrl+J (пропущены): {skipped_stale}")
     if face_count_changed:
         warn_bits.append(f"изменилось число граней (правки или сторонний Ctrl+J): {face_count_changed}")
     if unlinked_edited:
@@ -1540,9 +1948,9 @@ class AGR_OT_link_separate_all(Operator):
 # ----------------------------------------------------------------------------
 
 class AGR_OT_link_strip(Operator):
-    """Удалить память AGR Link с выделенных контейнеров (для полностью
-чистой сдачи): таблица, служебные атрибуты и color attributes.
-Разборка после этого станет НЕВОЗМОЖНА"""
+    """Удалить память AGR с выделенных объектов (для полностью чистой
+сдачи): таблица AGR Link, служебные атрибуты и color attributes, а также
+записи атласов/UDIM.  Разборка/распаковка станет НЕВОЗМОЖНА"""
     bl_idname = "agr.link_strip"
     bl_label = "Удалить память (сдача)"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1550,7 +1958,10 @@ class AGR_OT_link_strip(Operator):
     @classmethod
     def poll(cls, context):
         return (context.mode == 'OBJECT'
-                and any(o.type == 'MESH' and is_container(o)
+                and any(o.type == 'MESH'
+                        and (is_container(o)
+                             or ATLAS_STORE.peek(o) is not None
+                             or UDIM_STORE.peek(o) is not None)
                         for o in context.selected_objects))
 
     def invoke(self, context, event):
@@ -1559,13 +1970,31 @@ class AGR_OT_link_strip(Operator):
     def execute(self, context):
         count = 0
         for obj in context.selected_objects:
-            if obj.type != 'MESH' or read_table(obj) is None:
+            if obj.type != 'MESH':
                 continue
-            # colors-only container (fresh FBX import) has no idprop - pop, not del
-            obj.pop(PROP_KEY, None)
-            _remove_tracking_attrs(obj.data)
-            _TABLE_CACHE.pop(obj.name, None)
-            count += 1
+            had = False
+            if read_table(obj) is not None:
+                # colors-only container (fresh FBX import) has no idprop - pop, not del
+                obj.pop(PROP_KEY, None)
+                _remove_tracking_attrs(obj.data)
+                _TABLE_CACHE.pop(obj.name, None)
+                _MERGED_CACHE.pop(obj.name, None)
+                had = True
+            # atlas/UDIM records are AGR service data too - the delivery
+            # file must not carry any of the color mirrors
+            if ATLAS_STORE.peek(obj) is not None:
+                ATLAS_STORE.strip(obj)
+                had = True
+            if 'agr_atlas_applied' in obj:
+                # stripping the record while leaving this guard set would
+                # block BOTH Apply (flag) and Unpack (no record) forever
+                del obj['agr_atlas_applied']
+                had = True
+            if UDIM_STORE.peek(obj) is not None:
+                UDIM_STORE.strip(obj)
+                had = True
+            if had:
+                count += 1
         agr_report(self, 'INFO', f"✅ AGR Link: память удалена у {count} объектов — разборка невозможна")
         return {'FINISHED'}
 
@@ -1596,7 +2025,7 @@ class AGR_PT_LinkPanel(Panel):
         obj = context.active_object
         if obj is None or obj.type != 'MESH':
             return
-        table = _peek_table(obj)
+        table, extra_windows = _peek_merged(obj)
         if table is None:
             layout.label(text="Активный объект — не контейнер", icon='INFO')
             return
@@ -1610,6 +2039,10 @@ class AGR_PT_LinkPanel(Panel):
         layout.separator()
         layout.label(text=f"Контейнер: {len(instances)} объектов, {n_groups} групп",
                      icon='PACKAGE')
+        if extra_windows:
+            layout.label(text=f"Обычный Ctrl+J: влито контейнеров: {extra_windows}",
+                         icon='INFO')
+            layout.label(text="Память объединится при разборке или джойне")
 
         def group_label(gid, members):
             if len(members) > 1:
@@ -1651,5 +2084,6 @@ def register():
 
 def unregister():
     _TABLE_CACHE.clear()
+    _MERGED_CACHE.clear()
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

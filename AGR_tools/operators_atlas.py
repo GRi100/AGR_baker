@@ -18,6 +18,14 @@ except ImportError:
 
 # Import material utilities
 from .core.materials import connect_texture_set_to_material, connect_regular_texture_set_to_material, validate_all_high_mode
+import re
+
+from .core.atlas_store import (
+    entry_folder_abs, find_atlas_entry, iter_atlas_entries,
+    load_legacy_atlas_json, make_atlas_entry, read_atlas_record,
+    record_from_legacy, save_legacy_atlas_json, serialize_layout,
+    strip_atlas_record, write_atlas_record,
+)
 from .log import agr_report
 
 
@@ -644,7 +652,7 @@ class AGR_OT_CreateAtlasOnly(Operator):
                     agr_report(self, 'INFO', f"Атлас создан: {result['atlas_name']}")
 
                 # Обновляем список сетов
-                bpy.ops.agr.refresh_texture_sets()
+                bpy.ops.agr.refresh_texture_sets(skip_alpha_strip=True)
                 
                 return {'FINISHED'}
             else:
@@ -1312,44 +1320,22 @@ class AGR_OT_CreateAtlasOnly(Operator):
             scene.display_settings.display_device = original_display_device
 
     def save_atlas_mapping(self, output_path, atlas_name, atlas_type, atlas_size, layout, created_atlases):
-        """Сохраняет информацию о раскладке атласа в JSON"""
-        try:
-            mapping = {
-                'atlas_name': atlas_name,
-                'atlas_type': atlas_type,
-                'atlas_size': atlas_size,
-                'created_atlases': created_atlases,
-                'layout': [
-                    {
-                        'set_name': item['texture_set'].name,
-                        'material_name': item['texture_set'].material_name,
-                        'x': item['x'],
-                        'y': item['y'],
-                        'width': item['width'],
-                        'height': item['height'],
-                        'u_min': item['u_min'],
-                        'v_min': item['v_min'],
-                        'u_max': item['u_max'],
-                        'v_max': item['v_max']
-                    }
-                    for item in layout
-                ]
-            }
-            
-            mapping_path = os.path.join(output_path, 'atlas_mapping.json')
-            with open(mapping_path, 'w', encoding='utf-8') as f:
-                json.dump(mapping, f, ensure_ascii=False, indent=2)
-            
-            print(f"💾 Сохранен atlas_mapping.json")
-            
-        except Exception as e:
-            print(f"⚠️ Не удалось сохранить atlas_mapping.json: {e}")
+        """Legacy JSON writer (kept: this object-less path has no carrier
+        for a record) — one serializer with the record path."""
+        entry = make_atlas_entry(atlas_name, atlas_type, atlas_size, "",
+                                 output_path, created_atlases,
+                                 serialize_layout(layout))
+        save_legacy_atlas_json(output_path, entry)
 
 
 # ===== CREATE ATLAS FROM OBJECT OPERATOR =====
 
 class AGR_OT_CreateAtlasFromObject(Operator):
-    """Create atlas from object materials, assign material and layout UVs"""
+    """Create atlas from object materials, assign material and layout UVs.
+
+    NOT REGISTERED since 2.6.0 (user decision): the multi-atlas operator
+    covers this case exactly (one bin == one atlas).  The class stays as
+    the base carrying all compositing/apply helpers for the multi op."""
     bl_idname = "agr.create_atlas_from_object"
     bl_label = "Create Atlas from Object"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1448,7 +1434,7 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                     agr_report(self, 'INFO', f"Атлас создан и применен: {result['atlas_name']}")
 
                 # Обновляем список сетов
-                bpy.ops.agr.refresh_texture_sets()
+                bpy.ops.agr.refresh_texture_sets(skip_alpha_strip=True)
                 
                 return {'FINISHED'}
             else:
@@ -1520,16 +1506,19 @@ class AGR_OT_CreateAtlasFromObject(Operator):
                 texture_sets, atlas_size, layout, atlas_output_path, atlas_name, has_alpha, use_low_naming
             )
         
-        # Сохраняем atlas_mapping.json
-        self.save_atlas_mapping(atlas_output_path, atlas_name, atlas_type, atlas_size, layout, created_atlases)
-        
         # Создаем материал
         atlas_material = self.create_atlas_material(
             context, atlas_name, material_name, created_atlases, atlas_type
         )
-        
+
         # Применяем к объекту
         self.apply_atlas_to_object(context, obj, atlas_material, layout)
+
+        # Per-object atlas record (idprop + color mirror, survives FBX);
+        # atlas_mapping.json is legacy and no longer written on this path
+        write_atlas_record(obj, [make_atlas_entry(
+            atlas_name, atlas_type, atlas_size, atlas_material.name,
+            atlas_output_path, created_atlases, serialize_layout(layout))])
         
         print(f"\n✅ Атлас создан и применен!")
         print(f"{'='*60}\n")
@@ -2192,40 +2181,6 @@ class AGR_OT_CreateAtlasFromObject(Operator):
             scene.view_settings.look = original_look
             scene.display_settings.display_device = original_display_device
     
-    def save_atlas_mapping(self, output_path, atlas_name, atlas_type, atlas_size, layout, created_atlases):
-        """Сохраняет информацию о раскладке атласа в JSON"""
-        try:
-            mapping = {
-                'atlas_name': atlas_name,
-                'atlas_type': atlas_type,
-                'atlas_size': atlas_size,
-                'created_atlases': created_atlases,
-                'layout': [
-                    {
-                        'set_name': item['texture_set'].name,
-                        'material_name': item['texture_set'].material_name,
-                        'x': item['x'],
-                        'y': item['y'],
-                        'width': item['width'],
-                        'height': item['height'],
-                        'u_min': item['u_min'],
-                        'v_min': item['v_min'],
-                        'u_max': item['u_max'],
-                        'v_max': item['v_max']
-                    }
-                    for item in layout
-                ]
-            }
-            
-            mapping_path = os.path.join(output_path, 'atlas_mapping.json')
-            with open(mapping_path, 'w', encoding='utf-8') as f:
-                json.dump(mapping, f, ensure_ascii=False, indent=2)
-            
-            print(f"💾 Сохранен atlas_mapping.json")
-            
-        except Exception as e:
-            print(f"⚠️ Не удалось сохранить atlas_mapping.json: {e}")
-    
     def create_atlas_material(self, context, atlas_name, material_name, created_atlases, atlas_type):
         """Создает материал с атласными текстурами"""
         if material_name in bpy.data.materials:
@@ -2523,7 +2478,7 @@ class AGR_OT_CreateMultiAtlasFromObject(AGR_OT_CreateAtlasFromObject):
                     {'INFO'},
                     f"Создано атласов: {result['atlas_count']} ({atlas_size}px), материалов: {result['atlas_count']}"
                 )
-                bpy.ops.agr.refresh_texture_sets()
+                bpy.ops.agr.refresh_texture_sets(skip_alpha_strip=True)
                 return {'FINISHED'}
             else:
                 self.report({'ERROR'}, "Не удалось создать мульти-атлас")
@@ -2564,6 +2519,7 @@ class AGR_OT_CreateMultiAtlasFromObject(AGR_OT_CreateAtlasFromObject):
 
         atlas_materials = []
         atlas_names = []
+        atlas_entries = []
 
         for bin_idx, layout in enumerate(bin_layouts, start=1):
             bin_sets = [item['texture_set'] for item in layout]
@@ -2596,16 +2552,25 @@ class AGR_OT_CreateMultiAtlasFromObject(AGR_OT_CreateAtlasFromObject):
             finally:
                 self._atlas_file_index = 1
 
-            self.save_atlas_mapping(atlas_output_path, atlas_name, atlas_type, atlas_size, layout, created_atlases)
-
             atlas_material = self.create_atlas_material(
                 context, atlas_name, material_name, created_atlases, atlas_type
             )
             atlas_materials.append(atlas_material)
             atlas_names.append(atlas_name)
+            atlas_entries.append(make_atlas_entry(
+                atlas_name, atlas_type, atlas_size, atlas_material.name,
+                atlas_output_path, created_atlases, serialize_layout(layout),
+                bin_index=bin_idx - 1))
+            # on-disk safety copy: keeps the folder re-appliable even after
+            # Unpack strips the on-object record or the object is deleted
+            save_legacy_atlas_json(atlas_output_path, atlas_entries[-1])
 
         # Применяем все атласы к объекту (мультиматериальный вариант)
         self.apply_multi_atlas_to_object(context, obj, atlas_materials, bin_layouts)
+
+        # ONE per-object record with every bin - Unpack rebuilds them all
+        # (the legacy per-bin atlas_mapping.json only ever exposed one bin)
+        write_atlas_record(obj, atlas_entries)
 
         print(f"\n✅ Мульти-атлас создан и применен: {len(bin_layouts)} атлас(ов)")
         print(f"{'='*60}\n")
@@ -2705,22 +2670,35 @@ _atlas_enum_cache = []
 
 
 def get_available_atlases(self, context):
-    """Получает список доступных атласов для EnumProperty (сканирует A_* папки напрямую)"""
+    """Список атласов для EnumProperty: записи на объектах файла + legacy
+    atlas_mapping.json на диске.  Колбэк зовётся из draw() диалога —
+    только peek-чтения, никаких мутаций ID-данных."""
     global _atlas_enum_cache
     items = []
-    settings = context.scene.agr_baker_settings
+    seen = set()
 
-    # Получаем путь к AGR_BAKE
+    # 1) Per-object records (any mesh in the file carrying agr_atlas_data)
+    for _obj, entry in iter_atlas_entries(peek=True):
+        name = entry.get('atlas_name', '')
+        folder = entry_folder_abs(entry)
+        if not name or name in seen or not folder or not os.path.isdir(folder):
+            continue
+        seen.add(name)
+        size = entry.get('atlas_size', '?')
+        items.append((folder, name, f"Atlas: {name} ({size}x{size})"))
+
+    # 2) Legacy disk scan: A_* folders with atlas_mapping.json
+    settings = context.scene.agr_baker_settings
     blend_path = bpy.path.abspath("//")
     if blend_path:
         agr_bake_path = os.path.join(blend_path, settings.output_folder)
 
         if os.path.exists(agr_bake_path):
-            # Сканируем A_* папки
             for item in os.listdir(agr_bake_path):
+                if item in seen:
+                    continue
                 item_path = os.path.join(agr_bake_path, item)
                 if os.path.isdir(item_path) and item.startswith("A_"):
-                    # Проверяем наличие atlas_mapping.json
                     mapping_path = os.path.join(item_path, 'atlas_mapping.json')
                     if os.path.exists(mapping_path):
                         try:
@@ -2809,18 +2787,15 @@ class AGR_OT_ApplyAtlasToObject(Operator):
             self.report({'ERROR'}, "Папка атласа не найдена")
             return {'CANCELLED'}
         
-        # Загружаем atlas_mapping.json
-        mapping_path = os.path.join(atlas_folder_path, 'atlas_mapping.json')
-        if not os.path.exists(mapping_path):
-            self.report({'ERROR'}, f"Не найден atlas_mapping.json для атласа")
-            return {'CANCELLED'}
-        
-        try:
-            with open(mapping_path, 'r', encoding='utf-8') as f:
-                mapping = json.load(f)
-        except Exception as e:
-            self.report({'ERROR'}, f"Ошибка чтения atlas_mapping.json: {e}")
-            return {'CANCELLED'}
+        # Источник раскладки: запись на любом объекте файла, затем legacy
+        # atlas_mapping.json рядом с текстурами (execute — мутации разрешены)
+        _src_obj, mapping = find_atlas_entry(atlas_name, peek=False)
+        if mapping is None:
+            legacy = load_legacy_atlas_json(atlas_folder_path)
+            if legacy is None:
+                self.report({'ERROR'}, "Нет записи атласа на объектах и не найден atlas_mapping.json")
+                return {'CANCELLED'}
+            mapping = record_from_legacy(legacy, atlas_folder_path)
         
         # Проверяем, что все материалы объекта есть в атласе
         obj_materials = [slot.material.name for slot in obj.material_slots if slot.material]
@@ -2890,14 +2865,16 @@ class AGR_OT_ApplyAtlasToObject(Operator):
         
         print(f"💾 Сохранено {len(face_to_material)} полигонов с материалами")
 
-        # Имя материала по конвенции M_Address_Type_1 (как у Create Atlas
-        # from Object в LOW-схеме); фолбэк на M_<atlas_name> для объектов
-        # вне SM_-паттерна
-        try:
-            address, obj_type = process_object_name(obj.name)
-            atlas_material_name = f"M_{address}_{obj_type}_1"
-        except Exception:
-            atlas_material_name = f"M_{atlas_name}"
+        # Имя материала БИНА из записи (у мульти-атласа каждый бин несёт
+        # своё M_addr_Type_i — конвенция с хардкодом _1 подсовывала бину 2
+        # материал бина 1); фолбэк на конвенцию для legacy JSON без имени
+        atlas_material_name = (mapping.get('material_name') or '').strip()
+        if not atlas_material_name:
+            try:
+                address, obj_type = process_object_name(obj.name)
+                atlas_material_name = f"M_{address}_{obj_type}_1"
+            except Exception:
+                atlas_material_name = f"M_{atlas_name}"
 
         if atlas_material_name not in bpy.data.materials:
             # Пытаемся создать материал из текстур атласа
@@ -2959,7 +2936,13 @@ class AGR_OT_ApplyAtlasToObject(Operator):
         # Guard against a second (non-idempotent) UV remap; cleared by Unpack
         obj['agr_atlas_applied'] = atlas_material_name
 
-        print(f"✅ UV раскладка применена: обработано {processed_faces} полигонов по JSON маппингу")
+        # Copy/migrate the atlas record onto THIS object — Unpack then works
+        # from the object alone (no folder JSON needed, survives FBX)
+        entry = dict(mapping)
+        entry['material_name'] = atlas_material_name
+        write_atlas_record(obj, [entry])
+
+        print(f"✅ UV раскладка применена: обработано {processed_faces} полигонов")
 
     def create_atlas_material_from_textures(self, atlas_folder_path, atlas_name, mapping, material_name=None):
         """Создает материал атласа из текстур"""
@@ -3098,28 +3081,36 @@ class AGR_OT_UnpackAtlasToMaterials(Operator):
         print(f"Активный материал: {active_material.name}")
         
         try:
-            # 1. Находим путь к текстуре атласа через Base Color
-            atlas_folder = self.find_atlas_folder_from_material(active_material)
-            
-            if not atlas_folder:
-                self.report({'ERROR'}, "Не удалось найти папку атласа через текстуру Base Color")
-                return {'CANCELLED'}
-            
-            print(f"📁 Найдена папка атласа: {atlas_folder}")
-            
-            # 2. Загружаем atlas_mapping.json
-            mapping_path = os.path.join(atlas_folder, 'atlas_mapping.json')
-            if not os.path.exists(mapping_path):
-                self.report({'ERROR'}, f"Не найден atlas_mapping.json в {atlas_folder}")
-                return {'CANCELLED'}
-            
-            with open(mapping_path, 'r', encoding='utf-8') as f:
-                mapping = json.load(f)
-            
-            print(f"📄 Загружен atlas_mapping.json")
-            print(f"  Атлас: {mapping['atlas_name']}")
+            # 1-2. Источник раскладки: запись на объекте (ВСЕ бины), затем
+            # legacy atlas_mapping.json через текстуру Base Color
+            record = read_atlas_record(obj)
+            if record and record.get('atlases'):
+                entries = [e for e in record['atlases'] if isinstance(e, dict)]
+                print(f"📄 Запись атласа на объекте: {len(entries)} атлас(ов)")
+            else:
+                atlas_folder = self.find_atlas_folder_from_material(active_material)
+                if not atlas_folder:
+                    self.report({'ERROR'}, "Нет записи атласа на объекте и не найдена папка через Base Color")
+                    return {'CANCELLED'}
+                print(f"📁 Найдена папка атласа: {atlas_folder}")
+                legacy = load_legacy_atlas_json(atlas_folder)
+                if legacy is None:
+                    self.report({'ERROR'}, f"Не найден atlas_mapping.json в {atlas_folder}")
+                    return {'CANCELLED'}
+                entries = [record_from_legacy(legacy, atlas_folder)]
+                # no record migration here: unpack works from `entries`
+                # directly, and a CANCELLED precondition further down must
+                # not leave a fresh record outside the undo stack
+                print(f"📄 Загружен atlas_mapping.json")
+
+            mapping = {
+                'atlas_name': ", ".join(e.get('atlas_name', '') for e in entries),
+                'atlas_type': entries[0].get('atlas_type', 'HIGH'),
+                'atlas_size': entries[0].get('atlas_size', 0),
+                'layout': [item for e in entries for item in e.get('layout', [])],
+            }
+            print(f"  Атлас(ы): {mapping['atlas_name']}")
             print(f"  Тип: {mapping['atlas_type']}")
-            print(f"  Размер: {mapping['atlas_size']}")
             print(f"  Материалов в атласе: {len(mapping['layout'])}")
             
             # 3. Проверяем наличие всех материалов в texture sets
@@ -3142,7 +3133,7 @@ class AGR_OT_UnpackAtlasToMaterials(Operator):
                     return {'CANCELLED'}
 
             # 4. Распаковываем атлас
-            result = self.unpack_atlas(context, obj, mapping, texture_sets_list)
+            result = self.unpack_atlas(context, obj, entries, texture_sets_list)
             
             if result:
                 self.report({'INFO'}, f"Атлас распакован: {result['materials_count']} материалов, {result['faces_processed']} полигонов")
@@ -3218,20 +3209,34 @@ class AGR_OT_UnpackAtlasToMaterials(Operator):
         
         return missing_materials
     
-    def unpack_atlas(self, context, obj, mapping, texture_sets_list):
-        """Распаковывает атлас обратно в отдельные материалы"""
-        
-        # Создаем маппинг UV region -> material_name
+    def unpack_atlas(self, context, obj, entries, texture_sets_list):
+        """Распаковывает атлас(ы) обратно в отдельные материалы.
+
+        entries — список записей атласа (один элемент на бин).  Регионы
+        разных бинов ПЕРЕКРЫВАЮТСЯ в UV 0..1, поэтому фейс ищет свой регион
+        только в раскладке СВОЕГО бина (по материалу его слота)."""
+        # Регионы по бинам + сводный словарь для создания материалов
+        bin_regions = []
         uv_region_to_material = {}
-        for item in mapping['layout']:
-            mat_name = item['material_name']
-            uv_region_to_material[mat_name] = {
-                'u_min': item['u_min'],
-                'v_min': item['v_min'],
-                'u_max': item['u_max'],
-                'v_max': item['v_max']
-            }
-        
+        for e in entries:
+            regions = {}
+            for item in e.get('layout', []):
+                coords = {
+                    'u_min': item['u_min'],
+                    'v_min': item['v_min'],
+                    'u_max': item['u_max'],
+                    'v_max': item['v_max']
+                }
+                regions[item['material_name']] = coords
+                uv_region_to_material[item['material_name']] = coords
+            bin_regions.append(regions)
+
+        # Бин фейса определяется материалом его слота (атласным материалом)
+        mat_to_bin = {}
+        for i, e in enumerate(entries):
+            if e.get('material_name'):
+                mat_to_bin[e['material_name']] = i
+
         print(f"\n📋 UV регионы атласа:")
         for mat_name, coords in uv_region_to_material.items():
             print(f"  {mat_name}: ({coords['u_min']:.3f}, {coords['v_min']:.3f}) - ({coords['u_max']:.3f}, {coords['v_max']:.3f})")
@@ -3261,9 +3266,25 @@ class AGR_OT_UnpackAtlasToMaterials(Operator):
             center_u = sum(uv[0] for uv in poly_uvs) / len(poly_uvs)
             center_v = sum(uv[1] for uv in poly_uvs) / len(poly_uvs)
             
+            # Регионы только СВОЕГО бина (мульти-атлас): регионы бинов
+            # перекрываются в UV 0..1, объединение молча сматчило бы фейс
+            # с чужим регионом — неизвестный слот честно уходит в unmatched
+            regions = uv_region_to_material
+            if len(bin_regions) > 1:
+                slot = (obj.material_slots[poly.material_index]
+                        if poly.material_index < len(obj.material_slots) else None)
+                slot_mat = slot.material.name if slot and slot.material else None
+                bin_idx = mat_to_bin.get(slot_mat)
+                if bin_idx is None and slot_mat:
+                    # FBX/append collisions rename the material to *.001
+                    bin_idx = mat_to_bin.get(re.sub(r'\.\d{3}$', '', slot_mat))
+                if bin_idx is None:
+                    continue  # counted by the unmatched guard below
+                regions = bin_regions[bin_idx]
+
             # Определяем к какому региону атласа принадлежит полигон
             matched_material = None
-            for mat_name, coords in uv_region_to_material.items():
+            for mat_name, coords in regions.items():
                 if (coords['u_min'] <= center_u <= coords['u_max'] and
                     coords['v_min'] <= center_v <= coords['v_max']):
                     matched_material = mat_name
@@ -3273,7 +3294,7 @@ class AGR_OT_UnpackAtlasToMaterials(Operator):
                 face_to_material[poly.index] = matched_material
                 
                 # Сохраняем оригинальные UV и вычисляем обратную трансформацию
-                coords = uv_region_to_material[matched_material]
+                coords = regions[matched_material]
                 original_uvs = []
                 u_range = coords['u_max'] - coords['u_min']
                 v_range = coords['v_max'] - coords['v_min']
@@ -3359,9 +3380,18 @@ class AGR_OT_UnpackAtlasToMaterials(Operator):
                 
                 faces_processed += 1
         
+        # On-disk safety copy BEFORE the record is stripped: for atlases
+        # created from an object the record was the ONLY layout copy - the
+        # folder must stay re-appliable after Unpack
+        for e in entries:
+            folder = entry_folder_abs(e)
+            if folder and os.path.isdir(folder):
+                save_legacy_atlas_json(folder, e)
+
         # Object is back to individual materials — allow atlas apply again
         if 'agr_atlas_applied' in obj:
             del obj['agr_atlas_applied']
+        strip_atlas_record(obj)
 
         print(f"\n✅ Распаковка завершена:")
         print(f"  Материалов: {len(material_objects)}")
@@ -3380,7 +3410,8 @@ classes = (
     AGR_OT_PreviewAtlasLayout,
     AGR_OT_PreviewAtlasLayoutFromObject,
     AGR_OT_CreateAtlasOnly,
-    AGR_OT_CreateAtlasFromObject,
+    # AGR_OT_CreateAtlasFromObject is NOT registered (superseded by the
+    # multi-atlas operator; kept in code as its base class)
     AGR_OT_CreateMultiAtlasFromObject,
     AGR_OT_ApplyAtlasToObject,
     AGR_OT_UnpackAtlasToMaterials,

@@ -4,7 +4,7 @@ Additional operators for texture set management
 
 import bpy
 from bpy.types import Operator
-from bpy.props import EnumProperty, IntProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty
 import os
 import re
 
@@ -14,9 +14,11 @@ from .log import agr_report
 
 def strip_useless_alpha_in_folders(folders):
     """Convert every RGBA PNG whose alpha channel is fully white to RGB.
-    Returns the number of converted files. Requires Pillow (caller checks)."""
+    Returns the number of converted files. Requires Pillow (caller checks).
+    16-bit PNGs are left alone: Pillow loads them as 8-bit, so a re-save
+    would silently halve the depth of externally authored files."""
     from PIL import Image
-    from .core.texture_sets import png_has_alpha
+    from .core.texture_sets import png_bit_depth, png_has_alpha
 
     converted = 0
     for folder in folders:
@@ -28,12 +30,15 @@ def strip_useless_alpha_in_folders(folders):
             path = os.path.join(folder, fname)
             if not png_has_alpha(path):
                 continue
+            if png_bit_depth(path) != 8:
+                continue
             try:
                 with Image.open(path) as img:
                     if 'A' not in img.getbands():
                         continue
                     # getextrema is a C pass — no python-list materialization
-                    if img.getchannel('A').getextrema()[0] < 254:
+                    # (only a FULLY white alpha counts as useless)
+                    if img.getchannel('A').getextrema()[0] < 255:
                         continue
                     rgb = img.convert('RGB')
                 try:
@@ -53,6 +58,11 @@ class AGR_OT_RefreshTextureSets(Operator):
     bl_label = "Refresh Texture Sets"
     bl_options = {'REGISTER'}
 
+    # Programmatic refreshes (atlas/convert/UDIM operators re-scan the list
+    # mid-flow) pass True: the alpha strip rewrites PNGs ON DISK, which
+    # only the user-facing Refresh should do
+    skip_alpha_strip: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
+
     def execute(self, context):
         # Thumbnails may reference replaced/deleted files after a rescan
         from . import ui
@@ -60,10 +70,10 @@ class AGR_OT_RefreshTextureSets(Operator):
 
         count = texture_sets.refresh_texture_sets_list(context)
 
-        # Optional auto-cleanup: RGBA files with a fully white alpha come
-        # from external/legacy sources and only skew alpha detection
-        settings = context.scene.agr_baker_settings
-        if getattr(settings, 'auto_strip_alpha', False):
+        # Auto-cleanup (always on for the manual Refresh): RGBA files with a
+        # fully white alpha come from external/legacy sources and only skew
+        # alpha detection
+        if not self.skip_alpha_strip:
             try:
                 from PIL import Image  # noqa: F401
             except ImportError:

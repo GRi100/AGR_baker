@@ -1433,6 +1433,96 @@ class AGR_OT_rename_lights_root_dialog(Operator):
         return {'FINISHED'}
 
 
+# ============= Autofill address from the scene =============
+
+# The lowpoly collection is the imported FBX name: NNNN_<address>_Ground[.fbx]
+# (e.g. "0109_BolshaiaPirogovskaia_ZU_51_1_Ground.fbx" -> number "0109",
+# address "BolshaiaPirogovskaia_ZU_51_1").  BOTH the 4-digit number AND the
+# _Ground tail are REQUIRED — that is what tells the lowpoly collection apart
+# from every other NNNN_* collection in the scene.
+_LOWPOLY_COLL_RE = re.compile(r'^(\d{4})_(.+?)_Ground(?:\.[Ff][Bb][Xx])?$')
+
+
+def _strip_dup_suffix(name):
+    """Blender's '.001' duplicate suffix."""
+    return re.sub(r'\.\d{3}$', '', name)
+
+
+def find_lowpoly_collections(scene):
+    """Collections named NNNN_<address>_Ground[.fbx] in the scene tree, in
+    tree order.  Returns [(number, address, collection_name)]; a collection
+    linked in several places is visited once."""
+    found = []
+    seen = set()
+
+    def walk(coll):
+        if coll.as_pointer() in seen:
+            return
+        seen.add(coll.as_pointer())
+        match = _LOWPOLY_COLL_RE.match(_strip_dup_suffix(coll.name))
+        if match:
+            found.append((match.group(1), match.group(2), coll.name))
+        for child in coll.children:
+            walk(child)
+
+    if scene is not None:
+        for child in scene.collection.children:
+            walk(child)
+    return found
+
+
+class AGR_OT_rename_autofill_address(Operator):
+    """Найти lowpoly-коллекцию вида 0109_Адрес_Ground(.fbx) и подставить
+номер lowpoly и адрес в поля панели"""
+    bl_idname = "agr.rename_autofill_address"
+    bl_label = "Заполнить из сцены"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        matches = find_lowpoly_collections(scene)
+        if not matches:
+            self.report({'ERROR'},
+                        "Не найдена lowpoly-коллекция вида NNNN_Адрес_Ground "
+                        "(например 0109_BolshaiaPirogovskaia_ZU_51_1_Ground.fbx)")
+            return {'CANCELLED'}
+        number, address, coll_name = matches[0]
+        scene.agr_rp_project_lowpoly_number = number
+        scene.agr_rename_address = address
+        if len(matches) > 1:
+            others = ", ".join(m[2] for m in matches[1:])
+            self.report({'WARNING'},
+                        f"Взята первая коллекция: {coll_name}; ещё найдены: {others}")
+        else:
+            self.report({'INFO'}, f"Адрес заполнен из коллекции: {coll_name}")
+        print(f"📍 AGR Rename: адрес из коллекции — {number}_{address}")
+        return {'FINISHED'}
+
+
+@bpy.app.handlers.persistent
+def _autofill_address_on_load(_dummy):
+    """Fill BOTH address props from the lowpoly collection name on file
+    load — ONLY when both are empty (a partially filled state is the
+    user's own choice).  Exceptions are swallowed: a handler error would
+    spam EVERY file open."""
+    try:
+        scene = bpy.context.scene
+        if scene is None:
+            return
+        if getattr(scene, 'agr_rename_address', '') or \
+                getattr(scene, 'agr_rp_project_lowpoly_number', ''):
+            return
+        matches = find_lowpoly_collections(scene)
+        if not matches:
+            return
+        number, address, coll_name = matches[0]
+        scene.agr_rp_project_lowpoly_number = number
+        scene.agr_rename_address = address
+        print(f"📍 AGR Rename: адрес заполнен из коллекции {coll_name} — {number}_{address}")
+    except Exception as exc:
+        print(f"⚠️ AGR Rename autofill on load: {exc}")
+
+
 # ============= Register =============
 
 
@@ -1460,6 +1550,7 @@ classes = (
     AGR_OT_rename_geojson,
     AGR_OT_rename_lights_root,
     AGR_OT_rename_lights_root_dialog,
+    AGR_OT_rename_autofill_address,
 )
 
 
@@ -1491,11 +1582,17 @@ def register():
         description="Тип объекта стекла",
         default="",
     )
-    
+
+    if _autofill_address_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_autofill_address_on_load)
+
     print("✅ Rename operators registered")
 
 
 def unregister():
+    if _autofill_address_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_autofill_address_on_load)
+
     if hasattr(bpy.types.Scene, "agr_rename_address"):
         del bpy.types.Scene.agr_rename_address
     if hasattr(bpy.types.Scene, "agr_glass_address"):

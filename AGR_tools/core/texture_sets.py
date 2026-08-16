@@ -8,6 +8,8 @@ import json
 import struct
 from pathlib import Path
 
+from .atlas_store import atlas_type_for
+
 
 def get_agr_bake_folder(context):
     """Get AGR_BAKE folder path next to blend file"""
@@ -83,6 +85,137 @@ def png_has_alpha(filepath):
     return read_png_ihdr(filepath)[2] in (4, 6)
 
 
+def png_bit_depth(filepath):
+    """Bit depth from the PNG IHDR (8/16); 0 for unreadable files.  Lives
+    next to read_png_ihdr — the ONE place PNG headers are parsed."""
+    try:
+        with open(filepath, 'rb') as f:
+            if f.read(8) != b'\x89PNG\r\n\x1a\n':
+                return 0
+            f.read(4)  # chunk length
+            if f.read(4) != b'IHDR':
+                return 0
+            ihdr_data = f.read(9)  # width(4) + height(4) + bit_depth(1)
+            if len(ihdr_data) != 9:
+                return 0
+            return ihdr_data[8]
+    except Exception:
+        return 0
+
+
+# ============================================================
+# Material texture resolutions (stub detection for AGR UV)
+# ============================================================
+
+def material_images(mat):
+    """Every TEX_IMAGE image of the material, descending into GROUP nodes.
+
+    Semantics kept IDENTICAL to SintezAGRChecker._material_images (the
+    acceptance tool): muted/unconnected nodes are NOT skipped, node trees
+    are deduped by pointer (embedded trees all share one name)."""
+    images = []
+    if not mat or not mat.use_nodes or not mat.node_tree:
+        return images
+    stack = [mat.node_tree]
+    visited = set()
+    while stack:
+        tree = stack.pop()
+        if tree is None or tree.as_pointer() in visited:
+            continue
+        visited.add(tree.as_pointer())
+        for node in tree.nodes:
+            if node.type == 'TEX_IMAGE' and node.image is not None:
+                images.append(node.image)
+            elif node.type == 'GROUP':
+                stack.append(node.node_tree)
+    return images
+
+
+_UDIM_PATH_TOKENS = ("<UDIM>", "<udim>", "%(UDIM)d")
+
+
+def _tile_pixel_side(image, tile):
+    """Largest pixel side of ONE UDIM tile.  tile.size stays (0, 0) until
+    Blender loads the tile into memory, so fall back to reading the PNG
+    header of the tile file on disk (read_png_ihdr)."""
+    size = getattr(tile, "size", None)
+    if size and max(size[0], size[1]) > 0:
+        return max(size[0], size[1])
+    raw_path = image.filepath_raw or image.filepath
+    if not raw_path:
+        return 0
+    path = bpy.path.abspath(raw_path)
+    resolved = None
+    for token in _UDIM_PATH_TOKENS:
+        if token in path:
+            resolved = path.replace(token, str(tile.number))
+            break
+    if resolved is None and "<UVTILE>" in path:
+        # Blender's second tiled naming scheme: u<col>_v<row>
+        col = (tile.number - 1001) % 10 + 1
+        row = (tile.number - 1001) // 10 + 1
+        resolved = path.replace("<UVTILE>", f"u{col}_v{row}")
+    if resolved is None and ".1001." in path:
+        # tiled images loaded from a concrete first-tile file path
+        resolved = path.replace(".1001.", f".{tile.number:04d}.")
+    if resolved is None or not os.path.exists(resolved):
+        return 0
+    width, height, _color_type = read_png_ihdr(resolved)
+    return max(width, height)
+
+
+def _fixed_pixel_side(img):
+    """Largest pixel side of a NON-tiled image, with the same disk fallback
+    as tiles: an unloaded image reports size (0, 0)."""
+    side = max(img.size[0], img.size[1]) if img.size else 0
+    if side > 0:
+        return side
+    raw_path = img.filepath_raw or img.filepath
+    if not raw_path:
+        return 0
+    path = bpy.path.abspath(raw_path)
+    if not os.path.exists(path):
+        return 0
+    width, height, _color_type = read_png_ihdr(path)
+    return max(width, height)
+
+
+def material_texture_entry(mat):
+    """Measurement resolution of one material, checker-compatible:
+    ("tiles", {udim_number: max_side})  UDIM material — per-tile max over
+                                        every map of that tile; non-tiled
+                                        images of the material are ignored
+    ("fixed", max_side)                 regular material
+    None                                material has no textures, or a
+                                        non-tiled image's size cannot be
+                                        resolved (unloaded AND unreadable
+                                        on disk) — an unknown size must
+                                        never classify the material as a
+                                        stub, the destructive stub unwrap
+                                        gates on this number."""
+    tiles = {}
+    fixed = 0
+    fixed_unknown = False
+    for img in material_images(mat):
+        if img.source == 'TILED':
+            for tile in img.tiles:
+                side = _tile_pixel_side(img, tile)
+                if side > 0:
+                    tiles[tile.number] = max(tiles.get(tile.number, 0), side)
+        else:
+            side = _fixed_pixel_side(img)
+            if side <= 0:
+                fixed_unknown = True
+            fixed = max(fixed, side)
+    if tiles:
+        return ("tiles", tiles)
+    if fixed_unknown:
+        return None
+    if fixed > 0:
+        return ("fixed", fixed)
+    return None
+
+
 def _read_png_max_dimension(filepath):
     """Read max(width, height) from a PNG IHDR without loading the image.
     Returns 0 when the file is not a readable PNG."""
@@ -135,6 +268,9 @@ def scan_texture_sets(context):
                         atlas_type = json.load(f).get('atlas_type', 'HIGH')
                 except Exception as e:
                     print(f"  ⚠️ Could not read atlas_mapping.json in {item}: {e}")
+            else:
+                # No legacy JSON — ask the per-object records in the file
+                atlas_type = atlas_type_for(item, default='HIGH')
 
             if not texture_info['has_any']:
                 # LOW atlases use short-suffix filenames (T_X_d.png ...) —

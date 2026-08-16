@@ -39,11 +39,13 @@ from bpy.props import (
     EnumProperty,
     FloatProperty,
     FloatVectorProperty,
+    IntProperty,
     PointerProperty,
 )
 from bpy.types import Operator, Panel, PropertyGroup
 
 from .log import agr_report, logger
+from .core.texture_sets import material_texture_entry
 from .operators_udim import object_has_udim
 
 # Safety cap for the cut operator: max grid lines per object (both axes)
@@ -134,6 +136,20 @@ class AGR_UVGridSettings(PropertyGroup):
         ],
         default='SELECTION',
         update=_tag_redraw_view3d,
+    )
+
+    # --- stub unwrap ---
+    stub_threshold: IntProperty(
+        name="Порог заглушки",
+        description="Материал/тайл считается заглушкой, когда его наибольшая "
+                    "текстура не превышает этот размер в пикселях",
+        default=256, min=1, max=8192, subtype='PIXEL',
+    )
+    stub_margin: FloatProperty(
+        name="Отступ",
+        description="Масштаб фейса внутри UV-квадрата (0.9 = 5% отступ от "
+                    "каждого края, чтобы развёртка не касалась границ)",
+        default=0.9, min=0.1, max=1.0,
     )
 
     # --- common options ---
@@ -998,10 +1014,10 @@ def _report_no_targets(op, settings):
         agr_report(op, 'ERROR', "Нет фейсов для обработки")
 
 
-def _note_uv_overwrite(obj, bm, faces, atlas_objects, udim_objects):
+def _note_uv_overwrite_counts(obj, n_total, n_touched, atlas_objects, udim_objects):
     """Track objects whose special UV state gets overwritten by a rewrite."""
     if obj.get('agr_atlas_applied'):
-        if len(faces) == len(bm.faces):
+        if n_touched == n_total:
             # every atlas UV gets rewritten -> the re-apply guard would
             # only block a now-perfectly-valid atlas application
             del obj['agr_atlas_applied']
@@ -1009,6 +1025,86 @@ def _note_uv_overwrite(obj, bm, faces, atlas_objects, udim_objects):
     if object_has_udim(obj):
         # integer UV part IS the tile number for the UDIM tools
         udim_objects.append(obj.name)
+
+
+def _note_uv_overwrite(obj, bm, faces, atlas_objects, udim_objects):
+    _note_uv_overwrite_counts(obj, len(bm.faces), len(faces),
+                              atlas_objects, udim_objects)
+
+
+# ============================================================
+# Stub unwrap: every face of a stub material/tile fills its unit square
+# ============================================================
+
+_STUB_EPS = 1e-9
+
+
+def _stub_face_uvs(pts, normal, tile_uv=(0.0, 0.0), margin=0.9):
+    """Project ONE face onto its own plane and stretch it to fill the unit
+    square (user decision: faces are laid on top of each other), then scale
+    by `margin` around (0.5, 0.5) and shift into its UDIM tile.
+
+    Basis: x = first edge projected into the plane (rotation-stable),
+    y = n × x, so (x × y)·n = +1 and the mapping is never mirrored.
+    Returns [(u, v)] in loop order, or None for a degenerate face."""
+    n = normal.normalized()
+    if n.length < 0.5:
+        return None
+    x = pts[1] - pts[0]
+    x = x - n * x.dot(n)
+    if x.length < _STUB_EPS:
+        up = Vector((0.0, 0.0, 1.0)) if abs(n.z) < 0.9 else Vector((1.0, 0.0, 0.0))
+        x = n.cross(up)
+        if x.length < _STUB_EPS:
+            return None
+    x.normalize()
+    y = n.cross(x)
+    flat = [((p - pts[0]).dot(x), (p - pts[0]).dot(y)) for p in pts]
+    min_x = min(p[0] for p in flat)
+    max_x = max(p[0] for p in flat)
+    min_y = min(p[1] for p in flat)
+    max_y = max(p[1] for p in flat)
+    width = max_x - min_x
+    height = max_y - min_y
+    if width < _STUB_EPS or height < _STUB_EPS:
+        return None
+    out = []
+    for px, py in flat:
+        u = (px - min_x) / width    # NON-UNIFORM stretch fills both axes
+        v = (py - min_y) / height
+        u = 0.5 + (u - 0.5) * margin  # margin keeps UVs off the square edges
+        v = 0.5 + (v - 0.5) * margin
+        out.append((u + tile_uv[0], v + tile_uv[1]))
+    return out
+
+
+def _uv_to_udim_number(u, v):
+    """Checker-compatible tile number (SintezAGRChecker.uv_to_udim_number):
+    1000 + floor(v)*10 + ceil(u), clamped — ceil(0.0) == 0 would otherwise
+    vote for the non-existent tile 1000.  Returns None OUTSIDE the valid
+    UDIM zone (negative UVs — a deliberate parking area that revert_udim
+    also protects — and u past the 10-column row end): a clamped/wrapped
+    number would silently TELEPORT the face onto a real tile."""
+    if u < 0.0 or v < 0.0 or u > 10.0:
+        return None
+    return max(1001, 1000 + int(floor(v)) * 10 + int(ceil(u)))
+
+
+def _face_tile_number(uvs):
+    """Unanimous vote over the face's loop UVs, falling back to the face
+    mean UV when the loops straddle a tile border.  None when the face
+    sits outside the valid UDIM zone."""
+    nums = [_uv_to_udim_number(u, v) for u, v in uvs]
+    if nums and nums[0] is not None and all(num == nums[0] for num in nums):
+        return nums[0]
+    mu = sum(u for u, _v in uvs) / len(uvs)
+    mv = sum(v for _u, v in uvs) / len(uvs)
+    return _uv_to_udim_number(mu, mv)
+
+
+def _tile_offset(num):
+    """UDIM number -> integer (u, v) offset of its unit square."""
+    return float((num - 1001) % 10), float((num - 1001) // 10)
 
 
 # ============================================================
@@ -1729,6 +1825,258 @@ class AGR_OT_UVGridCutUnwrap(_AGR_UVGridPollMixin, Operator):
 # Panel
 # ============================================================
 
+class AGR_OT_UVUnwrapStub(Operator):
+    """Unwrap every polygon of stub (small-texture) materials and tiles"""
+    bl_idname = "agr.uv_unwrap_stub"
+    bl_label = "Развернуть заглушки"
+    bl_description = ("Найти материалы и UDIM-тайлы, чья наибольшая текстура "
+                      "не превышает порог (заглушки), и развернуть ВСЕ их "
+                      "полигоны: каждый растягивается на весь UV-квадрат "
+                      "своего тайла внахлёст, с отступом от краёв")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        if context.mode != 'OBJECT':
+            cls.poll_message_set("Работает в объектном режиме")
+            return False
+        if any(o.type == 'MESH' for o in context.selected_objects):
+            return True
+        if context.active_object is not None and context.active_object.type == 'MESH':
+            return True
+        cls.poll_message_set("Выберите MESH-объекты")
+        return False
+
+    def execute(self, context):
+        settings = _get_settings(context)
+        threshold = settings.stub_threshold if settings else 256
+        margin = settings.stub_margin if settings else 0.9
+
+        objs = [o for o in context.selected_objects if o.type == 'MESH']
+        if not objs and context.active_object is not None \
+                and context.active_object.type == 'MESH':
+            objs = [context.active_object]
+        # one pass per MESH datablock: linked duplicates share the UV layer,
+        # a second pass would double-count and (with OBJECT-linked slot
+        # overrides) flatten another object's faces
+        seen_data = set()
+        unique_objs = []
+        for o in objs:
+            if o.data in seen_data:
+                continue
+            seen_data.add(o.data)
+            unique_objs.append(o)
+
+        stats = {'faces': 0, 'materials': 0, 'tiles': 0,
+                 'degenerate': 0, 'out_of_tiles': 0, 'override_slots': 0,
+                 'found_objects': 0,
+                 'atlas_objects': [], 'udim_objects': []}
+        for obj in unique_objs:
+            self._process_object(obj, threshold, margin, stats)
+
+        if stats['faces'] == 0:
+            if stats['found_objects']:
+                agr_report(self, 'WARNING',
+                           "⚠️ Стаб-материалы найдены, но ни один фейс не "
+                           "затронут (фейсы на других слотах/тайлах)")
+            else:
+                agr_report(self, 'WARNING',
+                           f"⚠️ Заглушки (≤{threshold}px) не найдены в материалах "
+                           f"выбранных объектов")
+            return {'CANCELLED'}
+
+        msg = (f"✅ Stub-развёртка: фейсов {stats['faces']}, "
+               f"материалов {stats['materials']}, тайлов {stats['tiles']}")
+        level = 'INFO'
+        if stats['degenerate']:
+            msg += f", вырожденных пропущено {stats['degenerate']}"
+        if stats['out_of_tiles']:
+            msg += f", вне известных тайлов {stats['out_of_tiles']}"
+        if stats['override_slots']:
+            msg += (f", пропущено OBJECT-слотов {stats['override_slots']} "
+                    f"(меш общий, оверрайд объекта не правит всех)")
+        if stats['atlas_objects']:
+            msg += f" | ⚠️ перезаписаны UV атласа: {', '.join(stats['atlas_objects'])}"
+            level = 'WARNING'
+        if stats['udim_objects']:
+            msg += (f" | ⚠️ перезаписана развёртка UDIM-объектов: "
+                    f"{', '.join(stats['udim_objects'])}")
+            level = 'WARNING'
+        agr_report(self, level, msg)
+        return {'FINISHED'}
+
+    @staticmethod
+    def _process_object(obj, threshold, margin, stats):
+        mesh = obj.data
+        stub_fixed_slots = set()
+        tile_maps = {}  # slot index -> (all tiles, stub tiles)
+        for idx, slot in enumerate(obj.material_slots):
+            if slot.link == 'OBJECT':
+                # the UV write goes into the SHARED mesh; a per-object
+                # material override must not reshape every user of it
+                if material_texture_entry(slot.material) is not None:
+                    stats['override_slots'] += 1
+                continue
+            entry = material_texture_entry(slot.material)
+            if entry is None:
+                continue  # no textures (or unreadable size) -> not a stub
+            kind, res = entry
+            if kind == 'fixed':
+                if res <= threshold:
+                    stub_fixed_slots.add(idx)
+            else:
+                stub_tiles = {num: side for num, side in res.items()
+                              if side <= threshold}
+                if stub_tiles:
+                    tile_maps[idx] = (res, stub_tiles)
+        if not stub_fixed_slots and not tile_maps:
+            return
+        stats['found_objects'] += 1
+
+        if mesh.uv_layers.active is None:
+            mesh.uv_layers.new(name="UVMap")
+        uv_data = mesh.uv_layers.active.data
+        poly_normals = mesh.polygon_normals  # forces the lazy normals cache
+        # a fixed-stub slot on a UDIM object must keep each face in its
+        # OWN tile - flattening into 0..1 would silently re-texture it
+        keep_tiles = object_has_udim(obj)
+
+        n_touched = 0
+        touched_slots = set()
+        touched_tiles = set()
+        for poly in mesh.polygons:
+            idx = poly.material_index
+            tile_uv = (0.0, 0.0)
+            if idx in stub_fixed_slots:
+                if keep_tiles:
+                    uvs = [tuple(uv_data[li].uv) for li in poly.loop_indices]
+                    num = _face_tile_number(uvs)
+                    if num is None:
+                        stats['out_of_tiles'] += 1
+                        continue
+                    tile_uv = _tile_offset(num)
+            elif idx in tile_maps:
+                all_tiles, stub_tiles = tile_maps[idx]
+                uvs = [tuple(uv_data[li].uv) for li in poly.loop_indices]
+                num = _face_tile_number(uvs)
+                if num not in stub_tiles:
+                    if num not in all_tiles:
+                        stats['out_of_tiles'] += 1
+                    continue
+                tile_uv = _tile_offset(num)
+            else:
+                continue
+            pts = [mesh.vertices[mesh.loops[li].vertex_index].co
+                   for li in poly.loop_indices]
+            new_uvs = _stub_face_uvs(pts, poly_normals[poly.index].vector,
+                                     tile_uv, margin)
+            if new_uvs is None:
+                stats['degenerate'] += 1
+                continue
+            for li, uv in zip(poly.loop_indices, new_uvs):
+                uv_data[li].uv = uv
+            n_touched += 1
+            if idx in stub_fixed_slots:
+                touched_slots.add(idx)
+            else:
+                touched_tiles.add(num)
+
+        if n_touched:
+            stats['materials'] += len(touched_slots)
+            stats['tiles'] += len(touched_tiles)
+            stats['faces'] += n_touched
+            _note_uv_overwrite_counts(obj, len(mesh.polygons), n_touched,
+                                      stats['atlas_objects'],
+                                      stats['udim_objects'])
+            mesh.update()
+
+
+class AGR_OT_UVUnwrapStubSelected(_AGR_UVGridPollMixin, Operator):
+    """Unwrap the SELECTED polygons into overlapping unit squares"""
+    bl_idname = "agr.uv_unwrap_stub_selected"
+    bl_label = "Развернуть выделенные фейсы"
+    bl_description = ("Развернуть ВЫДЕЛЕННЫЕ полигоны внахлёст: каждый "
+                      "растягивается на весь UV-квадрат с отступом; фейсы "
+                      "UDIM-материалов остаются в своём тайле. Порог "
+                      "разрешения не проверяется")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def _execute(self, context):
+        settings = _get_settings(context)
+        margin = settings.stub_margin if settings else 0.9
+
+        total = 0
+        degenerate = 0
+        out_of_zone = 0
+        selected_any = False
+        atlas_objects = []
+        udim_objects = []
+
+        for obj in _edit_mesh_objects(context):
+            bm = bmesh.from_edit_mesh(obj.data)
+            faces = [f for f in bm.faces if f.select]
+            if not faces:
+                continue
+            selected_any = True
+            uv_layer = bm.loops.layers.uv.active
+            if uv_layer is None:
+                uv_layer = bm.loops.layers.uv.new("UVMap")
+            bm.normal_update()
+            keep_tiles = object_has_udim(obj)
+            n_done = 0
+            for f in faces:
+                tile_uv = (0.0, 0.0)
+                if keep_tiles:
+                    uvs = [tuple(loop[uv_layer].uv) for loop in f.loops]
+                    num = _face_tile_number(uvs)
+                    if num is None:
+                        # negative parking zone / past the row end - a
+                        # clamped tile would teleport the face onto 1001
+                        out_of_zone += 1
+                        continue
+                    tile_uv = _tile_offset(num)
+                pts = [loop.vert.co for loop in f.loops]
+                new_uvs = _stub_face_uvs(pts, f.normal, tile_uv, margin)
+                if new_uvs is None:
+                    degenerate += 1
+                    continue
+                for loop, uv in zip(f.loops, new_uvs):
+                    loop[uv_layer].uv = uv
+                n_done += 1
+            if n_done:
+                total += n_done
+                _note_uv_overwrite_counts(obj, len(bm.faces), n_done,
+                                          atlas_objects, udim_objects)
+                bmesh.update_edit_mesh(obj.data, loop_triangles=False,
+                                       destructive=False)
+
+        if not selected_any:
+            agr_report(self, 'ERROR',
+                       "Нет выделенных фейсов — выделите полигоны в Edit Mode")
+            return {'CANCELLED'}
+        if total == 0:
+            agr_report(self, 'ERROR',
+                       "Развернуть нечего: фейсы вырождены или вне валидной "
+                       "UDIM-зоны")
+            return {'CANCELLED'}
+
+        msg = f"✅ Развёрнуто фейсов внахлёст: {total}"
+        level = 'INFO'
+        if degenerate:
+            msg += f", вырожденных пропущено: {degenerate}"
+        if out_of_zone:
+            msg += f", вне валидной UDIM-зоны пропущено: {out_of_zone}"
+        if atlas_objects:
+            msg += f" | ⚠️ перезаписаны UV атласа: {', '.join(atlas_objects)}"
+            level = 'WARNING'
+        if udim_objects:
+            msg += (f" | ⚠️ перезаписана развёртка UDIM-объектов: "
+                    f"{', '.join(udim_objects)}")
+            level = 'WARNING'
+        agr_report(self, level, msg)
+        return {'FINISHED'}
+
+
 class AGR_PT_UVPanel(Panel):
     """AGR UV panel in the AGR Tools sidebar"""
     bl_label = "AGR UV"
@@ -1808,6 +2156,31 @@ class AGR_PT_UVPanel(Panel):
         col.operator("agr.uv_grid_cut_unwrap", text="Разрезать и развернуть", icon='MOD_UVPROJECT')
 
 
+class AGR_PT_UVStubPanel(Panel):
+    """Stub unwrap tools (sub-panel of AGR UV)"""
+    bl_label = "Заглушки"
+    bl_idname = "AGR_PT_uv_stub_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'AGR Tools'
+    bl_parent_id = "AGR_PT_uv_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        s = _get_settings(context)
+        if s is None:
+            return
+        row = layout.row(align=True)
+        row.prop(s, "stub_threshold", text="Порог")
+        row.prop(s, "stub_margin", text="Отступ")
+        col = layout.column(align=True)
+        col.operator("agr.uv_unwrap_stub", icon='SHADING_BBOX')
+        col.operator("agr.uv_unwrap_stub_selected", icon='UV_FACESEL')
+        if context.mode == 'OBJECT':
+            col.label(text="«Выделенные фейсы» — в Edit Mode", icon='INFO')
+
+
 # ============================================================
 # Registration
 # ============================================================
@@ -1819,7 +2192,10 @@ classes = (
     AGR_OT_UVGridUnwrap,
     AGR_OT_UVGridCut,
     AGR_OT_UVGridCutUnwrap,
+    AGR_OT_UVUnwrapStub,
+    AGR_OT_UVUnwrapStubSelected,
     AGR_PT_UVPanel,
+    AGR_PT_UVStubPanel,
 )
 
 

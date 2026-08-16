@@ -169,11 +169,6 @@ class AGR_BakerSettings(PropertyGroup):
         default=False
     )
 
-    auto_strip_alpha: BoolProperty(
-        name="Auto Strip Useless Alpha",
-        description="On Refresh: convert RGBA textures whose alpha is fully white to RGB",
-        default=False
-    )
 
     # NOTE: the old show_* section toggles are gone — every collapsible
     # section is now a real Blender sub-panel (bl_parent_id) and Blender

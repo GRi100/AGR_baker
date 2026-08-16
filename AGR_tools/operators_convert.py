@@ -94,7 +94,7 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                     converted_count += 1
                     print(f"  ✅ Material converted and reconnected successfully")
 
-            bpy.ops.agr.refresh_texture_sets()
+            bpy.ops.agr.refresh_texture_sets(skip_alpha_strip=True)
 
             self.report({'INFO'}, f"Converted {converted_count} materials to texture sets")
             print(f"\n✅ Conversion complete: {converted_count} materials")
@@ -713,7 +713,7 @@ class AGR_OT_ConvertActiveMaterialToSet(Operator):
                 connect_texture_set_to_material(material, str(set_folder), material.name)
                 print(f"  ✅ Material converted and reconnected successfully")
 
-            bpy.ops.agr.refresh_texture_sets()
+            bpy.ops.agr.refresh_texture_sets(skip_alpha_strip=True)
 
             if success:
                 self.report({'INFO'}, f"Converted active material: {material.name}")
