@@ -1147,7 +1147,9 @@ def _rollback_join(mutated):
 class AGR_OT_link_join(Operator):
     """Заджоинить выбранные меши в один объект с памятью линков:
 контейнер можно в любой момент разобрать обратно на исходные
-линкованные объекты (панель AGR Link)"""
+линкованные объекты (панель AGR Link). Клик по ОДНОМУ контейнеру
+обновляет его память: поглощает обычные Ctrl+J и перепаковывает
+зеркало (закрепление перед правками/передачей в другой пакет)"""
     bl_idname = "agr.link_join"
     bl_label = "Джоин с памятью линков"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1167,6 +1169,11 @@ class AGR_OT_link_join(Operator):
             agr_report(self, 'ERROR', "❌ AGR Link: активный объект должен быть выделенным мешем")
             return {'CANCELLED'}
         if len(participants) < 2:
+            # single CONTAINER: refresh its memory instead of blocking -
+            # absorb plain-Ctrl+J windows and repack a fresh mirror
+            if (len(participants) == 1 and participants[0] == active
+                    and read_table(active) is not None):
+                return self._refresh_single(context, active)
             agr_report(self, 'ERROR', "❌ AGR Link: выделите минимум 2 меш-объекта")
             return {'CANCELLED'}
 
@@ -1401,6 +1408,66 @@ class AGR_OT_link_join(Operator):
         if absorbed_tables:
             msg += f", поглощено таблиц обычного Ctrl+J: {absorbed_tables}"
         agr_report(self, 'INFO', msg)
+        return {'FINISHED'}
+
+    def _refresh_single(self, context, active):
+        """Single selected container: "закрепить память" — absorb any
+        plain-Ctrl+J windows (materialise the merged table exactly as the
+        panel shows it) and repack ONE fresh mirror over the current mesh.
+        After this the container is canonical: safe to edit topology and
+        safe to hand to another DCC."""
+        if active.library is not None or active.data.library is not None:
+            agr_report(self, 'ERROR',
+                       "❌ AGR Link: объект из линкованной библиотеки нельзя изменять")
+            return {'CANCELLED'}
+
+        recon = _reconcile_container(context, active)
+        table = read_table(active)
+        if table is None:
+            agr_report(self, 'ERROR',
+                       "❌ AGR Link: таблица контейнера не читается (данные повреждены)")
+            return {'CANCELLED'}
+
+        if recon is not None:
+            mirror_ok = recon.get("mirror_ok", True)
+        else:
+            # nothing to absorb - still refresh idprop + mirror so the
+            # memory matches the CURRENT mesh exactly (e.g. after edits or
+            # a fresh FBX import that was never materialised)
+            has_attrs = active.data.attributes.get(ATTR_NAME) is not None
+            if not has_attrs:
+                has_attrs = _unpack_tracking_from_colors(active.data, table)
+            if not has_attrs:
+                # inherited broken state (idprop without attrs or a usable
+                # mirror) - repacking would destroy the surviving mirror
+                agr_report(self, 'WARNING',
+                           "⚠️ AGR Link: у контейнера нет разметки для перепаковки — "
+                           "память оставлена как есть")
+                return {'FINISHED'}
+            write_table(active, table)
+            try:
+                mirror_ok = _pack_tracking_to_colors(active.data, table)
+            except Exception:
+                _remove_color_mirror(active.data)
+                mirror_ok = False
+            if mirror_ok:
+                write_table(active, table)
+            _TABLE_CACHE.pop(active.name, None)
+            _MERGED_CACHE.pop(active.name, None)
+
+        n_inst = len(table.get("instances", {}))
+        n_groups = len({inst.get("group", 0) for inst in table.get("instances", {}).values()})
+        msg = (f"✅ AGR Link: память '{active.name}' обновлена "
+               f"({n_inst} объектов, {n_groups} групп)")
+        if recon and recon.get("absorbed"):
+            msg += f", поглощено таблиц обычного Ctrl+J: {recon['absorbed']}"
+        if recon and recon.get("zero_instance"):
+            msg += ", непомеченная геометрия оформлена объектом"
+        level = 'INFO'
+        if not mirror_ok:
+            msg += " | ⚠️ цветовое зеркало не записано (FBX-перенос недоступен)"
+            level = 'WARNING'
+        agr_report(self, level, msg)
         return {'FINISHED'}
 
 

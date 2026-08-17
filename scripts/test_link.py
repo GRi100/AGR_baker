@@ -1322,6 +1322,50 @@ check("tail42: foreign P kept as leftover (idprop semantics)",
       any(n.endswith("_leftover") for n in names42), str(sorted(names42)))
 
 # ---------------------------------------------------------------------------
+print("\n=== 43. link_join on a SINGLE container = refresh memory ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+mesh_b = make_cube_mesh("MeshB")
+b1 = add_obj("B1", mesh_b, TRS((0, 5, 0)))
+b2 = add_obj("B2", mesh_b, TRS((3, 5, 0)))
+orig = {o.name: o.matrix_world.copy() for o in (a1, a2, b1, b2)}
+select_only([a1, a2], a1)
+bpy.ops.agr.link_join()
+c_a = bpy.data.objects.get("A1")
+select_only([b1, b2], b1)
+bpy.ops.agr.link_join()
+c_b = bpy.data.objects.get("B1")
+select_only([c_a, c_b], c_a)
+bpy.ops.object.join()                      # plain Ctrl+J: window not absorbed yet
+select_only([c_a], c_a)
+check("refresh: single-container join FINISHED",
+      bpy.ops.agr.link_join() == {'FINISHED'})
+tbl43 = linkmod._parse_table(c_a.get(KEY))
+check("refresh: merged table materialised in the idprop",
+      tbl43 is not None and len(tbl43["instances"]) == 4,
+      str(len(tbl43["instances"])) if tbl43 else "-")
+check("refresh: no foreign windows left",
+      linkmod._merged_view(c_a)[1] == 0)
+check("refresh: second click is a clean no-op",
+      bpy.ops.agr.link_join() == {'FINISHED'}
+      and len(linkmod.read_table(c_a)["instances"]) == 4)
+select_only([c_a], c_a)
+check("refresh: separate after refresh FINISHED",
+      bpy.ops.agr.link_separate_all() == {'FINISHED'})
+check("refresh: all restored at exact positions",
+      all(bpy.data.objects.get(n) is not None
+          and mat_close(bpy.data.objects[n].matrix_world, orig[n]) for n in orig))
+
+print("--- 43b. single PLAIN mesh still refuses ---")
+reset_scene()
+lone = add_obj("Lone", make_cube_mesh("MeshL"))
+select_only([lone], lone)
+check("refresh: plain single mesh -> CANCELLED",
+      expect_cancel(lambda: bpy.ops.agr.link_join()))
+
+# ---------------------------------------------------------------------------
 print("\n" + "=" * 60)
 if FAILS:
     print(f"❌ {len(FAILS)} FAILED:")
