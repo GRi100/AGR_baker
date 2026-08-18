@@ -1366,6 +1366,643 @@ check("refresh: plain single mesh -> CANCELLED",
       expect_cancel(lambda: bpy.ops.agr.link_join()))
 
 # ---------------------------------------------------------------------------
+# Forced restore (agr.link_restore) helpers
+# ---------------------------------------------------------------------------
+import bmesh as _bmesh  # noqa: E402  (idempotent re-import, also done in section 22)
+
+
+def purge_orphan_meshes():
+    """Donor datablocks survive the join with users==0 and the alive-adoption
+    branch happily picks them up (see test 1).  Restore scenarios MUST kill
+    them, or the reference would come from the orphan and the majority vote
+    would never be exercised.  A .blend save/reload does exactly this."""
+    for me in list(bpy.data.meshes):
+        if me.users == 0:
+            bpy.data.meshes.remove(me)
+
+
+def inst_id(cont, name):
+    table = linkmod.read_table(cont)
+    return next(int(i) for i, inst in table["instances"].items()
+                if inst["name"] == name)
+
+
+def gid_of(cont, data_name):
+    table = linkmod.read_table(cont)
+    return next(int(g) for g, info in table["groups"].items()
+                if info["data_name"] == data_name)
+
+
+def nudge_vert(cont, iid, dx=0.3):
+    """Shift the first vertex of the instance's first face (a local edit)."""
+    attr = cont.data.attributes[ATTR]
+    for poly, pa in zip(cont.data.polygons, attr.data):
+        if pa.value == iid:
+            cont.data.vertices[poly.vertices[0]].co.x += dx
+            return
+    raise AssertionError(f"no faces with id {iid}")
+
+
+def paint_faces(cont, iid, slot):
+    attr = cont.data.attributes[ATTR]
+    for poly, pa in zip(cont.data.polygons, attr.data):
+        if pa.value == iid:
+            poly.material_index = slot
+
+
+def drop_faces(cont, iid, n):
+    """bmesh-delete n faces of the instance (recipe from test 22)."""
+    bm = _bmesh.new()
+    bm.from_mesh(cont.data)
+    layer = bm.faces.layers.int.get(ATTR)
+    doomed = [f for f in bm.faces if f[layer] == iid][:n]
+    _bmesh.ops.delete(bm, geom=doomed, context='FACES')
+    bm.to_mesh(cont.data)
+    bm.free()
+
+
+def status():
+    return bpy.context.window_manager.agr_last_status
+
+
+def status_level():
+    return bpy.context.window_manager.agr_last_status_level
+
+
+# ---------------------------------------------------------------------------
+print("\n=== 44. RESTORE SOFT: vertex shift discarded, link recovered ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0), rot=(0, 0, 15)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))
+orig = {o.name: o.matrix_world.copy() for o in (a1, a2, a3)}
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+nudge_vert(cont, inst_id(cont, "A2"), 0.3)
+select_only([cont], cont)
+check("soft: restore ran", bpy.ops.agr.link_restore(mode='SOFT') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("soft: 3 restored", len(restored) == 3, str(sorted(restored)))
+check("soft: all linked",
+      restored["A1"].data == restored["A2"].data == restored["A3"].data)
+check("soft: A2 coords back to original", local_coords_match(restored["A2"]))
+for n in ("A1", "A2", "A3"):
+    check(f"soft: {n} matrix", mat_close(restored[n].matrix_world, orig[n], tol=1e-3))
+check("soft: datablock keeps group name", restored["A1"].data.name == "MeshA")
+check("soft: INFO level", status_level() == 'INFO', status())
+check("soft: shifts reported", "сдвиги" in status(), status())
+
+# ---------------------------------------------------------------------------
+print("\n=== 45. RESTORE SOFT: repaint discarded (majority reference) ===")
+reset_scene()
+mat_red = bpy.data.materials.new("M_Red")
+mat_blue = bpy.data.materials.new("M_Blue")
+mesh_a = make_cube_mesh("MeshA")
+mesh_a.materials.append(mat_red)
+mesh_a.materials.append(mat_blue)  # slot exists, but all faces are red
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+paint_faces(cont, inst_id(cont, "A2"), 1)  # repaint one copy blue
+select_only([cont], cont)
+check("repaint: restore ran", bpy.ops.agr.link_restore(mode='SOFT') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("repaint: all linked",
+      restored["A1"].data == restored["A2"].data == restored["A3"].data)
+check("repaint: slot is majority red",
+      [m.name for m in restored["A2"].data.materials] == ["M_Red"],
+      str([m.name for m in restored["A2"].data.materials]))
+check("repaint: faces on slot 0",
+      all(p.material_index == 0 for p in restored["A2"].data.polygons))
+check("repaint: reported", "перекраска" in status(), status())
+
+print("--- 45b. Majority repaint WINS (2 of 3 painted blue) ---")
+reset_scene()
+mat_red = bpy.data.materials.new("M_Red")
+mat_blue = bpy.data.materials.new("M_Blue")
+mesh_a = make_cube_mesh("MeshA")
+mesh_a.materials.append(mat_red)
+mesh_a.materials.append(mat_blue)
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+paint_faces(cont, inst_id(cont, "A2"), 1)
+paint_faces(cont, inst_id(cont, "A3"), 1)
+select_only([cont], cont)
+check("majority: restore ran", bpy.ops.agr.link_restore(mode='SOFT') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("majority: all linked",
+      restored["A1"].data == restored["A2"].data == restored["A3"].data)
+check("majority: blue wins (2 votes)",
+      [m.name for m in restored["A1"].data.materials] == ["M_Blue"],
+      str([m.name for m in restored["A1"].data.materials]))
+
+# ---------------------------------------------------------------------------
+print("\n=== 46. RESTORE SOFT does NOT touch broken topology ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+drop_faces(cont, inst_id(cont, "A2"), 1)
+select_only([cont], cont)
+check("soft-topo: restore ran", bpy.ops.agr.link_restore(mode='SOFT') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("soft-topo: A1+A3 linked", restored["A1"].data == restored["A3"].data)
+check("soft-topo: A2 stays unique", restored["A2"].data != restored["A1"].data)
+check("soft-topo: A2 keeps 5 faces", len(restored["A2"].data.polygons) == 5)
+check("soft-topo: WARNING level", status_level() == 'WARNING', status())
+check("soft-topo: hard-mode hint", "нужен жёсткий режим" in status(), status())
+
+# ---------------------------------------------------------------------------
+print("\n=== 47. RESTORE HARD: broken chunk rebuilt from the reference ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0), rot=(0, 0, 40)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))
+orig = {o.name: o.matrix_world.copy() for o in (a1, a2, a3)}
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+a2_id = inst_id(cont, "A2")
+drop_faces(cont, a2_id, 3)
+nudge_vert(cont, a2_id, 0.2)
+select_only([cont], cont)
+check("hard: restore ran", bpy.ops.agr.link_restore(mode='HARD') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("hard: 3 restored", len(restored) == 3, str(sorted(restored)))
+check("hard: all linked",
+      restored["A1"].data == restored["A2"].data == restored["A3"].data)
+check("hard: full 6 faces back", len(restored["A2"].data.polygons) == 6)
+check("hard: coords original", local_coords_match(restored["A2"]))
+check("hard: A2 position by fit", mat_close(restored["A2"].matrix_world, orig["A2"], tol=1e-3))
+check("hard: rebuilt reported", "перестроено по эталону" in status(), status())
+check("hard: fit converged (no approx warning)",
+      "позиция может быть неточной" not in status(), status())
+check("hard: INFO level", status_level() == 'INFO', status())
+
+# ---------------------------------------------------------------------------
+print("\n=== 48. RESTORE HARD after a plain Ctrl+J of a foreign cube ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+foreign = add_obj("Foreign", make_cube_mesh("MeshF"), T(0, -5, 0))
+select_only([cont, foreign], cont)
+bpy.ops.object.join()  # plain Ctrl+J: foreign faces get id 0
+purge_orphan_meshes()
+drop_faces(cont, inst_id(cont, "A2"), 2)
+select_only([cont], cont)
+check("hard-foreign: restore ran", bpy.ops.agr.link_restore(mode='HARD') == {'FINISHED'})
+objs = {o.name: o for o in bpy.data.objects}
+check("hard-foreign: A* restored linked",
+      {"A1", "A2", "A3"} <= set(objs)
+      and objs["A1"].data == objs["A2"].data == objs["A3"].data,
+      str(sorted(objs)))
+check("hard-foreign: A2 coords original", local_coords_match(objs["A2"]))
+leftover = next((o for o in bpy.data.objects if o.name.endswith("_leftover")), None)
+check("hard-foreign: foreign kept as leftover", leftover is not None)
+check("hard-foreign: leftover holds the foreign 6 faces",
+      leftover is not None and len(leftover.data.polygons) == 6)
+
+print("--- 48b. duplicated face inherits id+orig: counts save the day ---")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+select_only([a1, a2], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+a2_id = inst_id(cont, "A2")
+bm = _bmesh.new()
+bm.from_mesh(cont.data)
+layer = bm.faces.layers.int.get(ATTR)
+src = next(f for f in bm.faces if f[layer] == a2_id)
+res = _bmesh.ops.duplicate(bm, geom=[src])
+new_verts = [g for g in res["geom"] if isinstance(g, _bmesh.types.BMVert)]
+_bmesh.ops.translate(bm, verts=new_verts, vec=(0.0, 0.0, 0.7))
+bm.to_mesh(cont.data)
+bm.free()
+select_only([cont], cont)
+check("dup: restore ran", bpy.ops.agr.link_restore(mode='HARD') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("dup: linked again", restored["A1"].data == restored["A2"].data)
+check("dup: clean 6 faces", len(restored["A2"].data.polygons) == 6)
+check("dup: position close",
+      mat_close(restored["A2"].matrix_world, TRS((3, 0, 0)), tol=1e-2))
+
+# ---------------------------------------------------------------------------
+print("\n=== 49. RESTORE HARD with NO reference: honest give-up ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+select_only([a1, a2], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()  # kills the orphan MeshA donors too
+drop_faces(cont, inst_id(cont, "A1"), 1)
+drop_faces(cont, inst_id(cont, "A2"), 2)
+select_only([cont], cont)
+check("noref: restore ran", bpy.ops.agr.link_restore(mode='HARD') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("noref: both unique", restored["A1"].data != restored["A2"].data)
+check("noref: edits preserved (nothing mangled)",
+      len(restored["A1"].data.polygons) == 5
+      and len(restored["A2"].data.polygons) == 4)
+check("noref: WARNING level", status_level() == 'WARNING', status())
+check("noref: no-reference reported", "групп без эталона" in status(), status())
+
+# ---------------------------------------------------------------------------
+print("\n=== 50. RESTORE HARD: reference from the alive scene datablock ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))  # never joined: keeps MeshA alive
+select_only([a1, a2], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()  # A3 keeps MeshA alive (users == 1)
+drop_faces(cont, inst_id(cont, "A1"), 1)
+drop_faces(cont, inst_id(cont, "A2"), 2)
+select_only([cont], cont)
+check("aliveref: restore ran", bpy.ops.agr.link_restore(mode='HARD') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("aliveref: all three linked on MeshA",
+      restored["A1"].data == restored["A2"].data == restored["A3"].data == mesh_a)
+check("aliveref: full cube back", len(restored["A1"].data.polygons) == 6)
+check("aliveref: reported", "эталон взят из сцены" in status(), status())
+check("aliveref: no tracking attr on the reference",
+      mesh_a.attributes.get(ATTR) is None)
+
+# ---------------------------------------------------------------------------
+print("\n=== 51. RESTORE: faceless instance stays skipped (user decision) ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+drop_faces(cont, inst_id(cont, "A2"), 6)  # ALL faces of A2 gone
+select_only([cont], cont)
+check("faceless: restore ran", bpy.ops.agr.link_restore(mode='HARD') == {'FINISHED'})
+check("faceless: A2 not recreated", bpy.data.objects.get("A2") is None)
+cont2 = next((o for o in bpy.data.objects if linkmod.read_table(o) is not None), None)
+check("faceless: container survives with the record", cont2 is not None)
+names_left = ({i["name"] for i in linkmod.read_table(cont2)["instances"].values()}
+              if cont2 else set())
+check("faceless: A2 entry preserved", "A2" in names_left, str(names_left))
+check("faceless: skip reported", "без граней" in status(), status())
+restored = {o.name: o for o in bpy.data.objects if o.name in ("A1", "A3")}
+check("faceless: A1+A3 linked",
+      len(restored) == 2 and restored["A1"].data == restored["A3"].data)
+
+# ---------------------------------------------------------------------------
+print("\n=== 52. RESTORE after an FBX roundtrip (bit-exact reference) ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0), rot=(0, 0, 10)))
+a2 = add_obj("A2", mesh_a, TRS((4, 0, 0), rot=(0, 0, 30)))
+a3 = add_obj("A3", mesh_a, TRS((8, 1, 0)))
+orig = {o.name: o.matrix_world.copy() for o in (a1, a2, a3)}
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+fbx52 = os.path.join(bpy.app.tempdir, "agr_link_restore.fbx")
+select_only([cont], cont)
+bpy.ops.export_scene.fbx(filepath=fbx52, use_selection=True)
+reset_scene()
+bpy.ops.import_scene.fbx(filepath=fbx52)
+cont2 = next(o for o in bpy.data.objects
+             if o.type == 'MESH' and linkmod.is_container(o))
+select_only([cont2], cont2)
+bpy.ops.agr.link_join()  # refresh: materialise the attrs + idprop
+purge_orphan_meshes()
+nudge_vert(cont2, inst_id(cont2, "A2"), 0.3)
+drop_faces(cont2, inst_id(cont2, "A3"), 2)
+select_only([cont2], cont2)
+check("fbx-restore: ran", bpy.ops.agr.link_restore(mode='HARD') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("fbx-restore: all linked",
+      restored["A1"].data == restored["A2"].data == restored["A3"].data)
+check("fbx-restore: coords bit-exact",
+      all(local_coords_match(restored[n], tol=1e-6) for n in ("A1", "A2", "A3")))
+for n in ("A1", "A2", "A3"):
+    check(f"fbx-restore: {n} matrix",
+          mat_close(restored[n].matrix_world, orig[n], tol=1e-3))
+
+# ---------------------------------------------------------------------------
+print("\n=== 53. RESTORE a single group (group_id) ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+mesh_b = make_cube_mesh("MeshB")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((2, 0, 0)))
+b1 = add_obj("B1", mesh_b, TRS((0, 5, 0)))
+b2 = add_obj("B2", mesh_b, TRS((2, 5, 0)))
+select_only([a1, a2, b1, b2], b1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+nudge_vert(cont, inst_id(cont, "A2"), 0.4)
+gid_a = gid_of(cont, "MeshA")
+select_only([cont], cont)
+check("group-restore: ran",
+      bpy.ops.agr.link_restore(mode='SOFT', group_id=gid_a) == {'FINISHED'})
+objs = {o.name: o for o in bpy.data.objects}
+check("group-restore: A* out and linked",
+      {"A1", "A2"} <= set(objs) and objs["A1"].data == objs["A2"].data,
+      str(sorted(objs)))
+check("group-restore: A2 coords restored", local_coords_match(objs["A2"]))
+cont2 = objs.get("B1")
+check("group-restore: container keeps the B group",
+      cont2 is not None and linkmod.read_table(cont2) is not None
+      and len(linkmod.read_table(cont2)["instances"]) == 2)
+check("group-restore: container faces = 12",
+      cont2 is not None and len(cont2.data.polygons) == 12)
+
+# ---------------------------------------------------------------------------
+print("\n=== 54. RESTORE SOFT on a standalone (single-instance) group ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+u1 = add_obj("U1", make_cube_mesh("MeshU"), TRS((0, 5, 0), rot=(0, 0, 25)))
+orig_u = u1.matrix_world.copy()
+select_only([a1, a2, u1], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+nudge_vert(cont, inst_id(cont, "U1"), 0.3)
+select_only([cont], cont)
+check("standalone: restore ran", bpy.ops.agr.link_restore(mode='SOFT') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("standalone: U1 coords restored", local_coords_match(restored["U1"]))
+check("standalone: U1 matrix", mat_close(restored["U1"].matrix_world, orig_u, tol=1e-3))
+check("standalone: INFO level", status_level() == 'INFO', status())
+
+# ---------------------------------------------------------------------------
+# Negative restore scenarios: what restore must NOT pretend to fix
+# ---------------------------------------------------------------------------
+
+def chunk_verts(cont, iid):
+    attr = cont.data.attributes[ATTR]
+    vs = set()
+    for poly, pa in zip(cont.data.polygons, attr.data):
+        if pa.value == iid:
+            vs.update(poly.vertices)
+    return vs
+
+
+def flatten_chunk(cont, iid):
+    """Scale-to-zero damage: the affine fit degenerates (det ~ 0)."""
+    for vi in chunk_verts(cont, iid):
+        cont.data.vertices[vi].co.z = 0.0
+
+
+def flip_chunk(cont, iid):
+    bm = _bmesh.new()
+    bm.from_mesh(cont.data)
+    layer = bm.faces.layers.int.get(ATTR)
+    _bmesh.ops.reverse_faces(bm, faces=[f for f in bm.faces if f[layer] == iid])
+    bm.to_mesh(cont.data)
+    bm.free()
+
+
+# ---------------------------------------------------------------------------
+print("\n=== 55. RESTORE: failed fit is NOT sold as success; HARD uses the healthy ref ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+flatten_chunk(cont, inst_id(cont, "A2"))
+flatten_chunk(cont, inst_id(cont, "A3"))
+select_only([cont], cont)
+check("failfit-soft: ran", bpy.ops.agr.link_restore(mode='SOFT') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("failfit-soft: A1 pristine", local_coords_match(restored["A1"]))
+check("failfit-soft: flattened stay unique and flat",
+      restored["A2"].data != restored["A1"].data
+      and not local_coords_match(restored["A2"]))
+check("failfit-soft: NOT a clean success", status_level() == 'WARNING', status())
+check("failfit-soft: hard-mode hint", "нужен жёсткий режим" in status(), status())
+
+print("--- 55b. HARD rebuilds the flattened chunks from the HEALTHY reference ---")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))
+orig = {o.name: o.matrix_world.copy() for o in (a1, a2, a3)}
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+flatten_chunk(cont, inst_id(cont, "A2"))
+flatten_chunk(cont, inst_id(cont, "A3"))
+select_only([cont], cont)
+check("failfit-hard: ran", bpy.ops.agr.link_restore(mode='HARD') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("failfit-hard: all linked on the healthy chunk",
+      restored["A1"].data == restored["A2"].data == restored["A3"].data)
+check("failfit-hard: geometry is the HEALTHY cube", local_coords_match(restored["A2"]))
+check("failfit-hard: rebuilt reported", "перестроено по эталону" in status(), status())
+check("failfit-hard: approximate position honestly flagged",
+      "позиция может быть неточной" in status(), status())
+for n in ("A1", "A2", "A3"):
+    check(f"failfit-hard: {n} matrix (fresh m_rel fallback)",
+          mat_close(restored[n].matrix_world, orig[n], tol=1e-3))
+
+# ---------------------------------------------------------------------------
+print("\n=== 56. RESTORE: a flipped lowest-id copy cannot hijack the group ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+ref_normals56 = [p.normal.copy() for p in mesh_a.polygons]
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+flip_chunk(cont, inst_id(cont, "A1"))  # vandalise the FIRST (lowest-id) copy
+select_only([cont], cont)
+check("flip-soft: ran", bpy.ops.agr.link_restore(mode='SOFT') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("flip-soft: healthy majority linked", restored["A2"].data == restored["A3"].data)
+check("flip-soft: flipped copy stays unique",
+      restored["A1"].data != restored["A2"].data)
+check("flip-soft: majority keeps TRUE normals",
+      all((p.normal - r).length < 1e-3
+          for p, r in zip(restored["A2"].data.polygons, ref_normals56)))
+
+print("--- 56b. HARD rebuilds the flipped copy from the healthy majority ---")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+ref_normals56 = [p.normal.copy() for p in mesh_a.polygons]
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+flip_chunk(cont, inst_id(cont, "A1"))
+select_only([cont], cont)
+check("flip-hard: ran", bpy.ops.agr.link_restore(mode='HARD') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("flip-hard: all linked", restored["A1"].data == restored["A2"].data == restored["A3"].data)
+check("flip-hard: TRUE normals won (flip discarded)",
+      all((p.normal - r).length < 1e-3
+          for p, r in zip(restored["A1"].data.polygons, ref_normals56)))
+check("flip-hard: rebuilt reported", "перестроено по эталону" in status(), status())
+
+# ---------------------------------------------------------------------------
+print("\n=== 57. RESTORE SOFT never enters the last-resort alive branch ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))  # never joined: keeps MeshA alive
+select_only([a1, a2], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+drop_faces(cont, inst_id(cont, "A1"), 1)
+drop_faces(cont, inst_id(cont, "A2"), 2)
+select_only([cont], cont)
+check("soft-lastresort: ran", bpy.ops.agr.link_restore(mode='SOFT') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects}
+check("soft-lastresort: NO false alive-adoption report",
+      "эталон взят из сцены" not in status(), status())
+check("soft-lastresort: chunks stay off the alive datablock",
+      restored["A1"].data != mesh_a and restored["A2"].data != mesh_a)
+check("soft-lastresort: honest hard-mode hint",
+      "нужен жёсткий режим" in status(), status())
+
+# ---------------------------------------------------------------------------
+print("\n=== 58. RESTORE: never-intact group (loose vert) - no reference, no repaint theft ===")
+
+
+def make_loose_cube(name):
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(CUBE_VERTS + [(0.0, 0.0, 2.0)], [], CUBE_FACES)
+    mesh.validate()
+    return mesh
+
+
+reset_scene()
+mat_red = bpy.data.materials.new("M_Red")
+mat_blue = bpy.data.materials.new("M_Blue")
+mesh_a = make_loose_cube("MeshA")
+mesh_a.materials.append(mat_red)
+mesh_a.materials.append(mat_blue)
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+paint_faces(cont, inst_id(cont, "A1"), 1)  # repaint the FIRST copy blue
+select_only([cont], cont)
+check("loose-soft: ran", bpy.ops.agr.link_restore(mode='SOFT') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects if o.name in ("A1", "A2", "A3")}
+check("loose-soft: repaint NOT stolen by the unvetted first member",
+      [m.name for m in restored["A2"].data.materials] == ["M_Red"]
+      and [m.name for m in restored["A1"].data.materials] == ["M_Blue"],
+      f'A1={[m.name for m in restored["A1"].data.materials]} '
+      f'A2={[m.name for m in restored["A2"].data.materials]}')
+check("loose-soft: WARNING level", status_level() == 'WARNING', status())
+
+print("--- 58b. HARD on the same group honestly gives up ---")
+reset_scene()
+mat_red = bpy.data.materials.new("M_Red")
+mat_blue = bpy.data.materials.new("M_Blue")
+mesh_a = make_loose_cube("MeshA")
+mesh_a.materials.append(mat_red)
+mesh_a.materials.append(mat_blue)
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+a3 = add_obj("A3", mesh_a, TRS((6, 0, 0)))
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+paint_faces(cont, inst_id(cont, "A1"), 1)
+select_only([cont], cont)
+check("loose-hard: ran", bpy.ops.agr.link_restore(mode='HARD') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects if o.name in ("A1", "A2", "A3")}
+check("loose-hard: paint preserved (nothing rebuilt onto member[0])",
+      [m.name for m in restored["A1"].data.materials] == ["M_Blue"]
+      and [m.name for m in restored["A2"].data.materials] == ["M_Red"])
+check("loose-hard: no-reference reported", "групп без эталона" in status(), status())
+
+# ---------------------------------------------------------------------------
+print("\n=== 59. RESTORE HARD: same-name same-counts stranger is rejected ===")
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((3, 0, 0)))
+select_only([a1, a2], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+purge_orphan_meshes()
+cont.data.name = "MeshContainer"  # free the group name for the stranger
+stranger_mesh = bpy.data.meshes.new("MeshA")  # same name, same counts...
+stranger_mesh.from_pydata([(x, y, z * 4.0) for x, y, z in CUBE_VERTS],
+                          [], CUBE_FACES)     # ...alien geometry (4x tall)
+stranger_mesh.validate()
+add_obj("Stranger", stranger_mesh, T(0, -8, 0))
+drop_faces(cont, inst_id(cont, "A1"), 1)
+drop_faces(cont, inst_id(cont, "A2"), 2)
+select_only([cont], cont)
+check("stranger: ran", bpy.ops.agr.link_restore(mode='HARD') == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects if o.name in ("A1", "A2")}
+check("stranger: NOT adopted as reference",
+      restored["A1"].data != stranger_mesh and restored["A2"].data != stranger_mesh)
+check("stranger: no alive-adoption report",
+      "эталон взят из сцены" not in status(), status())
+check("stranger: honest give-up", "групп без эталона" in status(), status())
+z_span = max(v.co.z for v in restored["A1"].data.vertices) \
+    - min(v.co.z for v in restored["A1"].data.vertices)
+check("stranger: restored geometry is NOT the 4x-tall alien", z_span < 1.5, str(z_span))
+check("stranger: stranger itself untouched",
+      len(stranger_mesh.polygons) == 6
+      and abs(max(v.co.z for v in stranger_mesh.vertices) - 2.0) < 1e-5)
+
+# ---------------------------------------------------------------------------
 print("\n" + "=" * 60)
 if FAILS:
     print(f"❌ {len(FAILS)} FAILED:")

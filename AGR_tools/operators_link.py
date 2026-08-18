@@ -22,6 +22,24 @@ How it works:
   (reported as a warning).  If the original datablock is still alive in
   the file (some copies were never joined), restored objects re-attach
   to it and become linked with the survivors again.
+- Forced restore (agr.link_restore) disassembles while ROLLING BACK
+  edits: SOFT snaps every original vertex of an INTACT chunk (counts
+  match the group AND all verts carry the orig flag AND the frame fit
+  succeeded - a failed fit demotes the chunk) back to its stored
+  coordinate and links it to the group reference even when repainted;
+  HARD additionally throws away chunks whose topology no longer matches
+  and attaches the reference datablock, placing the object by the frame
+  fitted from the surviving original vertices (a non-converged fit or
+  the stored-matrix fallback is reported as an approximate position).
+  The reference is the majority vote by ballot signature (materials +
+  geometry digest) among intact chunks - a repainted/flipped copy cannot
+  hijack the group; repaints are discarded ONLY onto a vetted reference.
+  With no intact chunk left, HARD may take a still-alive datablock that
+  matches the group's name, counts AND the chunks' surviving original
+  vertices (its materials/UV win - reported).  A legacy container
+  (no per-vertex originals, no color mirror) is refused up front.
+  Faceless and matrix_stale instances are skipped exactly as in a plain
+  disassembly.  UV policy is unchanged: the container's unwrap wins.
 
 Origin recovery does NOT rely on the container matrix: at join time every
 vertex stores its original LOCAL coordinate (attributes agr_link_co +
@@ -60,12 +78,13 @@ modifiers (modifier support is a possible future step).
 """
 
 import base64
+import hashlib
 import json
 
 import bpy
 import bmesh
 import numpy as np
-from bpy.props import IntProperty
+from bpy.props import EnumProperty, IntProperty
 from bpy.types import Operator, Panel
 from mathutils import Matrix
 
@@ -325,12 +344,30 @@ def _read_attr_values(mesh):
     return arr
 
 
+def _read_orig_mask(mesh):
+    """POINT-domain agr_link_orig flag as a bool array, or None on legacy
+    meshes that never stored it."""
+    flag = mesh.attributes.get(ORIG_ATTR)
+    if flag is None or flag.domain != 'POINT' or flag.data_type != 'BOOLEAN':
+        return None
+    arr = np.zeros(len(mesh.vertices), dtype=bool)
+    flag.data.foreach_get("value", arr)
+    return arr
+
+
 def _fit_affine_core(p, q, mask, extra_tol=0.0):
-    """Least-squares affine fit p[mask] -> q[mask] with trimmed-outlier
-    refit and SVD normal-completion for planar clouds.  Pure computation
-    (no mesh access).  Returns (a, t, res, tol) or None when degenerate;
-    ``res`` are residuals over the masked points, ``tol`` the accept
-    threshold used for snapping decisions."""
+    """Least-squares affine fit p[mask] -> q[mask] with conflict-multiplet
+    exclusion, iterative trimmed-outlier refit and SVD normal-completion
+    for planar clouds.  Pure computation (no mesh access).
+    Returns (a, t, res, tol, converged) or None when degenerate; ``res``
+    are residuals over ALL masked points from the FINAL frame, ``tol`` the
+    accept threshold used for snapping decisions.  ``converged`` is False
+    when the frame could not be anchored on a trustworthy rigid majority
+    (trimming gave up, or so few points survived that the 12-DOF affine
+    problem turns interpolative and "fits" outliers too) - callers must
+    treat the placement as approximate and say so.  Known limit: on tiny
+    clouds (<= ~5 verts) an edit is absorbed by the frame with zero
+    residual and stays undetectable."""
     if int(mask.sum()) < 3:
         return None
 
@@ -362,24 +399,99 @@ def _fit_affine_core(p, q, mask, extra_tol=0.0):
     if result is None:
         return None
     a, t = result
-    res = np.linalg.norm(q[mask] - (p[mask] @ a.T + t), axis=1)
     diag = float(np.linalg.norm(p[mask].max(axis=0) - p[mask].min(axis=0)))
-    tol = max(1e-4, diag * 1e-4, float(np.linalg.norm(t)) * 1e-6, extra_tol)
+
+    def residuals(a, t):
+        return np.linalg.norm(q[mask] - (p[mask] @ a.T + t), axis=1)
+
+    def accept_tol(t):
+        return max(1e-4, diag * 1e-4, float(np.linalg.norm(t)) * 1e-6, extra_tol)
+
+    res = residuals(a, t)
+    tol = accept_tol(t)
+    converged = True
     if res.max() > tol:
-        # part of the piece was edited - refit on the rigid majority
-        thr = max(tol, 3.0 * float(np.median(res)))
-        inliers = np.zeros(len(mask), dtype=bool)
-        inliers[np.flatnonzero(mask)[res <= thr]] = True
-        if int(inliers.sum()) >= 3:
-            refit = fit(inliers)
-            if refit is not None:
-                a, t = refit
-                res = np.linalg.norm(q[mask] - (p[mask] @ a.T + t), axis=1)
-                tol = max(1e-4, diag * 1e-4, float(np.linalg.norm(t)) * 1e-6, extra_tol)
+        m_idx = np.flatnonzero(mask)
+        work = np.ones(len(m_idx), dtype=bool)    # inlier flags over m_idx
+
+        # Points sharing one stored original (duplicated geometry inherits
+        # the attributes verbatim) but pulled apart in the container CANNOT
+        # be told apart by residuals: the fit would flip a coin between the
+        # prototype and the duplicate, or bridge them with a fake scale.
+        # Exclude every conflicted multiplet from the fit up front.  The
+        # scan is LAZY - a pulled-apart multiplet always pushes a residual
+        # beyond tol, so a clean first fit skips it entirely - and its
+        # threshold lives in CONTAINER space with the same offset-scaled
+        # noise budget as every other tolerance in this file.
+        qm_all = q[m_idx]
+        conflict_tol = max(
+            1e-4,
+            float(np.linalg.norm(qm_all.max(axis=0) - qm_all.min(axis=0))) * 1e-4,
+            float(np.linalg.norm(qm_all.mean(axis=0))) * 5e-6,
+            extra_tol)
+        _u, inv, counts = np.unique(p[m_idx], axis=0,
+                                    return_inverse=True, return_counts=True)
+        if (counts > 1).any():
+            for g in np.flatnonzero(counts > 1):
+                sel = inv == g
+                qg = qm_all[sel]
+                spread = float(np.linalg.norm(qg - qg.mean(axis=0), axis=1).max())
+                if spread > conflict_tol:
+                    work[sel] = False
+        if not work.all():
+            if int(work.sum()) >= 3:
+                sel = np.zeros(len(mask), dtype=bool)
+                sel[m_idx[work]] = True
+                refit = fit(sel)
+                if refit is not None:
+                    a, t = refit
+                    res = residuals(a, t)
+                    tol = accept_tol(t)
+            else:
+                work[:] = True  # conflict-free remnant degenerate - keep the full fit
+
+        # part of the piece was edited - refit on the rigid majority.  The
+        # affine LSQ SMEARS an outlier over the other points (one nudged
+        # cube vertex ends up only 2x above the median residual), so a
+        # single median-threshold pass cannot isolate it: iterate, dropping
+        # outlier batches - and at least the single worst point per round -
+        # while the inlier fit still exceeds tol and a majority remains.
+        start = int(work.sum())
+        min_keep = max(3, (start + 1) // 2)       # the majority must survive
+        for _ in range(64):
+            res_in = res[work]
+            if res_in.max() <= tol or int(work.sum()) <= min_keep:
+                break
+            thr = max(tol, 3.0 * float(np.median(res_in)))
+            drop = work & (res > thr)
+            if not drop.any():
+                worst = int(np.argmax(np.where(work, res, -1.0)))
+                drop = np.zeros_like(work)
+                drop[worst] = True
+            if int(work.sum() - drop.sum()) < min_keep:
+                break
+            work &= ~drop
+            sel = np.zeros(len(mask), dtype=bool)
+            sel[m_idx[work]] = True
+            refit = fit(sel)
+            if refit is None:
+                break
+            a, t = refit
+            res = residuals(a, t)
+            tol = accept_tol(t)
+        # honesty flag: trustworthy only when the surviving inliers still
+        # fit AND enough of them survived to over-determine the affine
+        # problem - an interpolative remnant "fits" anything, outliers
+        # included (the vacuum-convergence trap)
+        kept = int(work.sum())
+        trimmed = start - kept
+        converged = bool(res[work].max() <= tol
+                         and (trimmed == 0
+                              or (kept >= 5 and kept * 3 >= start * 2)))
 
     if abs(np.linalg.det(a)) < 1e-12:
         return None
-    return a, t, res, tol
+    return a, t, res, tol, converged
 
 
 def _affine_to_matrix(a, t):
@@ -391,24 +503,29 @@ def _affine_to_matrix(a, t):
     ))
 
 
-def _solve_instance_frame(mesh, extra_tol=0.0):
+def _solve_instance_frame(mesh, extra_tol=0.0, snap_all=False):
     """Recover the instance frame from the stored per-vertex original
     coordinates: least-squares affine fit original-local -> current
     container-local.  Immune to container Apply Transform / Set Origin /
     whole-piece edit-mode moves (the frame follows the piece) and to FBX
     matrix rebuilds - vertex order is irrelevant, the pairing rides with
     each vertex.  Rewrites the mesh vertices back into original local space
-    (snapping unedited verts to their exact stored coords) and returns the
-    frame Matrix, or None when the attributes are absent or the point cloud
-    is degenerate (legacy containers fall back to the matrix path)."""
+    (snapping unedited verts to their exact stored coords; snap_all=True
+    forces EVERY original vertex back - the forced-restore modes discard
+    local edits on purpose).  Returns (frame Matrix, edited vertex count,
+    fit converged), or (None, 0, False) when the attributes are absent or
+    the point cloud is degenerate (legacy containers fall back to the
+    matrix path).  ``converged`` False = the frame could not be anchored
+    on a trustworthy rigid majority - the caller must report the placement
+    as approximate."""
     co_attr = mesh.attributes.get(CO_ATTR)
     flag_attr = mesh.attributes.get(ORIG_ATTR)
     if (co_attr is None or co_attr.domain != 'POINT' or co_attr.data_type != 'FLOAT_VECTOR'
             or flag_attr is None or flag_attr.domain != 'POINT' or flag_attr.data_type != 'BOOLEAN'):
-        return None
+        return None, 0, False
     n = len(mesh.vertices)
     if n == 0:
-        return None
+        return None, 0, False
     p32 = np.zeros(n * 3, dtype=np.float32)
     co_attr.data.foreach_get("vector", p32)
     p = p32.reshape(-1, 3).astype(np.float64)
@@ -420,19 +537,57 @@ def _solve_instance_frame(mesh, extra_tol=0.0):
 
     core = _fit_affine_core(p, q, mask, extra_tol)
     if core is None:
-        return None
-    a, t, res, tol = core
+        return None, 0, False
+    a, t, res, tol, converged = core
 
     # final vertex coords: exact stored originals for unedited verts (kills
     # float32 container-space noise), frame-inverse for edited/new verts
     a_inv = np.linalg.inv(a)
     final = (q - t) @ a_inv.T
-    snap = np.zeros(n, dtype=bool)
-    snap[np.flatnonzero(mask)[res <= tol]] = True
+    if snap_all:
+        snap = mask.copy()
+    else:
+        snap = np.zeros(n, dtype=bool)
+        snap[np.flatnonzero(mask)[res <= tol]] = True
     final[snap] = p[snap]
     mesh.vertices.foreach_set("co", final.astype(np.float32).ravel())
 
-    return _affine_to_matrix(a, t)
+    return _affine_to_matrix(a, t), int((res > tol).sum()), converged
+
+
+def _stored_point_sample(mesh, limit=32):
+    """Up to ``limit`` stored original coordinates of the chunk's orig
+    verts.  The last-resort alive gate checks that a claimed reference
+    actually CONTAINS these points among its vertices (a chunk is a subset
+    of its original), rejecting a same-name same-counts stranger."""
+    co_attr = mesh.attributes.get(CO_ATTR)
+    om = _read_orig_mask(mesh)
+    if (co_attr is None or co_attr.domain != 'POINT'
+            or co_attr.data_type != 'FLOAT_VECTOR'
+            or om is None or not om.any()):
+        return None
+    arr = np.zeros(len(mesh.vertices) * 3, dtype=np.float32)
+    co_attr.data.foreach_get("vector", arr)
+    pts = arr.reshape(-1, 3)[om]
+    if len(pts) > limit:
+        step = max(1, len(pts) // limit)
+        pts = pts[::step][:limit]
+    return pts.copy()
+
+
+def _chunk_is_intact(mesh, ginfo):
+    """Chunk is "intact as a unit": exactly the group datablock's counts
+    AND every vertex existed at join time.  Only such a chunk has a
+    per-vertex pairing with the reference - its edits can be rolled back.
+    Originals with loose vertices never qualify: the chunk prune drops
+    loose geometry (see _prune_mesh_to_faces) and the counts diverge."""
+    verts, faces = ginfo.get("verts"), ginfo.get("faces")
+    if verts is None or faces is None or not len(mesh.polygons):
+        return False
+    if len(mesh.vertices) != int(verts) or len(mesh.polygons) != int(faces):
+        return False
+    mask = _read_orig_mask(mesh)
+    return mask is not None and len(mask) == len(mesh.vertices) and bool(mask.all())
 
 
 def _has_loose_geometry(mesh):
@@ -1095,8 +1250,12 @@ def _reconcile_container(context, obj):
                     vmask &= om
                     core = _fit_affine_core(p, q, vmask, extra_tol)
                     entry = merged["instances"][str(nid)]
-                    if core is not None:
-                        a, t, _res, _tol = core
+                    if core is not None and core[4]:
+                        # persist ONLY a converged fit - a frame anchored on
+                        # a dubious remnant must not overwrite matrix_rel
+                        # and clear the stale marker (extract would then
+                        # fly the piece with no warning)
+                        a, t = core[0], core[1]
                         entry["matrix_rel"] = _matrix_to_list(_affine_to_matrix(a, t))
                         entry.pop("matrix_stale", None)
                     else:
@@ -1565,6 +1724,35 @@ def _mesh_poly_normals(mesh):
     return arr
 
 
+def _materials_match(mesh_a, mesh_b):
+    """Same slot names in the same order AND the same material_index on
+    every face.  Split out of _geometry_matches so the restore modes can
+    tell a repaint apart from a real geometry edit."""
+    if not np.array_equal(_mesh_mat_indices(mesh_a), _mesh_mat_indices(mesh_b)):
+        return False
+    return ([m.name if m else "" for m in mesh_a.materials]
+            == [m.name if m else "" for m in mesh_b.materials])
+
+
+def _ballot_signature(mesh):
+    """Hashable ballot for the restore reference vote (taken AFTER
+    _restore_materials compacted the slots): material signature PLUS a
+    geometry digest (coords, loop topology, polygon normals).  Intact
+    chunks snapped onto the stored coords are byte-identical here; a
+    flipped or re-bridged chunk lands in its own bucket and cannot hijack
+    the reference by material signature alone."""
+    h = hashlib.blake2b(digest_size=16)
+    h.update(_mesh_coords(mesh).tobytes())
+    loops = np.zeros(len(mesh.loops), dtype=np.intc)
+    if len(mesh.loops):
+        mesh.loops.foreach_get("vertex_index", loops)
+    h.update(loops.tobytes())
+    h.update(_mesh_poly_normals(mesh).tobytes())
+    h.update(_mesh_mat_indices(mesh).tobytes())
+    names = tuple(m.name if m else "" for m in mesh.materials)
+    return names, h.digest()
+
+
 def _geometry_matches(mesh_a, mesh_b, check_materials=True, extra_atol=0.0):
     """extra_atol absorbs float32 roundtrip noise that grows with the
     instance's CONTAINER-relative offset (city-scale scenes): the joined
@@ -1585,13 +1773,8 @@ def _geometry_matches(mesh_a, mesh_b, check_materials=True, extra_atol=0.0):
     # quantised coords on small faces - genuine edits are caught by coords
     if not np.allclose(_mesh_poly_normals(mesh_a), _mesh_poly_normals(mesh_b), atol=0.1):
         return False
-    if check_materials:
-        if not np.array_equal(_mesh_mat_indices(mesh_a), _mesh_mat_indices(mesh_b)):
-            return False
-        names_a = [m.name if m else "" for m in mesh_a.materials]
-        names_b = [m.name if m else "" for m in mesh_b.materials]
-        if names_a != names_b:
-            return False
+    if check_materials and not _materials_match(mesh_a, mesh_b):
+        return False
     return True
 
 
@@ -1619,6 +1802,54 @@ def _uv_matches(mesh_a, mesh_b, atol=1e-5):
     return True
 
 
+def _vote_reference(members):
+    """Group reference for the restore modes: majority vote by ballot
+    signature (materials + geometry digest) among INTACT chunks.  A
+    repainted, flipped or otherwise deviant copy must not become the new
+    "original" - the healthy majority wins.  On a tie the first bucket
+    wins (dict keeps insertion order; max() returns the first maximum).
+    Returns the representative object or None when no chunk is intact."""
+    buckets = {}
+    for obj, _m, info in members:
+        if info["intact"]:
+            buckets.setdefault(_ballot_signature(obj.data), []).append(obj)
+    if not buckets:
+        return None
+    return max(buckets.values(), key=len)[0]
+
+
+def _adopt_target(member, target, new_meshes):
+    """Switch the object onto the reference datablock and drop its own
+    chunk mesh.  The chunk mesh was created by mesh.copy() for this object
+    alone, so after the reassignment it has zero users and remove() is
+    safe; the discard keeps the alive-adoption gate of the NEXT groups
+    from probing a dead pointer."""
+    old = member.data
+    member.data = target
+    new_meshes.discard(old)
+    bpy.data.meshes.remove(old)
+
+
+def _alive_contains_stored_points(alive, members, extra_atol):
+    """Vertex-subset gate for the last-resort reference: every surviving
+    stored original point of the group's chunks must exist among the
+    candidate's vertices (a chunk is a subset of its original) - a
+    same-name same-counts stranger fails here."""
+    pts = [i["pts"] for _o, _m, i in members if i.get("pts") is not None]
+    if not pts:
+        return True  # nothing to check against - counts-only gate remains
+    sample = np.concatenate(pts, axis=0).astype(np.float64)[:64]
+    verts = np.zeros(len(alive.vertices) * 3, dtype=np.float32)
+    alive.vertices.foreach_get("co", verts)
+    verts = verts.reshape(-1, 3).astype(np.float64)
+    scale = float(max(np.max(np.abs(verts), initial=1.0), 1.0))
+    atol = max(1e-4, scale * 1e-5, extra_atol)
+    for pt in sample:
+        if float(np.min(np.linalg.norm(verts - pt, axis=1))) > atol:
+            return False
+    return True
+
+
 def _link_to_collections(obj, names, context, fallback_collections):
     linked = False
     for name in names:
@@ -1640,8 +1871,10 @@ def _link_to_collections(obj, names, context, fallback_collections):
             context.scene.collection.objects.link(obj)
 
 
-def _extract_instances(op, context, container, target_ids):
+def _extract_instances(op, context, container, target_ids, restore='OFF'):
     """Core disassembly: pull the given instance ids out of the container.
+    restore: 'OFF' - honest disassembly (edited chunks stay unique);
+    'SOFT' | 'HARD' - forced restore, see AGR_OT_link_restore.
     Returns the list of created objects or None on error."""
     # blockers FIRST (read_table is a mutation-free view): a CANCELLED
     # outcome must not leave a reconcile mutation stranded outside undo
@@ -1686,6 +1919,12 @@ def _extract_instances(op, context, container, target_ids):
         agr_report(op, 'ERROR', f"❌ AGR Link: на контейнере нет атрибута {ATTR_NAME}")
         return None
 
+    # legacy container (no per-vertex co/orig): there is nothing to restore
+    # from - HARD can only lean on an alive datablock from the file
+    restore_blind = (restore != 'OFF'
+                     and (mesh.attributes.get(CO_ATTR) is None
+                          or mesh.attributes.get(ORIG_ATTR) is None))
+
     target_ids = {int(i) for i in target_ids if str(i) in table["instances"]}
     if not target_ids:
         agr_report(op, 'ERROR', "❌ AGR Link: нечего разбирать (экземпляры не найдены в таблице)")
@@ -1707,29 +1946,54 @@ def _extract_instances(op, context, container, target_ids):
 
     mirror_failed = False
     try:
-        created = []  # (obj, entry, matrix_rel, group_id)
+        created = []  # (obj, entry, frame, group_id, info)
         done_ids = []
         skipped_singular = 0
         skipped_stale = 0
-        face_count_changed = 0
+        face_changed_ids = set()
+        soft_snapped = 0    # chunks whose vertex shifts were discarded
+        soft_repaint = 0    # linked despite a repaint
+        hard_rebuilt = 0    # chunk geometry thrown away, reference taken
+        hard_alive_ref = 0  # reference had to come from the scene
+        hard_no_ref = 0     # groups HARD could not restore (no reference)
+        pos_approx = 0      # placement not anchored on a converged fit
+        hard_ids = set()
         for iid in extract:
             entry = table["instances"][str(iid)]
             m_rel = Matrix(entry["matrix_rel"])
+            gid = entry.get("group", 0)
             stored_faces = entry.get("faces")
             if stored_faces is not None:
                 if int(np.count_nonzero(face_ids == iid)) != stored_faces:
-                    face_count_changed += 1
+                    face_changed_ids.add(iid)
 
             new_mesh = mesh.copy()
             _prune_mesh_to_faces(new_mesh, lambda v, _iid=iid: v == _iid)
 
+            # intactness (restore only) must be read BEFORE the tracking
+            # attrs are removed; the stored-point sample feeds the
+            # last-resort alive gate of the relink phase
+            intact = (restore != 'OFF'
+                      and _chunk_is_intact(new_mesh, table["groups"].get(str(gid), {})))
+            stored_pts = _stored_point_sample(new_mesh) if restore == 'HARD' else None
             # Primary path: recover the frame from the stored per-vertex
             # original coords (robust to container Apply Transform / Set
             # Origin / whole-piece edit-mode moves / FBX matrix rebuilds).
             # Legacy containers fall back to the matrix path.
-            frame = _solve_instance_frame(new_mesh,
-                                          extra_tol=float(table.get("co_quant", 0.0)))
+            frame, edited_verts, fit_converged = _solve_instance_frame(
+                new_mesh, extra_tol=float(table.get("co_quant", 0.0)),
+                snap_all=intact)
             _remove_tracking_attrs(new_mesh)
+            fitted = frame is not None
+            # a failed fit means the snap never ran: the chunk must not
+            # pass as restored, vote, or serve as the group reference
+            intact = intact and fitted
+            if intact and edited_verts:
+                soft_snapped += 1
+            if intact and not fit_converged:
+                # coords are snapped, but the FRAME itself is dubious -
+                # the object may stand off its true place
+                pos_approx += 1
             if frame is None:
                 if entry.get("matrix_stale"):
                     # absorbed from a plain Ctrl+J and the coordinate fit
@@ -1756,7 +2020,9 @@ def _extract_instances(op, context, container, target_ids):
             _link_to_collections(obj, entry.get("collections", []), context, fallback_colls)
             for key, value in entry.get("props", {}).items():
                 obj[key] = value
-            created.append((obj, entry, frame, entry.get("group", 0)))
+            created.append((obj, entry, frame, gid,
+                            {"iid": iid, "intact": intact, "fitted": fitted,
+                             "converged": fit_converged, "pts": stored_pts}))
             done_ids.append(iid)
 
         # Second pass: parents.  Resolution order matters: (1) the batch
@@ -1765,10 +2031,10 @@ def _extract_instances(op, context, container, target_ids):
         # .__agr_link_tmp right now, so a bare name lookup would miss it);
         # (3) the scene by name.
         created_by_name = {}
-        for obj, entry, m_rel, gid in created:
+        for obj, entry, m_rel, gid, _info in created:
             created_by_name.setdefault(entry["name"], obj)
         container_survives = len(table["instances"]) > len(done_ids)
-        for obj, entry, m_rel, gid in created:
+        for obj, entry, m_rel, gid, _info in created:
             parent_name = entry.get("parent")
             if parent_name:
                 parent = created_by_name.get(parent_name)
@@ -1793,7 +2059,7 @@ def _extract_instances(op, context, container, target_ids):
         # child placed before its in-batch parent would end up at
         # parent_world @ target (verified on 5.2).
         context.view_layer.update()
-        unplaced = {obj: m_rel for obj, entry, m_rel, gid in created}
+        unplaced = {obj: m_rel for obj, entry, m_rel, gid, _info in created}
         while unplaced:
             progressed = False
             for obj in list(unplaced.keys()):
@@ -1809,19 +2075,27 @@ def _extract_instances(op, context, container, target_ids):
         # Fourth pass: re-link identical geometry of each group to one datablock
         unlinked_edited = 0
         by_group = {}
-        for obj, entry, m_rel, gid in created:
-            by_group.setdefault(gid, []).append((obj, m_rel))
+        for obj, entry, m_rel, gid, info in created:
+            by_group.setdefault(gid, []).append((obj, m_rel, info))
         new_meshes = {obj.data for obj, *_ in created}
+        forced = restore != 'OFF'
         for gid, members in by_group.items():
             ginfo = table["groups"].get(str(gid), {})
-            member_objs = [o for o, _m in members]
-            data_name = ginfo.get("data_name", member_objs[0].data.name)
+            data_name = ginfo.get("data_name", members[0][0].data.name)
             # float32 noise budget grows with container-relative offset;
             # after an FBX roundtrip the 16-bit quantisation step dominates
-            extra_atol = max(max(m.translation.length for _o, m in members) * 5e-6,
+            extra_atol = max(max(m.translation.length for _o, m, _i in members) * 5e-6,
                              float(table.get("co_quant", 0.0)))
 
+            # the group reference: under restore ONLY a majority-vote winner
+            # among intact chunks (or a vetted alive datablock) may serve -
+            # an arbitrary, never-validated first member must not own the
+            # group and eat the other copies' paint or geometry
+            rep = _vote_reference(members) if forced else None
+            probe = rep if rep is not None else members[0][0]
+
             target = None
+            ref_from_alive = False
             alive = bpy.data.meshes.get(data_name)
             alive_ok = (alive is not None and alive is not mesh
                         and alive not in new_meshes)
@@ -1832,27 +2106,71 @@ def _extract_instances(op, context, container, target_ids):
             # FULL test including materials AND UV: chunks carry the
             # CONTAINER's materials/unwrap, so an alive datablock with
             # different slots or an old unwrap must not be adopted (the
-            # group then links onto itself instead)
-            if alive_ok and _geometry_matches(member_objs[0].data, alive,
-                                              check_materials=True,
-                                              extra_atol=extra_atol) \
-                    and _uv_matches(member_objs[0].data, alive):
+            # group then links onto itself instead).  Under restore the
+            # probe must be the VOTED representative - matching against an
+            # arbitrary (possibly vandalised) first member would promote an
+            # unvetted reference for the whole group.
+            if alive_ok and (not forced or rep is not None) \
+                    and _geometry_matches(probe.data, alive,
+                                          check_materials=True,
+                                          extra_atol=extra_atol) \
+                    and _uv_matches(probe.data, alive):
                 # copies of this group still live in the file - re-attach
                 target = alive
                 _remove_tracking_attrs(target)
+                ref_from_alive = True
+            elif (alive_ok and restore == 'HARD' and rep is None
+                  and ginfo.get("verts") is not None
+                  and ginfo.get("faces") is not None
+                  and len(alive.vertices) == int(ginfo["verts"])
+                  and len(alive.polygons) == int(ginfo["faces"])
+                  and _alive_contains_stored_points(alive, members, extra_atol)):
+                # LAST resort (HARD only): not a single intact chunk
+                # survived, but a datablock carrying the group's name, the
+                # exact counts AND the chunks' surviving original vertices
+                # still lives in the file.  Its materials/UV win over the
+                # container's - reported separately
+                target = alive
+                _remove_tracking_attrs(target)
+                ref_from_alive = True
+                hard_alive_ref += 1
             if target is None:
-                target = member_objs[0].data
+                target = probe.data
                 target.name = data_name
+            ref_ok = rep is not None or ref_from_alive
 
-            for member in member_objs:
+            group_gave_up = False
+            for member, _m, info in members:
                 if member.data == target:
                     continue
-                if _geometry_matches(member.data, target, extra_atol=extra_atol):
-                    old = member.data
-                    member.data = target
-                    bpy.data.meshes.remove(old)
+                geo_ok = _geometry_matches(member.data, target,
+                                           check_materials=False,
+                                           extra_atol=extra_atol)
+                if geo_ok and _materials_match(member.data, target):
+                    _adopt_target(member, target, new_meshes)
+                elif geo_ok and forced and ref_ok:
+                    # intact chunk, different paint: restore means restore -
+                    # the repaint goes to the bin, but ONLY onto a vetted
+                    # reference (user decision)
+                    _adopt_target(member, target, new_meshes)
+                    soft_repaint += 1
+                elif restore == 'HARD' and ref_ok:
+                    # broken topology: the chunk's geometry is thrown away;
+                    # the object keeps the frame fitted from its surviving
+                    # original vertices (or the stored-matrix fallback)
+                    _adopt_target(member, target, new_meshes)
+                    hard_rebuilt += 1
+                    hard_ids.add(info["iid"])
+                    if not (info["fitted"] and info["converged"]):
+                        pos_approx += 1
                 else:
                     unlinked_edited += 1
+                    if restore == 'HARD' and not ref_ok:
+                        group_gave_up = True
+            if group_gave_up:
+                # only groups that actually LEFT members unrestored count -
+                # a group that linked fine without a vote is not a failure
+                hard_no_ref += 1
 
         # --- shrink the container (keep untracked loose geometry, as the
         # join-time warning promises)
@@ -1932,6 +2250,7 @@ def _extract_instances(op, context, container, target_ids):
 
     renamed = [obj.name for obj, entry, *_ in created if obj.name != entry["name"]]
     warn_bits = []
+    info_bits = []
     if recon and recon.get("absorbed"):
         warn_bits.append(f"поглощены таблицы обычного Ctrl+J: {recon['absorbed']}")
     if missing:
@@ -1940,10 +2259,13 @@ def _extract_instances(op, context, container, target_ids):
         warn_bits.append(f"необратимая матрица (пропущены): {skipped_singular}")
     if skipped_stale:
         warn_bits.append(f"позиция не восстановима после Ctrl+J (пропущены): {skipped_stale}")
-    if face_count_changed:
-        warn_bits.append(f"изменилось число граней (правки или сторонний Ctrl+J): {face_count_changed}")
+    # instances HARD just rebuilt are not "suspicious" anymore
+    stale_faces = face_changed_ids - hard_ids
+    if stale_faces:
+        warn_bits.append(f"изменилось число граней (правки или сторонний Ctrl+J): {len(stale_faces)}")
     if unlinked_edited:
-        warn_bits.append(f"правленых копий оставлено уникальными: {unlinked_edited}")
+        tail = " — нужен жёсткий режим" if restore == 'SOFT' else ""
+        warn_bits.append(f"правленых копий оставлено уникальными{tail}: {unlinked_edited}")
     if renamed:
         warn_bits.append("имена заняты, переименованы: " + ", ".join(renamed[:3]))
     if mirror_failed:
@@ -1951,11 +2273,28 @@ def _extract_instances(op, context, container, target_ids):
     if not container_deleted and container_final_name != original_container_name \
             and not container_final_name.endswith("_leftover"):
         warn_bits.append(f"контейнер переименован: {container_final_name}")
+    if restore != 'OFF':
+        if restore_blind:
+            warn_bits.append("контейнер старого формата — восстанавливать не по чему")
+        if soft_snapped:
+            info_bits.append(f"сдвиги вершин отброшены: {soft_snapped}")
+        if soft_repaint:
+            info_bits.append(f"перекраска отброшена: {soft_repaint}")
+        if hard_rebuilt:
+            info_bits.append(f"перестроено по эталону: {hard_rebuilt}")
+        if hard_alive_ref:
+            warn_bits.append(f"эталон взят из сцены (его материалы/UV победили): {hard_alive_ref}")
+        if hard_no_ref:
+            warn_bits.append(f"групп без эталона (не восстановлены): {hard_no_ref}")
+        if pos_approx:
+            warn_bits.append(f"позиция может быть неточной (фит не сошёлся): {pos_approx}")
     level = 'WARNING' if warn_bits else 'INFO'
-    icon = "⚠️" if warn_bits else "✅"
-    msg = f"{icon} AGR Link: восстановлено {len(created)} объектов"
-    if warn_bits:
-        msg += " (" + "; ".join(warn_bits) + ")"
+    icon = "⚠️" if warn_bits else ("♻️" if info_bits else "✅")
+    head = {'SOFT': "мягкое восстановление", 'HARD': "жёсткое восстановление"}.get(restore)
+    msg = (f"{icon} AGR Link: {head} — {len(created)} объектов" if head
+           else f"{icon} AGR Link: восстановлено {len(created)} объектов")
+    if warn_bits or info_bits:
+        msg += " (" + "; ".join(info_bits + warn_bits) + ")"
     agr_report(op, level, msg)
     return [obj for obj, *_ in created]
 
@@ -2007,6 +2346,79 @@ class AGR_OT_link_separate_all(Operator):
             return {'CANCELLED'}
         ids = [int(iid) for iid in table["instances"].keys()]
         result = _extract_instances(self, context, container, ids)
+        return {'FINISHED'} if result is not None else {'CANCELLED'}
+
+
+class AGR_OT_link_restore(Operator):
+    """Разобрать контейнер с ПРИНУДИТЕЛЬНЫМ восстановлением инстансов:
+правки откатываются к эталону группы, копии снова становятся линкованными"""
+    bl_idname = "agr.link_restore"
+    bl_label = "Восстановить"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(
+        name="Режим",
+        items=[('SOFT', "Мягко",
+                "Только целые куски: сдвиги вершин и перекраска отбрасываются"),
+               ('HARD', "Жёстко",
+                "Плюс куски с разрушенной топологией: их геометрия выбрасывается")],
+        default='SOFT')
+    group_id: IntProperty(name="Group ID", default=-1)  # -1 = весь контейнер
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and is_container(context.active_object)
+
+    @classmethod
+    def description(cls, context, properties):
+        if properties.mode == 'HARD':
+            return ("Жёсткое восстановление: как мягкое, ПЛЮС куски с разрушенной "
+                    "топологией (примержи, удалённые грани) — их геометрия "
+                    "ВЫБРАСЫВАЕТСЯ и заменяется эталоном группы, позиция берётся "
+                    "по уцелевшим исходным вершинам. Куски без граней и с "
+                    "непересчитанной матрицей пропускаются")
+        return ("Мягкое восстановление: куски, целые как единица, возвращаются к "
+                "исходным координатам и линкуются к эталону группы даже при другой "
+                "покраске. Куски с изменённой топологией не трогаются")
+
+    def invoke(self, context, event):
+        if self.mode == 'HARD':
+            # the per-group trigger is an icon-only button - this popup is
+            # the user's only warning about what HARD is going to discard
+            return context.window_manager.invoke_confirm(
+                self, event, title="Жёсткое восстановление",
+                message="Правки геометрии кусков будут ВЫБРОШЕНЫ и заменены "
+                        "эталоном группы. Продолжить?",
+                confirm_text="Восстановить", icon='WARNING')
+        return self.execute(context)
+
+    def execute(self, context):
+        container = context.active_object
+        table = read_table(container)
+        if table is None:
+            agr_report(self, 'ERROR',
+                       "❌ AGR Link: таблица контейнера не читается (данные повреждены)")
+            return {'CANCELLED'}
+        mesh = container.data
+        if (mesh.attributes.get(CO_ATTR) is None
+                and mesh.attributes.get(COL_CO) is None):
+            # legacy container: no per-vertex originals and no color mirror
+            # to rebuild them from - there is NOTHING to restore, and a
+            # silent plain disassembly here would be an irreversible surprise
+            agr_report(self, 'ERROR',
+                       "❌ AGR Link: контейнер старого формата (нет исходных "
+                       "координат) — восстанавливать не по чему, используйте "
+                       "обычную разборку")
+            return {'CANCELLED'}
+        if self.group_id < 0:
+            ids = [int(iid) for iid in table["instances"].keys()]
+        else:
+            ids = [int(iid) for iid, inst in table["instances"].items()
+                   if inst.get("group", 0) == self.group_id]
+            if not ids:
+                agr_report(self, 'ERROR', "❌ AGR Link: группа не найдена в контейнере")
+                return {'CANCELLED'}
+        result = _extract_instances(self, context, container, ids, restore=self.mode)
         return {'FINISHED'} if result is not None else {'CANCELLED'}
 
 
@@ -2122,11 +2534,27 @@ class AGR_PT_LinkPanel(Panel):
             members = by_group[gid]
             text, icon = group_label(gid, members)
             row = box.row(align=True)
-            row.label(text=text, icon=icon)
-            op = row.operator("agr.link_extract_group", text="", icon='EXPORT')
+            row.row().label(text=text, icon=icon)  # expandable, buttons keep their size
+            btns = row.row(align=True)
+            op = btns.operator("agr.link_extract_group", text="", icon='EXPORT')
+            op.group_id = gid
+            op = btns.operator("agr.link_restore", text="", icon='LOOP_BACK')
+            op.mode = 'SOFT'
+            op.group_id = gid
+            op = btns.operator("agr.link_restore", text="", icon='FILE_REFRESH')
+            op.mode = 'HARD'
             op.group_id = gid
 
         layout.operator("agr.link_separate_all", icon='OUTLINER_OB_GROUP_INSTANCE')
+        col = layout.column(align=True)
+        op = col.operator("agr.link_restore", text="Восстановить всё (мягко)",
+                          icon='LOOP_BACK')
+        op.mode = 'SOFT'
+        op.group_id = -1
+        op = col.operator("agr.link_restore", text="Восстановить всё (жёстко)",
+                          icon='FILE_REFRESH')
+        op.mode = 'HARD'
+        op.group_id = -1
         layout.operator("agr.link_strip", icon='TRASH')
 
 
@@ -2138,6 +2566,7 @@ classes = (
     AGR_OT_link_join,
     AGR_OT_link_extract_group,
     AGR_OT_link_separate_all,
+    AGR_OT_link_restore,
     AGR_OT_link_strip,
     AGR_PT_LinkPanel,
 )
