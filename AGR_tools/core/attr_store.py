@@ -35,6 +35,7 @@ MAX_ATTRS = 128                  # capacity guard: 4 bytes per loop per attribut
 MAX_PAYLOAD = 16 * 1024 * 1024   # sanity bound for the decoded length field
 HEADER_V1 = 14                   # magic(4) + ver(1) + flags(1) + len(4) + crc(4)
 HEADER_V2 = 18                   # v1 + n_loops(4): carrier loop count for exact windows
+COLOR_TYPES = ('FLOAT_COLOR', 'BYTE_COLOR')   # the only types exposing color_srgb
 
 
 def read_srgb_bytes(attr):
@@ -143,6 +144,103 @@ class ColorBlobStore:
                  and a.name[len(self.prefix):].isdigit()]
         return sorted(names, key=lambda n: int(n[len(self.prefix):]))
 
+    def _color_layer(self, mesh, name, n_loops=None):
+        """One mirror layer, or None when it cannot be read as packed
+        bytes.  ``color_srgb`` exists ONLY on color attributes, so a
+        foreign layer that merely borrowed the prefix (a FLOAT attribute
+        named "<prefix>0") must return None here — this runs inside
+        poll()/draw(), where an AttributeError takes the whole panel down.
+        ``n_loops`` additionally demands the canonical length, which is
+        also how an open edit BMesh is caught: while it lives, every
+        attribute's data array is EMPTY even though the counts refresh."""
+        attr = None if mesh is None else mesh.attributes.get(name)
+        if attr is None or attr.domain != 'CORNER':
+            return None
+        if attr.data_type not in COLOR_TYPES:
+            return None
+        if n_loops is not None and len(attr.data) != n_loops:
+            return None
+        return attr
+
+    def _head_bytes(self, mesh, names, count):
+        """The first ``count`` bytes of the packed blob, read loop by loop
+        and spilling into the next layer when one layer is too short: a
+        4-loop quad carries 16 bytes per layer, room for a v1 header but
+        not for a v2 one.  At most ceil(HEADER_V2/4) loops are touched, so
+        the cost stays flat in mesh size.  None when the layers cannot
+        supply that many bytes."""
+        n_loops = len(mesh.loops)
+        if n_loops == 0:
+            return None
+        raw = bytearray()
+        for name in names:
+            attr = self._color_layer(mesh, name, n_loops)
+            if attr is None:
+                return None
+            for i in range(min(n_loops, -(-(count - len(raw)) // 4))):
+                for ch in attr.data[i].color_srgb:
+                    raw.append(min(255, max(0, int(round(ch * 255.0)))))
+            if len(raw) >= count:
+                return bytes(raw[:count])
+        return None
+
+    def layer_ok(self, mesh, name):
+        """True when ``name`` is a readable packed-bytes layer of canonical
+        length (CORNER color attribute, one entry per loop)."""
+        return self._color_layer(mesh, name, len(mesh.loops)) is not None
+
+    def frame_capacity(self, mesh):
+        """Bytes the mirror layers can actually hold, or None when ANY
+        named layer cannot be read as packed bytes (wrong type/domain/
+        length — e.g. a foreign FLOAT attribute that merely borrowed the
+        "<prefix>N" name).  A name-only count over-reports capacity there,
+        and an integrity check built on it calls the mirror healthy while
+        decode_colors — which reads EVERY named layer — could only ever
+        fail."""
+        names = self.color_names(mesh)
+        if not names:
+            return None
+        n_loops = len(mesh.loops)
+        if n_loops == 0:
+            return None
+        for name in names:
+            if self._color_layer(mesh, name, n_loops) is None:
+                return None
+        return len(names) * n_loops * 4
+
+    def verify_frame(self, mesh):
+        """Byte-level CRC check of the frame at loop 0 — no decompress, no
+        JSON parse.  The header-only probe (peek_frame_header) cannot see
+        payload corruption that keeps the loop count intact (Sort Elements,
+        delete a quad + build another), and legacy v1 frames carry no loop
+        count at all — this is the affordable deep check for the moments
+        that matter (the save-time autosync), NOT for poll()/draw(): it
+        reads every mirror byte.  Returns True (payload matches its CRC),
+        False (mirror present but unreadable or corrupt), or None (no
+        mirror layers at all)."""
+        names = self.color_names(mesh)
+        if not names:
+            return None
+        if names[0] != self.prefix + "0":
+            return False
+        n_loops = len(mesh.loops)
+        if n_loops == 0:
+            return False
+        chunks = []
+        for name in names:
+            attr = self._color_layer(mesh, name, n_loops)
+            if attr is None:
+                return False
+            chunks.append(read_srgb_bytes(attr))
+        blob = np.concatenate(chunks).tobytes()
+        parsed = self._parse_header(blob)
+        if parsed is None:
+            return False
+        header, length, crc, _src = parsed
+        if header + length > len(blob):
+            return False
+        return zlib.crc32(blob[header:header + length]) == crc
+
     def remove_mirror(self, mesh):
         """Remove ONLY this namespace's mirror attributes — so a stale
         mirror never contradicts the idprop record."""
@@ -205,6 +303,36 @@ class ColorBlobStore:
         src_loops = int.from_bytes(blob[14:18], "little") if version >= 2 else None
         return header, length, crc, src_loops
 
+    def peek_frame_header(self, mesh):
+        """Cheap integrity probe: decode ONLY the frame header instead of
+        the whole layer.  The read is sized to the frame's OWN version —
+        14 bytes for a legacy v1 frame, 18 for v2 — and spills into the
+        next layer on carriers too small to hold the header in one (a
+        4-loop quad holds 16 bytes: room for v1, not for v2).  Cost is
+        flat in mesh size: measured 12 us from 512 to 2.6M loops, against
+        5.9 ms for the full candidate scan at 115k loops.  Returns
+        (version, payload_len, source_loops) - source_loops is None on
+        legacy v1 frames, which carry no loop count - or None when the
+        mirror does not start with a valid frame.  Reads only, so
+        poll()/draw() may call it."""
+        names = self.color_names(mesh) if mesh is not None else []
+        # the blob always starts at layer 0 — a mirror missing it is
+        # unreadable, and reading layer 1 as the head would invent a frame
+        if not names or names[0] != self.prefix + "0":
+            return None
+        raw = self._head_bytes(mesh, names, HEADER_V2)
+        if raw is None:
+            # a whole v1 frame can be shorter than a v2 header, and on a
+            # tiny carrier the layers may hold nothing past it
+            raw = self._head_bytes(mesh, names, HEADER_V1)
+        if raw is None:
+            return None
+        parsed = self._parse_header(raw)
+        if parsed is None:
+            return None
+        _header, length, _crc, src_loops = parsed
+        return raw[4], length, src_loops
+
     def _decode_blob(self, blob):
         """Frame check + CRC + JSON + validator on a raw byte string.
         Shared by the whole-mesh decode and the window scanner."""
@@ -237,8 +365,8 @@ class ColorBlobStore:
             return None
         chunks = []
         for name in names:
-            attr = mesh.attributes.get(name)
-            if attr is None or attr.domain != 'CORNER' or len(attr.data) != n_loops:
+            attr = self._color_layer(mesh, name, n_loops)
+            if attr is None:
                 return None
             chunks.append(read_srgb_bytes(attr))
         return self._decode_blob(np.concatenate(chunks).tobytes())
@@ -257,8 +385,8 @@ class ColorBlobStore:
         n_loops = len(mesh.loops)
         if n_loops == 0:
             return names, None
-        first = mesh.attributes.get(names[0])
-        if first is None or first.domain != 'CORNER' or len(first.data) != n_loops:
+        first = self._color_layer(mesh, names[0], n_loops)
+        if first is None:
             return names, None
         return names, read_srgb_bytes(first).reshape(-1, 4)
 
@@ -301,11 +429,8 @@ class ColorBlobStore:
 
         def layer_bytes(name):
             if name not in layers:
-                attr = mesh.attributes.get(name)
-                if attr is None or attr.domain != 'CORNER' or len(attr.data) != n_loops:
-                    layers[name] = None
-                else:
-                    layers[name] = read_srgb_bytes(attr)
+                attr = self._color_layer(mesh, name, n_loops)
+                layers[name] = None if attr is None else read_srgb_bytes(attr)
             return layers[name]
 
         def segment_blob(s, e):

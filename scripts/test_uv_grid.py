@@ -1331,6 +1331,219 @@ try:
           expect_cancel(bpy.ops.agr.uv_grid_capture))
     bpy.ops.object.mode_set(mode='OBJECT')
 
+    print("=" * 60)
+    print("TEST 35: TOPZ (plan view) basis is nailed to world X/Y")
+    # floor grid tilted 60 deg about X: |n.z| = 0.5 -> the WORLD source would
+    # pick its WALL branch (V up the slope), so the two sources must disagree
+    roof = make_grid_object("RoofTilt", 3, 3, cell=1.0,
+                            matrix=Matrix.Rotation(radians(60), 4, 'X'))
+    bm = enter_edit(roof)
+    for f in bm.faces:
+        f.select = True
+    reset_settings()
+    s = settings()
+    s.selection_mode = 'ALL'
+    s.grid_source = 'TOPZ'
+    s.world_cell_u = s.world_cell_v = 1.0
+    r = bpy.ops.agr.uv_grid_unwrap()
+    check("TOPZ unwrap FINISHED", r == {'FINISHED'})
+    bm = bmesh.from_edit_mesh(roof.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    check("TOPZ: all UVs in 0..1", all_uvs_in_unit(bm, uv_layer))
+    f0 = next(f for f in bm.faces
+              if (f.calc_center_median() - Vector((0.5, 0.5, 0))).length < 1e-5)
+    uv10 = uv_of_vert(bm, uv_layer, f0, (1, 0, 0))
+    uv01 = uv_of_vert(bm, uv_layer, f0, (0, 1, 0))
+    check("TOPZ: U = world +X", uv10 is not None and (uv10 - Vector((1, 0))).length < 1e-4,
+          f"uv={tuple(uv10) if uv10 else None}")
+    # world Y of local (0,1,0) is cos(60) = 0.5 -> the slope is FORESHORTENED,
+    # which is exactly what a top-down projection must do
+    check("TOPZ: V = world +Y (slope foreshortened to 0.5)",
+          uv01 is not None and (uv01 - Vector((0, 0.5))).length < 1e-4,
+          f"uv={tuple(uv01) if uv01 else None}")
+    # same geometry through the WORLD source measures along the slope -> 1.0
+    s.grid_source = 'WORLD'
+    s.origin_mode = 'WORLD'
+    bpy.ops.agr.uv_grid_unwrap()
+    bm = bmesh.from_edit_mesh(roof.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    f0 = next(f for f in bm.faces
+              if (f.calc_center_median() - Vector((0.5, 0.5, 0))).length < 1e-5)
+    w01 = uv_of_vert(bm, uv_layer, f0, (0, 1, 0))
+    check("WORLD source measures along the slope (V=1) - sources differ",
+          w01 is not None and abs(w01.y - 1.0) < 1e-4,
+          f"uv={tuple(w01) if w01 else None}")
+
+    print("=" * 60)
+    print("TEST 36: TOPZ ignores selection, auto-orient and origin_mode")
+    s.grid_source = 'TOPZ'
+    s.selection_mode = 'SELECTED'
+    s.origin_mode = 'SELECTION'   # must be ignored: TOPZ anchors at world 0
+    s.auto_orient = True          # must be ignored: normals are never read
+    bm = bmesh.from_edit_mesh(roof.data)
+    deselect_all(bm)
+    # ONE far face, deliberately OFF the grid lines in V: local x 2..3,
+    # y 1..2 -> world y 0.5..1.0.  The fractional corner is what makes the
+    # check discriminating: with the origin nailed at world 0 the face lands
+    # at v = 0.5, while snapping the origin to the selection corner (what
+    # `!= 'EDGES'` instead of `== 'WORLD'` in _resolve_basis would do) would
+    # zero it.  On an integer-aligned face BOTH branches give the same UVs,
+    # so the guard _resolve_basis documents went untested.
+    far = next(f for f in bm.faces
+               if (f.calc_center_median() - Vector((2.5, 1.5, 0))).length < 1e-5)
+    far.select = True
+    r = bpy.ops.agr.uv_grid_unwrap()
+    check("TOPZ single-face unwrap FINISHED", r == {'FINISHED'})
+    bm = bmesh.from_edit_mesh(roof.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    far = next(f for f in bm.faces
+               if (f.calc_center_median() - Vector((2.5, 1.5, 0))).length < 1e-5)
+    uv21 = uv_of_vert(bm, uv_layer, far, (2, 1, 0))
+    uv32 = uv_of_vert(bm, uv_layer, far, (3, 2, 0))
+    # world (2, 0.5): u = 2 - floor(2.5) = 0, v = 0.5 - floor(0.75) = 0.5
+    check("TOPZ: origin stays at world 0 despite origin_mode=SELECTION",
+          uv21 is not None and (uv21 - Vector((0, 0.5))).length < 1e-4,
+          f"uv={tuple(uv21) if uv21 else None}")
+    # world (3, 1.0) -> (1, 1.0): the slope stays foreshortened by cos(60)
+    check("TOPZ: far face keeps plan-view scale",
+          uv32 is not None and (uv32 - Vector((1, 1.0))).length < 1e-4,
+          f"uv={tuple(uv32) if uv32 else None}")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # normals pointing DOWN: auto-orient would mirror U for the other
+    # sources; TOPZ must keep U = +X and honestly report the mirroring
+    flip = make_grid_object("FlipFloor", 2, 2, cell=1.0)
+    bm = enter_edit(flip)
+    for f in bm.faces:
+        f.select = True
+    bpy.ops.mesh.flip_normals()
+    reset_settings()
+    s = settings()
+    s.selection_mode = 'ALL'
+    s.grid_source = 'TOPZ'
+    bpy.ops.agr.uv_grid_unwrap()
+    bm = bmesh.from_edit_mesh(flip.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    f0 = next(f for f in bm.faces
+              if (f.calc_center_median() - Vector((0.5, 0.5, 0))).length < 1e-5)
+    uv10 = uv_of_vert(bm, uv_layer, f0, (1, 0, 0))
+    check("TOPZ: inverted normals do NOT rotate the plan grid",
+          uv10 is not None and (uv10 - Vector((1, 0))).length < 1e-4,
+          f"uv={tuple(uv10) if uv10 else None}")
+    check("TOPZ: mirroring is reported honestly, not compensated",
+          shoelace(f0, uv_layer) < 0, f"shoelace={shoelace(f0, uv_layer):.4f}")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # swap_axes flips the basis handedness, and under TOPZ the auto-orient
+    # that compensates it is structurally OFF - the whole unwrap silently
+    # came out MIRRORED (shoelace flipped sign on every face).  TOPZ must
+    # ignore the swap: the sanctioned plan-grid rotation is world_angle.
+    upfloor = make_grid_object("SwapFloor", 2, 2, cell=1.0)
+    bm = enter_edit(upfloor)
+    for f in bm.faces:
+        f.select = True
+    reset_settings()
+    s = settings()
+    s.selection_mode = 'ALL'
+    s.grid_source = 'TOPZ'
+    s.swap_axes = True
+    bpy.ops.agr.uv_grid_unwrap()
+    bm = bmesh.from_edit_mesh(upfloor.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    check("TOPZ: swap_axes is ignored - nothing is mirrored",
+          all(shoelace(f, uv_layer) > 0 for f in bm.faces),
+          f"shoelaces={[round(shoelace(f, uv_layer), 3) for f in bm.faces]}")
+    f0 = next(f for f in bm.faces
+              if (f.calc_center_median() - Vector((0.5, 0.5, 0))).length < 1e-5)
+    uv10 = uv_of_vert(bm, uv_layer, f0, (1, 0, 0))
+    check("TOPZ: with swap requested U still equals world +X",
+          uv10 is not None and (uv10 - Vector((1, 0))).length < 1e-4,
+          f"uv={tuple(uv10) if uv10 else None}")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 37: TOPZ world_angle + offsets, SURFACE forced off, cut")
+    floor2 = make_grid_object("PlanFloor", 2, 2, cell=1.0)
+    bm = enter_edit(floor2)
+    for f in bm.faces:
+        f.select = True
+    reset_settings()
+    s = settings()
+    s.selection_mode = 'ALL'
+    s.grid_source = 'TOPZ'
+    s.world_angle = radians(90)   # U -> +Y, V -> -X
+    bpy.ops.agr.uv_grid_unwrap()
+    bm = bmesh.from_edit_mesh(floor2.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    f0 = next(f for f in bm.faces
+              if (f.calc_center_median() - Vector((0.5, 0.5, 0))).length < 1e-5)
+    a10 = uv_of_vert(bm, uv_layer, f0, (1, 0, 0))
+    a01 = uv_of_vert(bm, uv_layer, f0, (0, 1, 0))
+    check("TOPZ +90 deg: U follows world +Y",
+          a01 is not None and (a01 - Vector((1, 1))).length < 1e-4,
+          f"uv(0,1)={tuple(a01) if a01 else None}")
+    check("TOPZ +90 deg: V follows world -X",
+          a10 is not None and (a10 - Vector((0, 0))).length < 1e-4,
+          f"uv(1,0)={tuple(a10) if a10 else None}")
+    s.world_angle = 0.0
+    s.offset_u = 0.25
+    bpy.ops.agr.uv_grid_unwrap()
+    bm = bmesh.from_edit_mesh(floor2.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    f0 = next(f for f in bm.faces
+              if (f.calc_center_median() - Vector((0.5, 0.5, 0))).length < 1e-5)
+    o10 = uv_of_vert(bm, uv_layer, f0, (1, 0, 0))
+    check("TOPZ: offset_u shifts the plan grid",
+          o10 is not None and abs(o10.x - 0.75) < 1e-4,
+          f"uv={tuple(o10) if o10 else None}")
+    s.offset_u = 0.0
+
+    # the overlay preview must survive the new source (it draws a HORIZONTAL
+    # lattice there, not one parked beside the faces)
+    data = uvmod._uv_overlay_build(bpy.context, s)
+    check("TOPZ overlay builds", isinstance(data, dict) and "error" not in data,
+          str(data if not isinstance(data, dict) else data.get("error", "ok")))
+    if isinstance(data, dict) and "error" not in data:
+        zs = [p[2] for p in data["lattice_pts"]]
+        check("TOPZ overlay lattice is horizontal",
+              bool(zs) and max(zs) - min(zs) < 1e-5,
+              f"dz={max(zs) - min(zs):.2e}" if zs else "no lattice")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # SURFACE must be a no-op under TOPZ: the plan-view cut and unwrap have
+    # to come out bit-identical to the PLANAR run
+    def topz_cut_unwrap(name, projection):
+        ob = make_grid_object(name, 3, 3, cell=1.0,
+                              matrix=Matrix.Rotation(radians(60), 4, 'X'))
+        b = enter_edit(ob)
+        for f in b.faces:
+            f.select = True
+        reset_settings()
+        st = settings()
+        st.selection_mode = 'ALL'
+        st.grid_source = 'TOPZ'
+        st.projection = projection
+        st.world_cell_u = st.world_cell_v = 0.4
+        res = bpy.ops.agr.uv_grid_cut_unwrap()
+        b = bmesh.from_edit_mesh(ob.data)
+        uvl = b.loops.layers.uv.verify()
+        uvs = sorted((round(l[uvl].uv.x, 5), round(l[uvl].uv.y, 5),
+                      round(l.vert.co.x, 5), round(l.vert.co.y, 5))
+                     for f in b.faces for l in f.loops)
+        inside = all_uvs_in_unit(b, uvl)
+        nf = len(b.faces)
+        bpy.ops.object.mode_set(mode='OBJECT')
+        return res, nf, uvs, inside
+
+    r_pl, nf_pl, uv_pl, in_pl = topz_cut_unwrap("TopzPlanar", 'PLANAR')
+    r_sf, nf_sf, uv_sf, in_sf = topz_cut_unwrap("TopzSurface", 'SURFACE')
+    check("TOPZ cut+unwrap FINISHED", r_pl == {'FINISHED'} and r_sf == {'FINISHED'})
+    check("TOPZ cut: every face lands inside its cell", in_pl and in_sf)
+    check("TOPZ cut: mesh really got cut", nf_pl > 9, f"faces={nf_pl}")
+    check("TOPZ: SURFACE projection is forced off (identical result)",
+          nf_pl == nf_sf and uv_pl == uv_sf,
+          f"faces {nf_pl} vs {nf_sf}, uv equal={uv_pl == uv_sf}")
+
 except Exception:
     traceback.print_exc()
     FAILS.append("EXCEPTION")

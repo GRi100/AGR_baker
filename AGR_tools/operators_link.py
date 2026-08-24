@@ -84,12 +84,13 @@ import json
 import bpy
 import bmesh
 import numpy as np
-from bpy.props import EnumProperty, IntProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty
 from bpy.types import Operator, Panel
 from mathutils import Matrix
 
 from .log import agr_report
-from .core.attr_store import ColorBlobStore, preserve_active_color, read_srgb_bytes
+from .core.attr_store import (ColorBlobStore, preserve_active_color,
+                              read_srgb_bytes, HEADER_V1, HEADER_V2)
 from .core.atlas_store import ATLAS_STORE
 from .core.udim_store import UDIM_STORE
 
@@ -641,11 +642,23 @@ def _pack_tracking_to_colors(mesh, table):
     mirror (called after every join).  Finishes by encoding the table
     itself into AGR_Link_T* - the container becomes fully self-contained
     for a plain default FBX export."""
+    # "cannot read this mesh right now" is NOT "the mirror is stale", and
+    # only the second one justifies deleting the mirror.  While an edit
+    # BMesh is open every attribute's .data array is EMPTY - the counts
+    # refresh, the arrays do not, and update_from_editmode() does not help -
+    # so foreach_get would raise and the caller's except would wipe a
+    # mirror that may be perfectly healthy.  Bail out BEFORE touching
+    # anything; the save handler retries once the mesh is flushed.
+    if mesh.is_editmode:
+        return False
     attr = mesh.attributes.get(ATTR_NAME)
     co_attr = mesh.attributes.get(CO_ATTR)
     flag_attr = mesh.attributes.get(ORIG_ATTR)
     if attr is None or co_attr is None or flag_attr is None:
-        _remove_color_mirror(mesh)  # never leave a stale mirror behind
+        # do NOT remove the mirror here: with the tracking attrs gone the
+        # mirror may be the ONLY surviving carrier of the original coords,
+        # and deleting it would destroy the container's memory for good
+        # (callers must rebuild the attrs from the mirror first)
         return False
     n_verts = len(mesh.vertices)
     n_loops = len(mesh.loops)
@@ -653,6 +666,9 @@ def _pack_tracking_to_colors(mesh, table):
     if n_verts == 0 or n_loops == 0:
         _remove_color_mirror(mesh)
         return False
+    if (len(co_attr.data) != n_verts or len(flag_attr.data) != n_verts
+            or len(attr.data) != n_polys):
+        return False   # arrays not materialised - same "cannot read" case
 
     co = np.zeros(n_verts * 3, dtype=np.float32)
     co_attr.data.foreach_get("vector", co)
@@ -930,6 +946,23 @@ def _add_zero_instance(merged, zero_faces, container_name, mesh_name):
     return zero_iid
 
 
+def _untracked_faces(mesh, windows=None):
+    """Faces that no id stamp / readable table window accounts for — the
+    tail a plain Ctrl+J into this container left behind.  With tracking
+    attrs the count is exact; on the pure-FBX path (no attrs yet) it is
+    estimated from the window metadata — the same arithmetic _merged_view
+    always used."""
+    ids = _read_face_ids(mesh)
+    if ids is not None:
+        return int((ids == 0).sum())
+    if windows is None:
+        windows = _LINK_STORE.scan_windows(mesh)
+    total = sum(int(i.get("faces", 0) or 0)
+                for _s, _c, wt in windows
+                for i in wt.get("instances", {}).values())
+    return max(0, len(mesh.polygons) - total)
+
+
 def _merged_view(obj):
     """(table, extra_windows_count) WITHOUT mutating anything.  When the
     mesh carries foreign table windows the returned table is a VIRTUAL
@@ -954,16 +987,7 @@ def _merged_view(obj):
         own = any(_window_matches_table(wt, idp) for _s, _c, wt in windows)
         if len(windows) - (1 if own else 0) <= 0:
             return idp, 0
-    zero = 0
-    if idp is None:
-        ids = _read_face_ids(data)
-        if ids is not None:
-            zero = int((ids == 0).sum())
-        else:  # FBX path: no attrs yet - estimate from the window metadata
-            total = sum(int(i.get("faces", 0) or 0)
-                        for _s, _c, wt in windows
-                        for i in wt.get("instances", {}).values())
-            zero = max(0, len(data.polygons) - total)
+    zero = _untracked_faces(data, windows) if idp is None else 0
     merged, extras, _z = _compose_merged(idp, windows, zero, obj.name, data.name)
     if merged is None:
         return idp, 0
@@ -990,6 +1014,179 @@ def _peek_merged(obj):
     result = _merged_view(obj)
     _MERGED_CACHE[obj.name] = (fp, result)
     return result
+
+
+# ----------------------------------------------------------------------------
+# Mirror integrity ("is this container ready for FBX?")
+# ----------------------------------------------------------------------------
+# The memory has TWO carriers: the idprop (lives in the .blend, immune to
+# mesh edits) and the color mirror (the ONLY one a default FBX export
+# carries).  They drift apart silently: the blob is written as one
+# contiguous run starting at loop 0, so deleting the faces that happen to
+# sit at the head of the mesh takes the frame header - magic, length,
+# CRC32 - with it.  The .blend keeps working off the idprop while the
+# exported FBX ships a container nobody can disassemble.
+MIRROR_OK = 'OK'          # header matches the current mesh
+MIRROR_STALE = 'STALE'    # mesh was edited after the mirror was packed
+MIRROR_BROKEN = 'BROKEN'  # no readable header (edits cut the frame off)
+MIRROR_NONE = 'NONE'      # no mirror at all
+MIRROR_UNKNOWN = 'UNKNOWN'  # cannot be read right now (open edit BMesh)
+MIRROR_WINDOWS = 'WINDOWS'  # memory rides in plain-Ctrl+J windows, not at loop 0
+
+# containers the save-time autosync must leave to the explicit button:
+# obj.name -> (fingerprint, reason).  Three reasons, all "not repackable as
+# it stands": foreign plain-Ctrl+J windows in the mirror, a blob that does
+# not fit the mesh, a repack that raised.  Without this every save would
+# pay the full repack (0.5 s on a 1.3M-loop container) just to fail again;
+# the fingerprint means the very next mesh edit retries it.
+_NO_AUTOSYNC = {}
+
+
+def _mirror_fingerprint(obj):
+    """Identity of "this object with this mesh and this table" - the key
+    behind the autosync skip list.  session_uid is part of it on purpose:
+    a DELETED container whose name is later reused by a new object (or by
+    the NEXT opened file) must not inherit the old entry - names alone
+    repeat constantly in this pipeline."""
+    mesh = obj.data
+    raw = obj.get(PROP_KEY)
+    return (obj.session_uid, mesh.name, len(mesh.loops), len(mesh.polygons),
+            len(mesh.vertices), len(raw) if isinstance(raw, str) else 0)
+
+
+def _has_link_data(obj):
+    """Cheap "might be a container" test for batch ops and the depsgraph
+    handler: idprop or mirror present, WITHOUT parsing the table (the parse
+    costs 76 ms on a 1.3M-loop mesh - far too much per depsgraph tick)."""
+    if obj is None or getattr(obj, "type", None) != 'MESH' or obj.data is None:
+        return False
+    if obj.get(PROP_KEY) is not None:
+        return True
+    return obj.data.attributes.get(TABLE_COL_PREFIX + "0") is not None
+
+
+def _store_mirror_state(obj, store):
+    """Verdict core shared by the link container check and the auxiliary
+    UDIM/atlas record namespaces (same dual-carrier design in
+    core/attr_store.py, same failure modes).  Callers guard object type
+    and edit mode."""
+    mesh = obj.data
+    if mesh.attributes.get(store.prefix + "0") is None:
+        return MIRROR_NONE
+    head = store.peek_frame_header(mesh)
+    if head is None:
+        # No frame at loop 0 - two very different situations, told apart in
+        # O(1) by the idprop.  A container whose OWN frame was decapitated by
+        # an edit still carries its idprop (that carrier is immune to mesh
+        # edits), and for it BROKEN is the truth.  A container that was merged
+        # INTO a plain mesh by a plain Ctrl+J has no idprop at all - the plain
+        # mesh had none - and its table survives as a WINDOW at a non-zero
+        # loop offset, which scan_windows reads and a default FBX export
+        # carries verbatim (scripts/test_link.py test 39).  Calling that one
+        # "разрушено" was a false alarm printed right above the panel's own
+        # "влито контейнеров" line.  The reader is safe: this branch is only
+        # reached when a table was decoded, i.e. the windows DO parse.
+        return MIRROR_BROKEN if obj.get(store.prop_key) is not None else MIRROR_WINDOWS
+    version, length, src_loops = head
+    if src_loops and src_loops != len(mesh.loops):
+        # the mesh was edited after the pack: STALE regardless of what the
+        # layers can hold now (the repack fixes both, and this verdict is
+        # the more informative of the two)
+        return MIRROR_STALE
+    # Loop count agrees (or a legacy v1 frame carries none), so the frame
+    # LOOKS healthy - but the header promises `length` payload bytes and the
+    # layers must be able to HOLD them.  Without this a mirror that lost a
+    # layer (deleted by hand in the Color Attributes list, or dropped by an
+    # exporter with a vertex-color cap) keeps a valid header and an unchanged
+    # loop count, so the verdict was OK while decode_colors could only ever
+    # fail: the panel stayed silent and the FBX shipped unreadable memory.
+    # frame_capacity counts ONLY layers decode can actually read: a foreign
+    # FLOAT attribute that merely borrowed the "<prefix>N" name used to
+    # inflate a name-only count and re-create the very false-OK this gate
+    # was written to kill.
+    capacity = store.frame_capacity(mesh)
+    if capacity is None or (HEADER_V2 if version >= 2 else HEADER_V1) + length > capacity:
+        return MIRROR_BROKEN
+    return MIRROR_OK
+
+
+def _mirror_state(obj):
+    """poll()/draw()-safe answer to "will an FBX export carry this
+    container's memory?".  Deliberately UNCACHED: the verdict depends on
+    the mirror BYTES, and every fingerprint cheap enough to cache on -
+    mesh name, loop count, idprop length, layer count - stays IDENTICAL
+    when only the mirror changes (undo of "Закрепить память", File >
+    Revert, a strip done by another script), so the panel would keep
+    reporting OK over a dead mirror.  A fingerprint that IS sensitive has
+    to read those bytes, which is the whole computation.  And that
+    computation is tiny and near-flat: ~12 us from 512 to 2.6M loops
+    against ~1 us for a cache hit, next to the 1.4 us - 1.1 ms
+    _peek_merged spends in the SAME draw."""
+    if obj is None or getattr(obj, "type", None) != 'MESH' or obj.data is None:
+        return MIRROR_NONE
+    mesh = obj.data
+    if mesh.is_editmode:
+        # while an edit BMesh is open every attribute's data array is
+        # EMPTY (the counts refresh, the arrays do not), so the mirror
+        # cannot be read at all - saying BROKEN here would raise a false
+        # alarm on every container the user opens in Edit Mode
+        return MIRROR_UNKNOWN
+    state = _store_mirror_state(obj, _LINK_STORE)
+    if state == MIRROR_OK:
+        # The FBX transport is only whole with BOTH tracking layers: their
+        # names (AGR_Link_CO / AGR_Link_ID) do not match the "<prefix>N"
+        # filter, so the capacity gate above never sees them - deleting one
+        # in the Color Attributes list kept the verdict green while the
+        # import path could only ever fail ("нет атрибута agr_link_id").
+        # A repack rebuilds both from the live agr_link_* attributes.
+        for name in (COL_CO, COL_ID):
+            if not _LINK_STORE.layer_ok(mesh, name):
+                return MIRROR_BROKEN
+    return state
+
+
+def _invalidate_caches(name):
+    """Drop every poll/draw cache entry for one object plus its autosync
+    skip mark - callers reach here right after rewriting the data, and an
+    explicit user action is exactly the moment an earlier "cannot repack
+    this one" verdict has earned another chance."""
+    _TABLE_CACHE.pop(name, None)
+    _MERGED_CACHE.pop(name, None)
+    _NO_AUTOSYNC.pop(name, None)
+
+
+def _has_foreign_windows(mesh):
+    """True when the mirror still carries table windows that are NOT this
+    container's own - the leftovers of a plain Blender Ctrl+J.  A repack
+    writes ONE fresh blob from loop 0 over the whole mesh, so a foreign
+    window that was not absorbed FIRST is gone, and with it the only copy
+    of the merged container's table (the idprop holds this container's own
+    table alone).  Absorbing means _reconcile_container: id remap, possibly
+    a new zero-instance, possibly obj.data swapped for an Alt+D twin - a
+    structural, non-undoable change that belongs behind an explicit click,
+    never behind a save-time checkbox.
+
+    A canonical carrier contributes exactly one magic hit, at loop 0: no
+    hit at all = an edit decapitated our own frame and nothing else lives
+    in the layer (safe to repack); exactly one hit that peek_frame_header
+    can parse = that hit IS at loop 0, i.e. ours (safe).  Anything else goes
+    on to the CRC-checked scan: the raw magic count is a byte pattern search
+    over the compressed payload too, so a chance b"AGRL" on a loop boundary
+    used to invent a foreign window and pin the container in _NO_AUTOSYNC
+    for good ("нажмите «Закрепить память»" with nothing to absorb).  Only
+    scan_windows can tell a real frame from a coincidence, and it is paid
+    exactly where the cheap test was already ambiguous."""
+    hits = _LINK_STORE.count_window_candidates(mesh)
+    if hits == 0:
+        return False
+    if hits == 1 and _LINK_STORE.peek_frame_header(mesh) is not None:
+        return False
+    windows = _LINK_STORE.scan_windows(mesh)
+    if not windows:
+        return False              # every candidate was a payload coincidence
+    # exactly one REAL frame, and it starts at loop 0 = our own canonical
+    # mirror with a coincidence somewhere in its payload: nothing to absorb
+    return not (len(windows) == 1 and windows[0][0] == 0)
 
 
 def _unpack_tracking_windows(mesh, windows, merged):
@@ -1136,10 +1333,18 @@ def _reconcile_container(context, obj):
         obj.data = mesh
 
     quant_unpacked = None
-    if mesh.attributes.get(ATTR_NAME) is None:
+    if any(mesh.attributes.get(name) is None
+           for name in (ATTR_NAME, CO_ATTR, ORIG_ATTR)):
+        # ALL THREE attrs, not just the face ids: with co/orig deleted but
+        # the ids alive, the old one-attribute check skipped this unpack,
+        # the idprop commit below went through, and _pack_tracking_to_colors
+        # then refused (it must not wipe the mirror - the last carrier of
+        # the coords).  That left the OLD mirror behind the NEW idprop, the
+        # next reconcile no longer matched its own window and re-absorbed
+        # every window under fresh ids - instances duplicated on every run.
         stub = {"co_quant": float((idp or {}).get("co_quant", 0.0) or 0.0)}
         if not _unpack_tracking_windows(mesh, windows, stub):
-            return None  # no attrs and no usable mirror - cannot absorb
+            return None  # attrs missing and no usable mirror - cannot absorb
         quant_unpacked = stub["co_quant"]
 
     face_ids = _read_face_ids(mesh)
@@ -1273,10 +1478,137 @@ def _reconcile_container(context, obj):
         mirror_ok = False
     if mirror_ok:
         write_table(obj, merged)
-    _TABLE_CACHE.pop(obj.name, None)
-    _MERGED_CACHE.pop(obj.name, None)
+    _invalidate_caches(obj.name)
     return {"absorbed": len(extras), "zero_instance": zero_instance,
             "stale": stale, "mirror_ok": mirror_ok}
+
+
+# ----------------------------------------------------------------------------
+# Memory refresh ("закрепить память")
+# ----------------------------------------------------------------------------
+
+def _refresh_container(context, obj, absorb=True):
+    """Absorb any plain-Ctrl+J windows and repack ONE fresh mirror over the
+    CURRENT mesh, making the container canonical again: safe to edit and
+    safe to hand to another DCC.  Shared by the join operator (one selected
+    container), agr.link_refresh and the save-time autosync.  Returns
+    {"ok", "reason", "instances", "groups", "absorbed", "zero_instance",
+    "mirror_ok"}; ok=False carries a reason string instead of reporting -
+    the callers word their own message through _refresh_message.
+
+    absorb=False is the save-time contract: repack the mirror and NOTHING
+    else.  Absorbing rewrites the table and can swap the datablock, which
+    is a structural change nobody asked for by ticking a checkbox - so a
+    container with foreign windows is refused ("windows") instead, and the
+    panel's «Закрепить память» button (absorb=True) stays the single place
+    where absorption happens."""
+    if obj is None or getattr(obj, "type", None) != 'MESH':
+        return {"ok": False, "reason": "not_mesh"}
+    if obj.library is not None or obj.data.library is not None:
+        return {"ok": False, "reason": "library"}
+    if obj.data.is_editmode:
+        # obj.data is the pre-edit snapshot and its attribute arrays are
+        # empty, so the whole repack would be written into a mesh that the
+        # edit BMesh is about to overwrite - refuse here, so no caller can
+        # lose a repack by accident (see _pack_tracking_to_colors)
+        return {"ok": False, "reason": "editmode"}
+    if not absorb:
+        if _has_foreign_windows(obj.data):
+            return {"ok": False, "reason": "windows"}
+        if obj.get(PROP_KEY) is None and _untracked_faces(obj.data) > 0:
+            # read_table below would hand back a merged view holding a
+            # SYNTHESISED zero-instance for the untracked tail — and only
+            # _reconcile_container can stamp its faces.  Persisting that
+            # view here would register geometry no face carries (it comes
+            # out of extraction only as a _leftover husk), silently, inside
+            # save_pre, outside undo — absorption territory, refuse exactly
+            # like "windows".
+            return {"ok": False, "reason": "unmarked"}
+
+    recon = _reconcile_container(context, obj) if absorb else None
+    table = read_table(obj)
+    if table is None:
+        return {"ok": False, "reason": "unreadable"}
+
+    if recon is not None:
+        mirror_ok = recon.get("mirror_ok", True)
+    else:
+        # nothing to absorb - still refresh idprop + mirror so the memory
+        # matches the CURRENT mesh exactly (e.g. after edits or a fresh FBX
+        # import that was never materialised).  The test is ALL THREE attrs,
+        # not just the face ids: _pack_tracking_to_colors needs the per-vertex
+        # co/orig too, and a container carrying only agr_link_id would sail
+        # past a one-attribute check straight into a failed pack - while the
+        # mirror it was about to overwrite may be the last copy of those very
+        # coordinates.  Missing any of them means "unpack from the mirror
+        # FIRST", which is exactly what the branch below does.
+        has_attrs = all(obj.data.attributes.get(name) is not None
+                        for name in (ATTR_NAME, CO_ATTR, ORIG_ATTR))
+        if not has_attrs:
+            has_attrs = _unpack_tracking_from_colors(obj.data, table)
+        if not has_attrs:
+            # inherited broken state (idprop without attrs or a usable
+            # mirror) - repacking would destroy the surviving mirror
+            return {"ok": False, "reason": "no_tracking"}
+        write_table(obj, table)
+        try:
+            mirror_ok = _pack_tracking_to_colors(obj.data, table)
+        except Exception:
+            _remove_color_mirror(obj.data)
+            mirror_ok = False
+        if mirror_ok:
+            write_table(obj, table)
+
+    _invalidate_caches(obj.name)
+    instances = table.get("instances", {})
+    return {"ok": True, "reason": None,
+            "instances": len(instances),
+            "groups": len({inst.get("group", 0) for inst in instances.values()}),
+            "absorbed": (recon or {}).get("absorbed", 0),
+            "zero_instance": bool((recon or {}).get("zero_instance")),
+            "mirror_ok": bool(mirror_ok)}
+
+
+def _refresh_message(obj, stats):
+    """(level, message) for one _refresh_container result."""
+    if not stats.get("ok"):
+        reason = stats.get("reason")
+        if reason == "library":
+            return 'ERROR', "❌ AGR Link: объект из линкованной библиотеки нельзя изменять"
+        if reason == "editmode":
+            return 'WARNING', ("⚠️ AGR Link: контейнер в режиме редактирования — "
+                               "память обновится после выхода в Object Mode")
+        if reason == "windows":
+            return 'WARNING', ("⚠️ AGR Link: в зеркале лежат таблицы обычного Ctrl+J — "
+                               "нажмите «Закрепить память», чтобы их поглотить")
+        if reason == "unmarked":
+            return 'WARNING', ("⚠️ AGR Link: в контейнер влита непомеченная геометрия "
+                               "(обычный Ctrl+J) — нажмите «Закрепить память», чтобы "
+                               "оформить её объектом")
+        if reason == "unreadable":
+            return 'ERROR', "❌ AGR Link: таблица контейнера не читается (данные повреждены)"
+        if reason == "no_tracking":
+            return 'WARNING', ("⚠️ AGR Link: у контейнера нет разметки для перепаковки — "
+                               "память оставлена как есть")
+        return 'ERROR', "❌ AGR Link: активный объект — не контейнер"
+    msg = (f"✅ AGR Link: память '{obj.name}' обновлена "
+           f"({stats['instances']} объектов, {stats['groups']} групп)")
+    if stats.get("absorbed"):
+        msg += f", поглощено таблиц обычного Ctrl+J: {stats['absorbed']}"
+    if stats.get("zero_instance"):
+        msg += ", непомеченная геометрия оформлена объектом"
+    if not stats.get("mirror_ok"):
+        return 'WARNING', msg + " | ⚠️ цветовое зеркало не записано (FBX-перенос недоступен)"
+    return 'INFO', msg
+
+
+def _refresh_result(stats):
+    """Operator return value matching a _refresh_container result: a
+    container with no tracking left is reported, not treated as a failure
+    (nothing was mutated, the surviving mirror stays)."""
+    if stats.get("ok") or stats.get("reason") == "no_tracking":
+        return {'FINISHED'}
+    return {'CANCELLED'}
 
 
 # ----------------------------------------------------------------------------
@@ -1570,64 +1902,13 @@ class AGR_OT_link_join(Operator):
         return {'FINISHED'}
 
     def _refresh_single(self, context, active):
-        """Single selected container: "закрепить память" — absorb any
-        plain-Ctrl+J windows (materialise the merged table exactly as the
-        panel shows it) and repack ONE fresh mirror over the current mesh.
-        After this the container is canonical: safe to edit topology and
-        safe to hand to another DCC."""
-        if active.library is not None or active.data.library is not None:
-            agr_report(self, 'ERROR',
-                       "❌ AGR Link: объект из линкованной библиотеки нельзя изменять")
-            return {'CANCELLED'}
-
-        recon = _reconcile_container(context, active)
-        table = read_table(active)
-        if table is None:
-            agr_report(self, 'ERROR',
-                       "❌ AGR Link: таблица контейнера не читается (данные повреждены)")
-            return {'CANCELLED'}
-
-        if recon is not None:
-            mirror_ok = recon.get("mirror_ok", True)
-        else:
-            # nothing to absorb - still refresh idprop + mirror so the
-            # memory matches the CURRENT mesh exactly (e.g. after edits or
-            # a fresh FBX import that was never materialised)
-            has_attrs = active.data.attributes.get(ATTR_NAME) is not None
-            if not has_attrs:
-                has_attrs = _unpack_tracking_from_colors(active.data, table)
-            if not has_attrs:
-                # inherited broken state (idprop without attrs or a usable
-                # mirror) - repacking would destroy the surviving mirror
-                agr_report(self, 'WARNING',
-                           "⚠️ AGR Link: у контейнера нет разметки для перепаковки — "
-                           "память оставлена как есть")
-                return {'FINISHED'}
-            write_table(active, table)
-            try:
-                mirror_ok = _pack_tracking_to_colors(active.data, table)
-            except Exception:
-                _remove_color_mirror(active.data)
-                mirror_ok = False
-            if mirror_ok:
-                write_table(active, table)
-            _TABLE_CACHE.pop(active.name, None)
-            _MERGED_CACHE.pop(active.name, None)
-
-        n_inst = len(table.get("instances", {}))
-        n_groups = len({inst.get("group", 0) for inst in table.get("instances", {}).values()})
-        msg = (f"✅ AGR Link: память '{active.name}' обновлена "
-               f"({n_inst} объектов, {n_groups} групп)")
-        if recon and recon.get("absorbed"):
-            msg += f", поглощено таблиц обычного Ctrl+J: {recon['absorbed']}"
-        if recon and recon.get("zero_instance"):
-            msg += ", непомеченная геометрия оформлена объектом"
-        level = 'INFO'
-        if not mirror_ok:
-            msg += " | ⚠️ цветовое зеркало не записано (FBX-перенос недоступен)"
-            level = 'WARNING'
+        """Single selected container: "закрепить память" — the shared
+        _refresh_container does the work (absorb plain-Ctrl+J windows,
+        repack ONE fresh mirror over the current mesh)."""
+        stats = _refresh_container(context, active)
+        level, msg = _refresh_message(active, stats)
         agr_report(self, level, msg)
-        return {'FINISHED'}
+        return _refresh_result(stats)
 
 
 # ----------------------------------------------------------------------------
@@ -1734,23 +2015,34 @@ def _materials_match(mesh_a, mesh_b):
             == [m.name if m else "" for m in mesh_b.materials])
 
 
-def _ballot_signature(mesh):
-    """Hashable ballot for the restore reference vote (taken AFTER
-    _restore_materials compacted the slots): material signature PLUS a
-    geometry digest (coords, loop topology, polygon normals).  Intact
-    chunks snapped onto the stored coords are byte-identical here; a
-    flipped or re-bridged chunk lands in its own bucket and cannot hijack
-    the reference by material signature alone."""
+def _ballot_key(mesh):
+    """Exact-INTEGER pre-key for the restore reference vote (taken AFTER
+    _restore_materials compacted the slots): material signature, element
+    counts and the loop->vertex map.  Deliberately contains NO float
+    bytes.  Hashing the coords used to look safe because intact chunks are
+    snapped onto their stored originals - but the stored originals come
+    back QUANTISED whenever table["co_quant"] > 0 (FBX roundtrip without
+    the precise_co records), and each plain-Ctrl+J window is dequantised
+    against its OWN co_min/co_size, so two honest copies of one group
+    differ by up to co_quant/2 and landed in separate buckets.  The vote
+    then degenerated to "first intact chunk wins" and a repainted minority
+    could take the group.  Quantising the coords before hashing does not
+    help either: any grid splits a bucket as soon as one coordinate sits
+    near a cell edge, and that risk grows with the vertex count.  So the
+    coordinate comparison leaves the key entirely and moves into
+    _vote_reference's tolerant pairwise pass.  Flip/re-bridge detection
+    does not need it: reverse_faces / flip_normals rewrite each polygon's
+    loop order, so a flipped chunk still lands in another pre-bucket, and
+    a re-bridged one changes the counts or the map."""
     h = hashlib.blake2b(digest_size=16)
-    h.update(_mesh_coords(mesh).tobytes())
     loops = np.zeros(len(mesh.loops), dtype=np.intc)
     if len(mesh.loops):
         mesh.loops.foreach_get("vertex_index", loops)
     h.update(loops.tobytes())
-    h.update(_mesh_poly_normals(mesh).tobytes())
     h.update(_mesh_mat_indices(mesh).tobytes())
     names = tuple(m.name if m else "" for m in mesh.materials)
-    return names, h.digest()
+    return (names, len(mesh.vertices), len(mesh.polygons), len(mesh.loops),
+            h.digest())
 
 
 def _geometry_matches(mesh_a, mesh_b, check_materials=True, extra_atol=0.0):
@@ -1802,20 +2094,44 @@ def _uv_matches(mesh_a, mesh_b, atol=1e-5):
     return True
 
 
-def _vote_reference(members):
-    """Group reference for the restore modes: majority vote by ballot
-    signature (materials + geometry digest) among INTACT chunks.  A
-    repainted, flipped or otherwise deviant copy must not become the new
-    "original" - the healthy majority wins.  On a tie the first bucket
-    wins (dict keeps insertion order; max() returns the first maximum).
-    Returns the representative object or None when no chunk is intact."""
-    buckets = {}
+def _vote_reference(members, extra_atol=0.0):
+    """Group reference for the restore modes: majority vote among INTACT
+    chunks.  A repainted, flipped or otherwise deviant copy must not
+    become the new "original" - the healthy majority wins.  On a tie the
+    first bucket wins (insertion order is preserved and max() returns the
+    first maximum), so the outcome stays deterministic.  Returns the
+    representative object or None when no chunk is intact.
+
+    Buckets are built by greedy clustering, NOT by hashing: the exact
+    integer _ballot_key only PRE-sorts, and the "same chunk" decision is
+    the very predicate the adoption loop below uses - _geometry_matches
+    with the SAME extra_atol budget (max(offset*5e-6, table["co_quant"])).
+    That is the whole point: a bucket now means exactly "these chunks
+    would adopt each other", so copies whose stored coords came back
+    through different quantisation windows can no longer be split apart,
+    while a repaint (materials compared exactly, and the material names
+    and per-face indices sit in the pre-key already) or a flip (loop map
+    in the pre-key, polygon normals at atol 0.1 inside _geometry_matches)
+    still separates.  Only buckets carrying the IDENTICAL pre-key are ever
+    compared, so the healthy case costs one comparison per member and the
+    scan can never fan out across unrelated shapes."""
+    buckets = []      # [{"rep": obj, "objs": [...]}], insertion order kept
+    by_key = {}       # pre-key -> indices of the buckets sharing that key
     for obj, _m, info in members:
-        if info["intact"]:
-            buckets.setdefault(_ballot_signature(obj.data), []).append(obj)
+        if not info["intact"]:
+            continue
+        slot = by_key.setdefault(_ballot_key(obj.data), [])
+        for i in slot:
+            if _geometry_matches(buckets[i]["rep"].data, obj.data,
+                                 check_materials=True, extra_atol=extra_atol):
+                buckets[i]["objs"].append(obj)
+                break
+        else:
+            slot.append(len(buckets))
+            buckets.append({"rep": obj, "objs": [obj]})
     if not buckets:
         return None
-    return max(buckets.values(), key=len)[0]
+    return max(buckets, key=lambda b: len(b["objs"]))["rep"]
 
 
 def _adopt_target(member, target, new_meshes):
@@ -1830,22 +2146,60 @@ def _adopt_target(member, target, new_meshes):
     bpy.data.meshes.remove(old)
 
 
-def _alive_contains_stored_points(alive, members, extra_atol):
-    """Vertex-subset gate for the last-resort reference: every surviving
+def _alive_contains_stored_points(alive, members, extra_atol, limit=64):
+    """Vertex-subset gate for the last-resort reference: every SAMPLED
     stored original point of the group's chunks must exist among the
     candidate's vertices (a chunk is a subset of its original) - a
-    same-name same-counts stranger fails here."""
-    pts = [i["pts"] for _o, _m, i in members if i.get("pts") is not None]
+    same-name same-counts stranger fails here.
+
+    The sample is spread ACROSS the members, not sliced off the head of
+    one concatenated array: with a single budget for the whole group the
+    first chunk alone filled all 64 slots (its own sample is 32 points),
+    so in a multi-member group every chunk but the first went unchecked
+    and a stranger that merely contained the FIRST chunk's points walked
+    straight in.
+
+    No stored points at all => REFUSE.  This branch is HARD-only, it
+    throws the chunks' geometry away and hands the objects a datablock
+    whose materials and UV then beat the container's; a name plus two
+    integers is not enough to authorise that, and "pts is None" marks
+    exactly the cases where nothing can vouch for identity (no stored
+    coords at all, or not one original vertex left).  A group that loses
+    here is reported honestly as "групп без эталона" and comes out as it
+    would from a normal disassembly - nothing is destroyed and the user
+    can still re-link by hand."""
+    pts = [i["pts"] for _o, _m, i in members
+           if i.get("pts") is not None and len(i["pts"])]
     if not pts:
-        return True  # nothing to check against - counts-only gate remains
-    sample = np.concatenate(pts, axis=0).astype(np.float64)[:64]
+        return False
+    if len(pts) > limit:
+        # evenly spread indices over the FULL member list (linspace, both
+        # ends included).  The old stride `pts[::len(pts) // limit][:limit]`
+        # degenerated to the LEADING `limit` members whenever
+        # len(pts) // limit == 1 (65..127 members) - the tail went entirely
+        # unchecked, which is exactly what this subset must never allow.
+        idx = np.unique(np.linspace(0, len(pts) - 1, num=limit).round().astype(int))
+        pts = [pts[i] for i in idx]
+    share = max(1, limit // len(pts))
+    sample = np.concatenate([p[:share] for p in pts],
+                            axis=0)[:limit].astype(np.float64)
+    if not len(alive.vertices):
+        # nothing can contain a stored point; without this the blocked
+        # nearest-vertex search below reduces over a zero-size axis and
+        # raises, taking the whole disassembly down mid-flight
+        return False
     verts = np.zeros(len(alive.vertices) * 3, dtype=np.float32)
     alive.vertices.foreach_get("co", verts)
     verts = verts.reshape(-1, 3).astype(np.float64)
     scale = float(max(np.max(np.abs(verts), initial=1.0), 1.0))
     atol = max(1e-4, scale * 1e-5, extra_atol)
-    for pt in sample:
-        if float(np.min(np.linalg.norm(verts - pt, axis=1))) > atol:
+    # vectorised nearest-vertex search, blocked so the (block, V, 3)
+    # temporary stays ~32 MB even on a million-vertex candidate (there it
+    # degrades to exactly the old point-at-a-time loop)
+    block = max(1, 4_000_000 // (3 * max(len(verts), 1)))
+    for i in range(0, len(sample), block):
+        d2 = ((sample[i:i + block, None, :] - verts[None, :, :]) ** 2).sum(axis=2)
+        if float(np.sqrt(d2.min(axis=1)).max()) > atol:
             return False
     return True
 
@@ -1956,7 +2310,12 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
         hard_rebuilt = 0    # chunk geometry thrown away, reference taken
         hard_alive_ref = 0  # reference had to come from the scene
         hard_no_ref = 0     # groups HARD could not restore (no reference)
-        pos_approx = 0      # placement not anchored on a converged fit
+        # instance ids whose placement is not anchored on a converged fit.
+        # A SET, not a counter: one chunk can be flagged twice - once as an
+        # intact chunk with a dubious frame, once again when HARD rebuilds
+        # it from the reference - and the report must not count it twice
+        # (same reason hard_ids / face_changed_ids are sets)
+        pos_approx_ids = set()
         hard_ids = set()
         for iid in extract:
             entry = table["instances"][str(iid)]
@@ -1993,7 +2352,7 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
             if intact and not fit_converged:
                 # coords are snapped, but the FRAME itself is dubious -
                 # the object may stand off its true place
-                pos_approx += 1
+                pos_approx_ids.add(iid)
             if frame is None:
                 if entry.get("matrix_stale"):
                     # absorbed from a plain Ctrl+J and the coordinate fit
@@ -2091,7 +2450,10 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
             # among intact chunks (or a vetted alive datablock) may serve -
             # an arbitrary, never-validated first member must not own the
             # group and eat the other copies' paint or geometry
-            rep = _vote_reference(members) if forced else None
+            # the vote gets the SAME noise budget as the adoption loop
+            # below - otherwise honest copies that differ only by the
+            # quantisation step vote in separate buckets
+            rep = _vote_reference(members, extra_atol) if forced else None
             probe = rep if rep is not None else members[0][0]
 
             target = None
@@ -2148,10 +2510,17 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
                                            extra_atol=extra_atol)
                 if geo_ok and _materials_match(member.data, target):
                     _adopt_target(member, target, new_meshes)
-                elif geo_ok and forced and ref_ok:
+                elif geo_ok and forced and ref_ok \
+                        and (info["intact"] or restore == 'HARD'):
                     # intact chunk, different paint: restore means restore -
                     # the repaint goes to the bin, but ONLY onto a vetted
-                    # reference (user decision)
+                    # reference (user decision).  The intactness test is the
+                    # module contract for SOFT ("celye kuski"): a chunk whose
+                    # topology was rebuilt never ran through snap_all, so its
+                    # coords merely LANDING within the tolerance is not the
+                    # vetted per-vertex pairing this branch claims - SOFT
+                    # leaves it unique and says "нужен жёсткий режим", HARD
+                    # may still discard it deliberately
                     _adopt_target(member, target, new_meshes)
                     soft_repaint += 1
                 elif restore == 'HARD' and ref_ok:
@@ -2162,7 +2531,7 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
                     hard_rebuilt += 1
                     hard_ids.add(info["iid"])
                     if not (info["fitted"] and info["converged"]):
-                        pos_approx += 1
+                        pos_approx_ids.add(info["iid"])
                 else:
                     unlinked_edited += 1
                     if restore == 'HARD' and not ref_ok:
@@ -2286,8 +2655,9 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
             warn_bits.append(f"эталон взят из сцены (его материалы/UV победили): {hard_alive_ref}")
         if hard_no_ref:
             warn_bits.append(f"групп без эталона (не восстановлены): {hard_no_ref}")
-        if pos_approx:
-            warn_bits.append(f"позиция может быть неточной (фит не сошёлся): {pos_approx}")
+        if pos_approx_ids:
+            warn_bits.append("позиция может быть неточной (фит не сошёлся): "
+                             f"{len(pos_approx_ids)}")
     level = 'WARNING' if warn_bits else 'INFO'
     icon = "⚠️" if warn_bits else ("♻️" if info_bits else "✅")
     head = {'SOFT': "мягкое восстановление", 'HARD': "жёсткое восстановление"}.get(restore)
@@ -2356,14 +2726,20 @@ class AGR_OT_link_restore(Operator):
     bl_label = "Восстановить"
     bl_options = {'REGISTER', 'UNDO'}
 
+    # HIDDEN keeps both out of the F9 "Adjust Last Operation" panel, which
+    # calls execute() DIRECTLY: without it a soft restore could be turned into
+    # a hard one by flipping the enum there, and the invoke_confirm below -
+    # the user's only warning about discarded geometry - would never run
     mode: EnumProperty(
         name="Режим",
         items=[('SOFT', "Мягко",
                 "Только целые куски: сдвиги вершин и перекраска отбрасываются"),
                ('HARD', "Жёстко",
                 "Плюс куски с разрушенной топологией: их геометрия выбрасывается")],
-        default='SOFT')
-    group_id: IntProperty(name="Group ID", default=-1)  # -1 = весь контейнер
+        default='SOFT',
+        options={'HIDDEN', 'SKIP_SAVE'})
+    group_id: IntProperty(name="Group ID", default=-1,   # -1 = the whole container
+                          options={'HIDDEN', 'SKIP_SAVE'})
 
     @classmethod
     def poll(cls, context):
@@ -2456,8 +2832,7 @@ class AGR_OT_link_strip(Operator):
                 # colors-only container (fresh FBX import) has no idprop - pop, not del
                 obj.pop(PROP_KEY, None)
                 _remove_tracking_attrs(obj.data)
-                _TABLE_CACHE.pop(obj.name, None)
-                _MERGED_CACHE.pop(obj.name, None)
+                _invalidate_caches(obj.name)
                 had = True
             # atlas/UDIM records are AGR service data too - the delivery
             # file must not carry any of the color mirrors
@@ -2482,6 +2857,112 @@ class AGR_OT_link_strip(Operator):
 # Panel
 # ----------------------------------------------------------------------------
 
+class AGR_OT_link_refresh(Operator):
+    """Перепаковать цветовое зеркало контейнера по ТЕКУЩЕЙ геометрии"""
+    bl_idname = "agr.link_refresh"
+    bl_label = "Обновить память"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    # HIDDEN: flipping this in the F9 redo panel would re-run an absorb +
+    # repack across EVERY container in the scene - a structural change the
+    # button the user actually pressed never offered
+    scope: EnumProperty(
+        name="Область",
+        items=[('ACTIVE', "Активный контейнер", "Только активный объект"),
+               ('ALL', "Все контейнеры сцены", "Каждый контейнер сцены")],
+        default='ACTIVE',
+        options={'HIDDEN', 'SKIP_SAVE'})
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT'
+
+    @classmethod
+    def description(cls, context, properties):
+        if properties.scope == 'ALL':
+            return ("Закрепить память ВСЕХ контейнеров сцены: зеркало каждого "
+                    "перепаковывается по текущей геометрии. Без этого правка меша "
+                    "может срезать заголовок зеркала, и FBX уедет к получателю "
+                    "без памяти — .blend при этом выглядит здоровым")
+        return ("Закрепить память активного контейнера: зеркало перепаковывается "
+                "по текущей геометрии, контейнер снова готов к экспорту в FBX")
+
+    def execute(self, context):
+        if self.scope == 'ACTIVE':
+            obj = context.active_object
+            if not _has_link_data(obj):
+                agr_report(self, 'ERROR', "❌ AGR Link: активный объект — не контейнер")
+                return {'CANCELLED'}
+            targets = [obj]
+            aux_pool = [obj]
+        else:
+            targets = [o for o in context.scene.objects if _has_link_data(o)]
+            aux_pool = [o for o in context.scene.objects
+                        if o.type == 'MESH' and o.data is not None
+                        and o.library is None and o.data.library is None
+                        and not o.data.is_editmode]
+            if not targets:
+                agr_report(self, 'WARNING', "⚠️ AGR Link: в сцене нет контейнеров")
+                return {'CANCELLED'}
+
+        # the UDIM/atlas records ride on the same objects and break the
+        # same way - "закрепить память" that left them dead reported a
+        # success the FBX then contradicted
+        aux_fixed, aux_failed = [], []
+        for o in aux_pool:
+            try:
+                af, al = _sync_aux_records(o)
+            except Exception as exc:
+                af, al = [], [f"{o.name} ({exc})"]
+            aux_fixed.extend(af)
+            aux_failed.extend(al)
+
+        def aux_suffix(level):
+            msg = ""
+            if aux_fixed:
+                msg += f" | записи UDIM/атласов обновлены: {len(aux_fixed)}"
+            if aux_failed:
+                msg += f" | ⚠️ записи UDIM/атласов не перепакованы: {len(aux_failed)}"
+                level = 'WARNING' if level == 'INFO' else level
+            return msg, level
+
+        if len(targets) == 1:
+            stats = _refresh_container(context, targets[0])
+            level, msg = _refresh_message(targets[0], stats)
+            extra, level = aux_suffix(level)
+            agr_report(self, level, msg + extra)
+            result = _refresh_result(stats)
+            if aux_fixed and result == {'CANCELLED'}:
+                return {'FINISHED'}   # aux mirrors were rewritten - undo step needed
+            return result
+
+        done = no_mirror = 0
+        skipped = []
+        for obj in targets:
+            stats = _refresh_container(context, obj)
+            if stats["ok"]:
+                done += 1
+                if not stats["mirror_ok"]:
+                    no_mirror += 1
+            else:
+                skipped.append(f"{obj.name} ({stats['reason']})")
+        level = 'INFO' if done else 'WARNING'
+        msg = (f"{'✅' if done else '⚠️'} AGR Link: память обновлена у {done} "
+               f"из {len(targets)} контейнеров")
+        if no_mirror:
+            msg += f" | ⚠️ зеркало не записано: {no_mirror}"
+            level = 'WARNING'
+        if skipped:
+            msg += (" | пропущено: " + ", ".join(skipped[:5])
+                    + ("…" if len(skipped) > 5 else ""))
+            level = 'WARNING'
+        extra, level = aux_suffix(level)
+        agr_report(self, level, msg + extra)
+        # nothing repacked = nothing mutated: report it the way the
+        # single-target path does instead of pushing an empty undo step
+        return {'FINISHED'} if (done or aux_fixed) else {'CANCELLED'}
+
+
 class AGR_PT_LinkPanel(Panel):
     bl_label = "AGR Link"
     bl_idname = "AGR_PT_link_panel"
@@ -2502,71 +2983,283 @@ class AGR_PT_LinkPanel(Panel):
             col.label(text=f"Выбрано: {len(meshes)} мешей, {len(groups)} групп данных")
 
         obj = context.active_object
-        if obj is None or obj.type != 'MESH':
-            return
-        table, extra_windows = _peek_merged(obj)
+        table, extra_windows = None, 0
+        if obj is not None and obj.type == 'MESH':
+            table, extra_windows = _peek_merged(obj)
+
         if table is None:
             layout.label(text="Активный объект — не контейнер", icon='INFO')
-            return
+        else:
+            instances = table.get("instances", {})
+            by_group = {}
+            for inst in instances.values():
+                by_group.setdefault(inst.get("group", 0), []).append(inst)
+            n_groups = len(by_group)
 
-        instances = table.get("instances", {})
-        by_group = {}
-        for inst in instances.values():
-            by_group.setdefault(inst.get("group", 0), []).append(inst)
-        n_groups = len(by_group)
+            layout.separator()
+            layout.label(text=f"Контейнер: {len(instances)} объектов, {n_groups} групп",
+                         icon='PACKAGE')
+            self._draw_mirror_state(layout, obj)
+            if extra_windows:
+                layout.label(text=f"Обычный Ctrl+J: влито контейнеров: {extra_windows}",
+                             icon='INFO')
+                layout.label(text="Память объединится при разборке или джойне")
 
-        layout.separator()
-        layout.label(text=f"Контейнер: {len(instances)} объектов, {n_groups} групп",
-                     icon='PACKAGE')
-        if extra_windows:
-            layout.label(text=f"Обычный Ctrl+J: влито контейнеров: {extra_windows}",
-                         icon='INFO')
-            layout.label(text="Память объединится при разборке или джойне")
+            def group_label(gid, members):
+                if len(members) > 1:
+                    data_name = table.get("groups", {}).get(str(gid), {}).get("data_name", "?")
+                    return f"{data_name} · {len(members)} шт.", 'LINKED'
+                return members[0].get("name", "?"), 'OBJECT_DATA'
 
-        def group_label(gid, members):
-            if len(members) > 1:
-                data_name = table.get("groups", {}).get(str(gid), {}).get("data_name", "?")
-                return f"{data_name} · {len(members)} шт.", 'LINKED'
-            return members[0].get("name", "?"), 'OBJECT_DATA'
+            box = layout.column(align=True)
+            for gid in sorted(by_group.keys(), key=lambda g: group_label(g, by_group[g])[0]):
+                members = by_group[gid]
+                text, icon = group_label(gid, members)
+                row = box.row(align=True)
+                row.row().label(text=text, icon=icon)  # expandable, buttons keep their size
+                btns = row.row(align=True)
+                op = btns.operator("agr.link_extract_group", text="", icon='EXPORT')
+                op.group_id = gid
+                op = btns.operator("agr.link_restore", text="", icon='LOOP_BACK')
+                op.mode = 'SOFT'
+                op.group_id = gid
+                op = btns.operator("agr.link_restore", text="", icon='FILE_REFRESH')
+                op.mode = 'HARD'
+                op.group_id = gid
 
-        box = layout.column(align=True)
-        for gid in sorted(by_group.keys(), key=lambda g: group_label(g, by_group[g])[0]):
-            members = by_group[gid]
-            text, icon = group_label(gid, members)
-            row = box.row(align=True)
-            row.row().label(text=text, icon=icon)  # expandable, buttons keep their size
-            btns = row.row(align=True)
-            op = btns.operator("agr.link_extract_group", text="", icon='EXPORT')
-            op.group_id = gid
-            op = btns.operator("agr.link_restore", text="", icon='LOOP_BACK')
+            layout.operator("agr.link_separate_all", icon='OUTLINER_OB_GROUP_INSTANCE')
+            col = layout.column(align=True)
+            op = col.operator("agr.link_restore", text="Восстановить всё (мягко)",
+                              icon='LOOP_BACK')
             op.mode = 'SOFT'
-            op.group_id = gid
-            op = btns.operator("agr.link_restore", text="", icon='FILE_REFRESH')
+            op.group_id = -1
+            op = col.operator("agr.link_restore", text="Восстановить всё (жёстко)",
+                              icon='FILE_REFRESH')
             op.mode = 'HARD'
-            op.group_id = gid
+            op.group_id = -1
+            layout.operator("agr.link_strip", icon='TRASH')
 
-        layout.operator("agr.link_separate_all", icon='OUTLINER_OB_GROUP_INSTANCE')
+        # Maintenance stays visible even when the active object is not a
+        # container - its whole point is catching the ones you forgot.
+        layout.separator()
         col = layout.column(align=True)
-        op = col.operator("agr.link_restore", text="Восстановить всё (мягко)",
-                          icon='LOOP_BACK')
-        op.mode = 'SOFT'
-        op.group_id = -1
-        op = col.operator("agr.link_restore", text="Восстановить всё (жёстко)",
+        op = col.operator("agr.link_refresh", text="Обновить память всех контейнеров",
                           icon='FILE_REFRESH')
-        op.mode = 'HARD'
-        op.group_id = -1
-        layout.operator("agr.link_strip", icon='TRASH')
+        op.scope = 'ALL'
+        col.prop(context.scene, "agr_link_autosync")
+
+    @staticmethod
+    def _draw_mirror_state(layout, obj):
+        """Warn when the memory will NOT survive an FBX export.  The rest
+        of the panel reads the idprop, which mesh edits never touch — so
+        without this line a decapitated mirror stays invisible until the
+        RECEIVER imports the file and finds a container with no memory."""
+        state = _mirror_state(obj)
+        if state in (MIRROR_OK, MIRROR_UNKNOWN):
+            # UNKNOWN = an edit BMesh is open, so the mirror simply cannot
+            # be read; a red alert there would fire on every container the
+            # user tabs into and would be pure noise
+            return
+        col = layout.column(align=True)
+        row = col.row()
+        if state == MIRROR_BROKEN:
+            row.alert = True
+            row.label(text="Зеркало разрушено — FBX уедет без памяти", icon='ERROR')
+        elif state == MIRROR_STALE:
+            row.alert = True
+            row.label(text="Память устарела — меш правился после сборки", icon='ERROR')
+        elif state == MIRROR_WINDOWS:
+            # NOT an alert: the memory rides in the merged windows and a
+            # default FBX carries them — the container is simply not
+            # canonical yet, and the button below makes it one
+            row.label(text="Память лежит окнами после обычного Ctrl+J", icon='INFO')
+        else:
+            row.label(text="Зеркала нет — FBX не перенесёт память", icon='INFO')
+        op = col.operator("agr.link_refresh", text="Закрепить память", icon='FILE_REFRESH')
+        op.scope = 'ACTIVE'
 
 
 # ----------------------------------------------------------------------------
 # Registration
 # ----------------------------------------------------------------------------
 
+# ----------------------------------------------------------------------------
+# Autosync: repack stale mirrors on save
+# ----------------------------------------------------------------------------
+# A repack costs ~0.4 µs per loop (0.5 s on a 1.3M-loop container), so it
+# can NOT run per depsgraph tick - the work happens once in save_pre, the
+# moment that is already slow and the one right before an export.  WHICH
+# containers need it is NOT bookkept: it is read straight off the data (the
+# mirror's own loop count against the mesh, ~12 µs per container), so an
+# undo, a dev reload, a handler that was never installed or an edit made in
+# a previous session cannot leave the autosync blind - and the repack
+# cannot mark itself dirty either.  The scan costs ~10 ms on a 3000-object
+# scene, all of it in the cheap _has_link_data filter.
+
+
+def _drop_stale_handlers(handler_list, func_name):
+    """Remove copies left by a dev reload: the reloaded module gets NEW
+    function objects, so the usual identity check misses the old ones and
+    the handler would fire twice per event."""
+    for h in list(handler_list):
+        if getattr(h, "__name__", None) == func_name:
+            handler_list.remove(h)
+
+
+# UDIM/atlas records share the dual-carrier design (idprop + color mirror,
+# core/attr_store.py) and BREAK the same way: a mesh edit decapitates the
+# mirror while the idprop keeps the .blend working - and the FBX ships
+# without the record.  The link machinery above only watched its own
+# namespace; these two used to go out dead in total silence (reproduced:
+# delete the first face of a UDIM/atlas carrier -> both records survive in
+# the .blend and are gone after a default FBX round trip).
+_AUX_STORES = (("UDIM", UDIM_STORE), ("атлас", ATLAS_STORE))
+
+
+def _sync_aux_records(obj):
+    """Repack the UDIM/atlas record mirrors of one object when they no
+    longer match the mesh.  Unlike the link container there is nothing to
+    absorb or stamp - the record does not describe geometry - so a repack
+    from the idprop (or, for a colors-only carrier, from an unambiguous
+    mirror) is always the whole fix.  Buried windows of a merged-in carrier
+    are left alone: one full-mesh repack would overwrite them, and
+    scan_windows still reads them as they are.  Returns (fixed, failed)
+    label lists.  Callers guard type/library/edit mode."""
+    fixed, failed = [], []
+    mesh = obj.data
+    for label, store in _AUX_STORES:
+        raw = obj.get(store.prop_key)
+        if raw is None and mesh.attributes.get(store.prefix + "0") is None:
+            continue
+        state = _store_mirror_state(obj, store)
+        if state == MIRROR_OK and store.verify_frame(mesh) is not False:
+            continue
+        if state == MIRROR_WINDOWS:
+            continue   # buried window(s) - see the docstring
+        record = store.parse_idprop(raw)
+        if record is None:
+            if store.count_window_candidates(mesh) > 1:
+                failed.append(f"{obj.name} ({label})")
+                continue
+            record = store.read(obj)
+        if record is None or not store.write(obj, record):
+            failed.append(f"{obj.name} ({label})")
+            continue
+        fixed.append(f"{obj.name} ({label})")
+    return fixed, failed
+
+
+@bpy.app.handlers.persistent
+def _link_save_pre(_dummy):
+    """Repack the mirrors of stale containers right before the file is
+    written.  The .blend never needed this - the idprop survives any edit -
+    but the color mirror is the ONLY memory an FBX export carries, and a
+    mesh edit can decapitate it.  Save is already the slow moment, so the
+    repack hides there.  Deliberately NOT limited to objects edited in this
+    session: a file that was already broken when it was opened comes out of
+    the next save exportable."""
+    scene = getattr(bpy.context, "scene", None)
+    if scene is not None and not getattr(scene, "agr_link_autosync", True):
+        return   # nothing is remembered: switching it back on catches up
+
+    done = 0
+    left, failed = [], []
+    aux_done, aux_failed = 0, []
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH' or obj.library is not None:
+            continue
+        mesh = obj.data
+        if mesh is None or mesh.library is not None:
+            continue
+        if mesh.is_editmode:
+            continue   # pre-edit snapshot - see _refresh_container
+        # UDIM/atlas records ride on ANY mesh, container or not - sync them
+        # before the link-only filter below can skip the object
+        try:
+            af, al = _sync_aux_records(obj)
+            aux_done += len(af)
+            aux_failed.extend(al)
+        except Exception as exc:
+            aux_failed.append(f"{obj.name} ({exc})")
+        if not _has_link_data(obj):
+            continue
+        skip = _NO_AUTOSYNC.get(obj.name)
+        if skip is not None and skip[0] == _mirror_fingerprint(obj):
+            continue   # already established: not repackable as it stands
+        state = _mirror_state(obj)
+        if state == MIRROR_UNKNOWN:
+            continue
+        if state == MIRROR_OK and _LINK_STORE.verify_frame(mesh) is not False:
+            # the header probe cannot see payload corruption that keeps the
+            # loop count intact (Sort Elements, delete a quad + build
+            # another used to sail through as OK over a CRC-dead mirror),
+            # and a legacy v1 frame carries no loop count at all - the deep
+            # byte check runs HERE, once per save, never in poll()/draw()
+            continue
+        if state == MIRROR_NONE and mesh.attributes.get(ATTR_NAME) is None:
+            continue   # legacy container: idprop only, nothing to pack FROM
+        try:
+            stats = _refresh_container(bpy.context, obj, absorb=False)
+            reason = (None if stats.get("ok") and stats.get("mirror_ok")
+                      else stats.get("reason") or "mirror")
+        except Exception as exc:
+            agr_report(None, 'WARNING',
+                       f"⚠️ AGR Link: не удалось обновить память '{obj.name}': {exc}")
+            reason = "error"
+        if reason is None:
+            done += 1
+            continue
+        # _refresh_container drops the caches on its way out, so the mark
+        # goes in AFTER it - keyed on the CURRENT fingerprint, i.e. the next
+        # mesh edit retries this container all by itself
+        _NO_AUTOSYNC[obj.name] = (_mirror_fingerprint(obj), reason)
+        if reason in ("windows", "unmarked"):
+            left.append(obj.name)
+        else:
+            failed.append(f"{obj.name} ({reason})")
+    # agr_report, not print: this is the one failure the user MUST see - the
+    # .blend keeps working off the idprop while the FBX the receiver opens
+    # has no memory at all, and the system console is closed by default on
+    # Windows.  The names go with it; a bare count leaves nothing to act on.
+    if done:
+        agr_report(None, 'INFO',
+                   f"✅ AGR Link: перед сохранением обновлена память контейнеров: {done}")
+    if left:
+        agr_report(None, 'WARNING',
+                   "⚠️ AGR Link: пропущены контейнеры с влитым обычным Ctrl+J — "
+                   "нажмите «Закрепить память»: " + ", ".join(sorted(left)[:5])
+                   + ("…" if len(left) > 5 else ""))
+    if failed:
+        agr_report(None, 'WARNING',
+                   f"⚠️ AGR Link: зеркало НЕ перепаковано ({len(failed)}) — "
+                   "FBX уедет без памяти: " + ", ".join(sorted(failed)[:5])
+                   + ("…" if len(failed) > 5 else ""))
+    if aux_done:
+        agr_report(None, 'INFO',
+                   f"✅ AGR: перед сохранением обновлены записи UDIM/атласов: {aux_done}")
+    if aux_failed:
+        agr_report(None, 'WARNING',
+                   f"⚠️ AGR: записи UDIM/атласов НЕ перепакованы ({len(aux_failed)}) — "
+                   "FBX уедет без них: " + ", ".join(sorted(aux_failed)[:5])
+                   + ("…" if len(aux_failed) > 5 else ""))
+
+
+def _clear_caches():
+    """Every module-level cache in one place.  Called by register() as well
+    as unregister(): a dev reload keeps these dicts alive across the module
+    swap while the datablocks they describe may already be gone, and
+    enumerating them inline is exactly what let one be forgotten before."""
+    _NO_AUTOSYNC.clear()
+    _TABLE_CACHE.clear()
+    _MERGED_CACHE.clear()
+
+
 classes = (
     AGR_OT_link_join,
     AGR_OT_link_extract_group,
     AGR_OT_link_separate_all,
     AGR_OT_link_restore,
+    AGR_OT_link_refresh,
     AGR_OT_link_strip,
     AGR_PT_LinkPanel,
 )
@@ -2575,11 +3268,29 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+
+    bpy.types.Scene.agr_link_autosync = BoolProperty(
+        name="Обновлять память при сохранении",
+        description="Перед записью .blend перепаковать зеркало изменённых контейнеров: "
+                    "иначе экспорт в FBX унесёт устаревшую или разрушенную память, "
+                    "хотя сам .blend продолжит работать",
+        default=True)
+
+    _clear_caches()
+    # the depsgraph handler is GONE: with the verdict read from the mesh
+    # there is nothing to mark, and a per-tick handler that only bookkeeps
+    # is exactly what went stale behind undo and dev reloads
+    _drop_stale_handlers(bpy.app.handlers.depsgraph_update_post, "_link_depsgraph_post")
+    _drop_stale_handlers(bpy.app.handlers.save_pre, "_link_save_pre")
+    bpy.app.handlers.save_pre.append(_link_save_pre)
     print("✅ AGR Link operators registered")
 
 
 def unregister():
-    _TABLE_CACHE.clear()
-    _MERGED_CACHE.clear()
+    _drop_stale_handlers(bpy.app.handlers.save_pre, "_link_save_pre")
+    _drop_stale_handlers(bpy.app.handlers.depsgraph_update_post, "_link_depsgraph_post")
+    _clear_caches()
+    if hasattr(bpy.types.Scene, "agr_link_autosync"):
+        del bpy.types.Scene.agr_link_autosync
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

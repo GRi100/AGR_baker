@@ -1,6 +1,6 @@
 """AGR UV — grid-based planar UV mapping driven by a reference grid.
 
-Two grid sources:
+Three grid sources:
   * EDGES — the user picks two edges of ONE grid cell ("Запомнить сетку");
     they define the U/V axes, the cell sizes and the grid origin in WORLD
     space, so the stored grid works across every object in the scene.
@@ -9,6 +9,19 @@ Two grid sources:
     cell size is typed in manually, an optional angle rotates the grid
     around the normal, and the origin snaps to the selection corner or the
     world origin.
+  * TOPZ — plan view, top-down: U=+X, V=+Y (rotated by world_angle around
+    world +Z), origin at world (0,0,0) + the manual offsets, cut planes
+    vertical.  It NEVER looks at the geometry: the mean normal is not even
+    computed, auto-orientation is skipped and SURFACE degrades to PLANAR,
+    so the grid cannot drift with the selection.  The price is deliberate:
+    a downward-facing face comes out MIRRORED (auto-orient is what used to
+    fix that) and a vertical face collapses in V — both are what a plan
+    projection means, and the operator reports the second one.
+
+Besides the grid there is one tool for the opposite kind of geometry —
+"Органика" (see the organic section below): no plane describes an organic
+mesh, so it is cut by a world 3D grid into pieces and every piece gets its
+own UV square, projected along its own normal.
 
 "Развернуть по сетке" maps each target face into the 0..1 UV square of its
 own grid cell (faces spanning several cells exceed 0..1 — use "Разрезать по
@@ -31,7 +44,7 @@ import bpy
 import bmesh
 import gpu
 from gpu_extras.batch import batch_for_shader
-from math import atan2, ceil, cos, floor, hypot, pi, sin
+from math import atan2, ceil, cos, floor, hypot, pi, radians, sin
 from mathutils import Matrix, Vector, geometry
 
 from bpy.props import (
@@ -54,6 +67,11 @@ _MAX_CUT_LINES = 2048
 # Faces whose UVs exceed the unit square by more than this are counted as
 # "bigger than one cell" (the warning suggests cutting first)
 _UNIT_EPS = 1e-3
+
+# TOPZ (plan view): |cos| between the face normal and the grid plane normal
+# below this means the face is (nearly) vertical, so the top-down projection
+# squashes its UVs by 20x or more — reported, never silently accepted
+_TOPZ_FLAT_EPS = 0.05
 
 # Grid overlay limits
 _OVERLAY_MAX_SEGMENTS = 20000   # cut-preview segments across all objects
@@ -100,6 +118,10 @@ class AGR_UVGridSettings(PropertyGroup):
         items=[
             ('EDGES', "По рёбрам", "Сетка, запомненная по двум рёбрам одной ячейки"),
             ('WORLD', "Мировая", "Оси из нормали фейсов и мировых осей, размер ячейки задаётся вручную"),
+            ('TOPZ', "Сверху", "Плановая сетка вида сверху: U = мировой +X, V = мировой +Y, "
+                               "начало в (0,0,0), разрезы — вертикальными плоскостями. "
+                               "НЕ зависит от выделенной геометрии (нормали не смотрятся, "
+                               "авто-ориентация и проекция «по поверхности» не применяются)"),
         ],
         default='EDGES',
         update=_tag_redraw_view3d,
@@ -108,21 +130,24 @@ class AGR_UVGridSettings(PropertyGroup):
     # --- WORLD grid parameters ---
     world_cell_u: FloatProperty(
         name="Ячейка U",
-        description="Размер ячейки мировой сетки по горизонтали",
+        description="Размер ячейки мировой сетки по оси U (в режиме «Сверху» — "
+                    "по мировому X)",
         subtype='DISTANCE',
         default=1.0, min=0.001, soft_max=100.0,
         update=_tag_redraw_view3d,
     )
     world_cell_v: FloatProperty(
         name="Ячейка V",
-        description="Размер ячейки мировой сетки по вертикали",
+        description="Размер ячейки мировой сетки по оси V (в режиме «Сверху» — "
+                    "по мировому Y)",
         subtype='DISTANCE',
         default=1.0, min=0.001, soft_max=100.0,
         update=_tag_redraw_view3d,
     )
     world_angle: FloatProperty(
         name="Поворот",
-        description="Поворот сетки вокруг нормали фейсов (направление нарезки)",
+        description="Поворот сетки вокруг нормали фейсов (направление нарезки); "
+                    "в режиме «Сверху» — вокруг мировой оси Z",
         subtype='ANGLE',
         default=0.0, soft_min=-3.14159, soft_max=3.14159,
         update=_tag_redraw_view3d,
@@ -150,6 +175,78 @@ class AGR_UVGridSettings(PropertyGroup):
         description="Масштаб фейса внутри UV-квадрата (0.9 = 5% отступ от "
                     "каждого края, чтобы развёртка не касалась границ)",
         default=0.9, min=0.1, max=1.0,
+    )
+
+    # --- organic (voxel-piece) unwrap ---
+    organic_cell: FloatProperty(
+        name="Кусок",
+        description="Размер ячейки мировой 3D-сетки: меш режется на куски "
+                    "примерно этого размера, и КАЖДЫЙ кусок разворачивается "
+                    "на свой UV-квадрат",
+        subtype='DISTANCE',
+        default=0.25, min=0.001, soft_max=10.0,
+    )
+    organic_cut: BoolProperty(
+        name="Резать меш",
+        description="Разрезать геометрию по плоскостям 3D-сетки (X/Y/Z), чтобы "
+                    "кусок не свисал в соседнюю ячейку. Выключено — только UV, "
+                    "геометрия не меняется",
+        default=True,
+    )
+    organic_angle: FloatProperty(
+        name="Разброс нормалей",
+        description="Максимальный угол между нормалью грани и средней нормалью "
+                    "куска: кусок, который загибается сильнее, делится дальше. "
+                    "Это защита от наложения UV на сгибах (уши, ноздри)",
+        subtype='ANGLE',
+        default=radians(60.0), min=radians(5.0), max=radians(89.0),
+    )
+    organic_merge: FloatProperty(
+        name="Слить мелкие",
+        description="Куски площадью меньше этой доли квадрата ячейки прилипают "
+                    "к соседу с самой длинной общей границей (0 — не сливать; "
+                    "иначе тонкие обрезки у линий реза получают по целому "
+                    "квадрату текстуры)",
+        default=0.15, min=0.0, max=1.0,
+    )
+    organic_margin: FloatProperty(
+        name="Отступ",
+        description="Масштаб куска внутри UV-квадрата (1.0 — вплотную к краям, "
+                    "0.9 — 5% отступ с каждой стороны)",
+        default=1.0, min=0.1, max=1.0,
+    )
+    organic_fill: EnumProperty(
+        name="Заполнение",
+        description="Как кусок ложится в свой UV-квадрат",
+        items=[
+            ('SCALE', "Один масштаб",
+             "Один UV-квадрат = два размера куска в метрах (кусок может лежать "
+             "по диагонали ячейки, поэтому с запасом): клетки текстуры "
+             "одинаковы по всей модели, каждый кусок занимает свою часть "
+             "квадрата. Самые «чёткие квадратики». Итоговый метр на квадрат "
+             "пишется в отчёте"),
+            ('STRETCH', "На весь квадрат",
+             "Растянуть кусок на весь квадрат неравномерно — квадрат заполнен "
+             "целиком, но мелкий кусок показывает текстуру крупнее соседей"),
+            ('FIT', "Вписать",
+             "Вписать кусок в квадрат с сохранением пропорций — пропорции "
+             "текстуры целы, масштаб всё равно свой у каждого куска"),
+        ],
+        default='SCALE',
+    )
+    organic_align: EnumProperty(
+        name="Поворот",
+        description="Как ориентирован кусок внутри UV-квадрата",
+        items=[
+            ('WORLD', "По вертикали",
+             "V куска смотрит вверх (мировой +Z) — текстура ориентирована "
+             "одинаково на всей модели"),
+            ('PCA', "По форме",
+             "Длинную сторону куска положить в U — минимум растяжения"),
+            ('NONE', "Без поворота",
+             "Базис от первого ребра куска (как у развёртки заглушек)"),
+        ],
+        default='WORLD',
     )
 
     # --- common options ---
@@ -754,7 +851,8 @@ def _ensure_grid(op, context, settings):
         return 'CAPTURED' if _capture_grid(op, context, settings, picked) else None
     agr_report(op, 'ERROR',
                "Сетка не задана — выделите 2 ребра ячейки (или несколько рёбер — "
-               "автофит) и нажмите «Запомнить сетку», или переключитесь на мировую сетку")
+               "автофит) и нажмите «Запомнить сетку», или переключитесь на "
+               "мировую сетку / «Сверху»")
     return None
 
 
@@ -780,10 +878,30 @@ def _resolve_basis(op, settings, targets, quiet=False):
     and the manual flips; for the WORLD source optionally snaps the origin
     to the corner of the processed faces.  quiet=True (overlay preview)
     suppresses the error reports.
-    """
-    n_hint = _mean_world_normal(_orientation_targets(targets))
 
-    if settings.grid_source == 'EDGES':
+    TOPZ is the deliberate exception to all of that: the basis is nailed to
+    the world axes (U=+X, V=+Y, origin 0) and the face normals are NEVER
+    consulted — the mean normal is not even computed, so the plan-view grid
+    cannot drift with the selection.
+    """
+    topz = settings.grid_source == 'TOPZ'
+    # structural guarantee, not just a skipped branch: TOPZ never reads the
+    # geometry orientation (and saves the O(faces) Newell pass)
+    n_hint = (Vector((0.0, 0.0, 0.0)) if topz
+              else _mean_world_normal(_orientation_targets(targets)))
+
+    if topz:
+        # plan view, top-down: U along world +X, V along world +Y, rotated
+        # around world +Z by the manual angle
+        x_dir = Vector((1.0, 0.0, 0.0))
+        y_dir = Vector((0.0, 1.0, 0.0))
+        if settings.world_angle != 0.0:
+            rot = Matrix.Rotation(settings.world_angle, 3, Vector((0.0, 0.0, 1.0)))
+            x_dir = (rot @ x_dir).normalized()
+            y_dir = (rot @ y_dir).normalized()
+        origin = Vector((0.0, 0.0, 0.0))
+        cell_u, cell_v = settings.world_cell_u, settings.world_cell_v
+    elif settings.grid_source == 'EDGES':
         origin = Vector(settings.origin)
         x_dir = Vector(settings.u_dir)
         y_dir = Vector(settings.v_dir)
@@ -816,10 +934,17 @@ def _resolve_basis(op, settings, targets, quiet=False):
         origin = Vector((0.0, 0.0, 0.0))
         cell_u, cell_v = settings.world_cell_u, settings.world_cell_v
 
-    if settings.swap_axes:
+    # TOPZ ignores the swap: it flips the basis handedness, and the
+    # auto-orient that would compensate is structurally OFF here (n_hint is
+    # zero), so the whole unwrap came out MIRRORED - the shoelace UV area
+    # flipped sign on every face with nothing in the report.  The sanctioned
+    # rotation for the plan grid is world_angle (90° = swapped axes).
+    if settings.swap_axes and settings.grid_source != 'TOPZ':
         x_dir, y_dir = y_dir, x_dir
         cell_u, cell_v = cell_v, cell_u
 
+    # TOPZ falls out here on its own: n_hint is the zero vector by
+    # construction, so auto-orientation can never rotate the plan grid
     if settings.auto_orient and n_hint.length > 1e-6:
         n = n_hint.normalized()
         up = Vector((0.0, 0.0, 1.0)) if abs(n.z) < 0.7 else Vector((0.0, 1.0, 0.0))
@@ -836,7 +961,10 @@ def _resolve_basis(op, settings, targets, quiet=False):
         y_dir = -y_dir
 
     # WORLD grid starting at the selection corner: shift the origin AFTER
-    # the final axis orientation is known (the "corner" depends on it)
+    # the final axis orientation is known (the "corner" depends on it).
+    # The test is deliberately `== 'WORLD'`, NOT `!= 'EDGES'`: merging the
+    # two non-EDGES sources here would make TOPZ read the selection again
+    # (this scan visits every target vertex) and kill its whole premise.
     if settings.grid_source == 'WORLD' and settings.origin_mode == 'SELECTION':
         min_u = min_v = None
         for obj, _bm, faces in targets:
@@ -856,6 +984,18 @@ def _resolve_basis(op, settings, targets, quiet=False):
     origin = origin + x_dir * settings.offset_u + y_dir * settings.offset_v
 
     return origin, x_dir, y_dir, cell_u, cell_v
+
+
+def _surface_mode(settings):
+    """True when the arc-length SURFACE projection is actually in effect.
+
+    The ONE place that decides it: TOPZ is a plan-view projection by
+    definition (its axes are horizontal and its U must stay a world X
+    coordinate), so the per-face arc-U machinery is forced off there — cut,
+    unwrap and the overlay preview all ask this function instead of reading
+    settings.projection directly, which is what keeps them in lockstep.
+    """
+    return settings.projection == 'SURFACE' and settings.grid_source != 'TOPZ'
 
 
 def _snap(value, tol):
@@ -996,7 +1136,7 @@ def _make_frames(settings, targets, basis):
     the agreement structural instead of a copy-paste convention.  Returns
     None for the PLANAR projection.
     """
-    if settings.projection != 'SURFACE':
+    if not _surface_mode(settings):
         return None
     anchor = Vector(settings.origin) if settings.grid_source == 'EDGES' else None
     # flip_v negates y_dir, which would drag the per-face U (= y_dir × n)
@@ -1108,6 +1248,787 @@ def _tile_offset(num):
 
 
 # ============================================================
+# Organic unwrap: cut a complex mesh with a world 3D grid and give
+# every resulting piece its own clean UV square
+# ============================================================
+#
+# The grid tools above assume a plane (a facade, a floor).  Organic shapes
+# — a sculpt, a tree, Suzanne — have no such plane, and every projection
+# onto ONE plane smears the texture where the surface turns away.  The
+# approach here is the opposite: chop the surface into pieces small enough
+# to be nearly flat, then project EACH piece along ITS OWN normal into its
+# own 0..1 square.  The texel density is then set by the piece size, so a
+# checker stays a checker on curvature instead of stretching into streaks.
+#
+# piece = edge-connected region inside ONE cell of the world voxel grid,
+#         with the face normals kept inside a cone (no fold-over),
+#         after tiny off-cuts have been absorbed by their neighbours.
+#
+# All pieces share the same unit square (they overlap in UV) exactly like
+# the stub unwrap does per face: with a tiling/checker texture every piece
+# shows one clean tile.  On a UDIM object a piece stays in the tile its
+# faces already vote for, so the integer UV part keeps its tile meaning.
+
+_ORGANIC_EPS = 1e-9
+_ORGANIC_MERGE_PASSES = 8
+
+# Organic gets its OWN, much tighter plane budget than the grid tools.  The
+# grid cutter spends _MAX_CUT_LINES over a planar selection in two axes;
+# organic chains every plane against the whole growing geometry in THREE, and
+# the cost is superlinear — measured on flat grids in 5.2: 198 planes 0.47 s,
+# 398 planes 2.5 s, 798 planes 29.4 s (2x the planes, 12x the time).  At 2048
+# that is ten minutes of frozen UI with no progress bar and no way to cancel,
+# which is not a usable outcome for anyone; 512 keeps the worst case in the
+# seconds range and the operator says plainly to enlarge the piece instead.
+_ORGANIC_MAX_CUT_LINES = 512
+
+# SCALE mode: how many cells one UV square is worth.  A piece never spans
+# more than one voxel, but it can lie across it DIAGONALLY, so its extent in
+# its own tangent frame reaches ~1.4 cells (measured on Suzanne subdiv 0..3,
+# cells 0.12..0.5: median 1.05, p90 1.40, max ~2.0 once sliver merging joins
+# two voxels).  Anchoring the square at 2 cells is what makes the texel size
+# come out IDENTICAL on ~every piece instead of "identical except for the
+# two thirds that had to be shrunk to fit" — and it stays a CONSTANT, so two
+# objects unwrapped in separate runs still share one texture scale.
+_ORGANIC_SCALE_SLACK = 2.0
+_ORGANIC_FOLD_EPS = -1e-12
+_ORGANIC_AXES = (Vector((1.0, 0.0, 0.0)),
+                 Vector((0.0, 1.0, 0.0)),
+                 Vector((0.0, 0.0, 1.0)))
+
+
+def _matrix_close(a, b, tol=1e-6):
+    """Same world transform to within `tol` (per element)."""
+    return all(abs(a[r][c] - b[r][c]) <= tol
+               for r in range(4) for c in range(4))
+
+
+def _organic_params(settings):
+    """Operator-independent snapshot of the organic settings."""
+    cell = max(float(settings.organic_cell), 1e-4)
+    return {
+        'cell': cell,
+        # metres per UV square in SCALE mode (see _ORGANIC_SCALE_SLACK)
+        'tile': cell * _ORGANIC_SCALE_SLACK,
+        'cut': bool(settings.organic_cut),
+        'cos_half': cos(max(min(float(settings.organic_angle), pi / 2 - 1e-6), 1e-6)),
+        'merge': float(settings.organic_merge),
+        'margin': float(settings.organic_margin),
+        'fill': settings.organic_fill,
+        'align': settings.organic_align,
+    }
+
+
+def _organic_stats():
+    # 'dirty' is not a statistic: it says the BMesh was actually mutated.
+    # In Object mode that BMesh is a throw-away copy and the flag is
+    # ignored; in Edit Mode it IS the mesh, and then the operator must end
+    # with {'FINISHED'} even having unwrapped nothing (see _organic_report)
+    return {'patches': 0, 'faces': 0, 'cuts': 0,
+            'degenerate': 0, 'out_of_tiles': 0, 'out_of_tile_faces': 0,
+            'folds': 0, 'merged': 0, 'crossed_tiles': 0,
+            'rescaled': 0, 'dirty': False,
+            'atlas_objects': [], 'udim_objects': [], 'modifier_objects': [],
+            'shared_matrix_objects': []}
+
+
+def _organic_world_table(mat, faces):
+    """{BMVert: world coordinate} for every corner of `faces`, built ONCE.
+
+    Without it a shared vertex is transformed once per incident face in
+    _organic_face_data (~4x on a quad mesh) and then AGAIN per piece in
+    _organic_patch_uvs — five matrix multiplications where one is enough.
+    The expression is the same `mat @ v.co`, so the numbers are bit-identical
+    to the per-face version; only the count changes.
+
+    The entries are shared mutable Vectors: read them, never write into one
+    in place (`a - b`, `p.dot(x)` are fine, `p -= n` is not).
+    """
+    world = {}
+    for f in faces:
+        for v in f.verts:
+            if v not in world:
+                world[v] = mat @ v.co
+    return world
+
+
+def _organic_face_data(world, faces):
+    """World centroid, area-vector normal and area per face (Newell).
+
+    The area vector (length == 2 x area) doubles as the weight: summing it
+    over a set of faces gives the area-weighted mean normal for free, and
+    that works under any object transform including negative scale.
+
+    `world` is the shared per-vertex table from _organic_world_table.
+    """
+    centroids, normals, areas = {}, {}, {}
+    for f in faces:
+        ws = [world[v] for v in f.verts]
+        c = Vector((0.0, 0.0, 0.0))
+        for p in ws:
+            c += p
+        centroids[f] = c / len(ws)
+        n = Vector((0.0, 0.0, 0.0))
+        for i in range(1, len(ws) - 1):
+            n += (ws[i] - ws[0]).cross(ws[i + 1] - ws[0])
+        normals[f] = n
+        areas[f] = n.length * 0.5
+    return centroids, normals, areas
+
+
+def _organic_plan_cut(mat, faces, cell):
+    """Interior world-grid planes crossing the faces, per world axis.
+
+    Returns [(axis, [k, ...]), ...], or None when the total exceeds
+    _ORGANIC_MAX_CUT_LINES — the caller must then abort BEFORE mutating
+    anything (a cancelled operator pushes no undo step, so a partial cut
+    would be fused into the previous undo entry).
+    """
+    verts = {v for f in faces for v in f.verts}
+    if not verts:
+        return []
+    world = [mat @ v.co for v in verts]
+    plan = []
+    total = 0
+    for ax in _ORGANIC_AXES:
+        ds = [p.dot(ax) / cell for p in world]
+        lo, hi = min(ds), max(ds)
+        # count arithmetically BEFORE materialising the list: a
+        # kilometres-long mesh at a millimetre cell used to build ~10^7
+        # ints (hundreds of MB, ~1 s) only for the cap below to throw them
+        # away (_do_cut pre-checks its span the same way).  The formula is
+        # exactly _interior_lines' predicate — integers k with
+        # lo + eps < k < hi - eps.
+        n_ax = max(0, ceil(hi - _LINE_EPS) - floor(lo + _LINE_EPS) - 1)
+        total += n_ax
+        if total > _ORGANIC_MAX_CUT_LINES:
+            return None
+        plan.append((ax, _interior_lines(lo, hi)))
+    return plan
+
+
+def _organic_cut(bm, mat, faces, cell, plan, reselect=False):
+    """Bisect `faces` along the planned world planes.
+
+    Returns (surviving + new faces, number of bisects).  Same chaining as
+    _do_cut: res['geom'] carries survivors AND everything new, so every
+    following plane sees the complete geometry.
+
+    reselect=True restores the face selection afterwards (Edit Mode): bisect
+    creates its faces with select=False AND replaces the originals, so the
+    user's selection comes out EMPTY otherwise - the next selection-based run
+    would then find nothing to work on.  Like _do_cut, the assignment is left
+    to flush DOWN to verts/edges on its own and never flushed upward.
+    """
+    mat_inv = mat.inverted_safe()
+    # world normal -> local plane normal (transpose, NOT inverse: correct
+    # under non-uniform scale)
+    nrm_to_local = mat.to_3x3().transposed()
+    obj_scale = max(abs(c) for c in mat.to_scale())
+    weld = 1e-5 / max(obj_scale, 1e-9)
+    verts = {v for f in faces for v in f.verts}
+    edges = {e for f in faces for e in f.edges}
+    geom = list(verts) + list(edges) + list(faces)
+    n_cuts = 0
+    for ax, ks in plan:
+        if not ks:
+            continue
+        plane_no = (nrm_to_local @ ax).normalized()
+        for k in ks:
+            res = bmesh.ops.bisect_plane(
+                bm, geom=geom,
+                plane_co=mat_inv @ (ax * (k * cell)),
+                plane_no=plane_no,
+                dist=weld,
+            )
+            geom = res['geom']
+            n_cuts += 1
+    out = [g for g in geom
+           if isinstance(g, bmesh.types.BMFace) and g.is_valid]
+    if reselect and n_cuts:
+        for f in out:
+            f.select = True
+    return out, n_cuts
+
+
+def _organic_in_cone(normal, axis, cos_half):
+    """True when `normal` lies inside the cone around `axis`.
+
+    A zero-length normal (degenerate face) is a wildcard: it carries no
+    orientation of its own and must not be able to break a piece apart.
+    """
+    if normal.length < _ORGANIC_EPS or axis.length < _ORGANIC_EPS:
+        return True
+    return normal.dot(axis) >= cos_half * normal.length * axis.length
+
+
+def _organic_patch_axis(patch, normals):
+    """Area-weighted mean normal of a piece (sum of the area vectors)."""
+    n = Vector((0.0, 0.0, 0.0))
+    for f in patch:
+        n += normals[f]
+    return n
+
+
+def _organic_split_cone(pool, normals, cos_half):
+    """Partition `pool` into connected pieces whose faces ALL lie inside the
+    cone around the piece's FINAL mean normal.
+
+    Greedy growth on its own is not enough, and that is the subtle part:
+    the running mean drifts while the BFS walks across curvature, so the
+    faces a piece started from can end up far outside the cone of the
+    finished piece — past 90 deg that is a projection FOLD, i.e. UVs of two
+    faces laid on top of each other.  Hence every grown piece is validated
+    against its own final mean; a piece with failing faces is split into the
+    passing and failing halves and BOTH are partitioned again.  Every
+    recursion works on a strictly smaller set, so this terminates, and the
+    invariant it leaves behind ("every face is within cos_half of its
+    piece's mean") is what makes the flattening fold-free by construction.
+    """
+    from collections import deque
+
+    result = []
+    work = [sorted(pool, key=lambda f: f.index)]
+    while work:
+        pending = work.pop()
+        if not pending:
+            continue
+        pset = set(pending)
+        # --- growth: edge-connected + running-mean cone ---
+        taken = set()
+        grown = []
+        for seed in pending:
+            if seed in taken:
+                continue
+            axis = normals[seed].copy()
+            patch = [seed]
+            taken.add(seed)
+            queue = deque((seed,))
+            while queue:
+                f = queue.popleft()
+                for e in f.edges:
+                    if len(e.link_faces) != 2:
+                        # a non-manifold edge (3+ sheets) has no meaningful
+                        # "other side" — growing across it would flatten two
+                        # sheets onto one plane.  Boundary edges (1 face)
+                        # fall out here too, at no cost
+                        continue
+                    for g in e.link_faces:
+                        if g in taken or g not in pset:
+                            continue
+                        if not _organic_in_cone(normals[g], axis, cos_half):
+                            continue          # would fold the projection
+                        axis = axis + normals[g]
+                        taken.add(g)
+                        patch.append(g)
+                        queue.append(g)
+            grown.append(patch)
+        # --- validation against the final mean ---
+        for patch in grown:
+            if len(patch) == 1:
+                result.append(patch)
+                continue
+            mean = _organic_patch_axis(patch, normals)
+            good, bad = [], []
+            for f in patch:
+                (good if _organic_in_cone(normals[f], mean, cos_half)
+                 else bad).append(f)
+            if not bad or not good:
+                result.append(patch)
+            else:
+                work.append(good)
+                work.append(bad)
+    return result
+
+
+def _organic_build_patches(mat, faces, cell, cos_half, world=None):
+    """Split the faces into pieces: one piece = an edge-connected region
+    inside ONE voxel of the world grid whose normals stay inside a cone.
+
+    Three constraints, each doing one job:
+      * the voxel key LOCALISES a piece — no piece is bigger than the cell,
+        and the pieces tile the model in world space (so the texture scale
+        is predictable and independent of the object's own orientation);
+      * edge connectivity keeps a piece in ONE part (two lumps of surface
+        crossing the same cell must not share a square);
+      * the normal cone is what keeps the later planar projection
+        fold-free: a region wrapping around a ridge (an ear, a nostril)
+        is split instead of being flattened on top of itself.
+
+    `world` is the shared per-vertex world table (_organic_world_table);
+    None means "build it here" — the path used by callers that only hold
+    the matrix, e.g. the unit checks in scripts/test_uv_organic.py.
+
+    Returns (patches, centroids, normals, areas).
+    """
+    if world is None:
+        world = _organic_world_table(mat, faces)
+    centroids, normals, areas = _organic_face_data(world, faces)
+    groups = {}
+    for f in faces:
+        c = centroids[f]
+        key = (floor(c.x / cell), floor(c.y / cell), floor(c.z / cell))
+        groups.setdefault(key, []).append(f)
+
+    patches = []
+    for key in sorted(groups):          # deterministic voxel order
+        patches.extend(_organic_split_cone(groups[key], normals, cos_half))
+    return patches, centroids, normals, areas
+
+
+def _organic_merge_slivers(patches, normals, areas, cell, frac, cos_half):
+    """Absorb tiny pieces into the neighbour with the longest shared border.
+
+    Bisecting along a grid leaves thin off-cuts against every cut line.
+    Left alone each of them claims a WHOLE texture square, so a 2 cm sliver
+    would show the tile at 10x the density of its neighbours — the single
+    most visible artefact of the whole approach.  A sliver is only absorbed
+    by a neighbour inside the same normal cone: merging across a ridge
+    would re-introduce exactly the fold the cone split prevented.
+
+    Returns the new patch list (order deterministic).
+    """
+    if frac <= 0.0 or not patches:
+        return patches, 0
+    limit = frac * cell * cell
+    members = {i: list(p) for i, p in enumerate(patches)}
+    owner = {}
+    for i, p in members.items():
+        for f in p:
+            owner[f] = i
+    area = {i: sum(areas[f] for f in p) for i, p in members.items()}
+    axis = {}
+    for i, p in members.items():
+        n = Vector((0.0, 0.0, 0.0))
+        for f in p:
+            n += normals[f]
+        axis[i] = n
+
+    merged_total = 0
+    for _pass in range(_ORGANIC_MERGE_PASSES):
+        small = sorted((i for i in members if area[i] < limit),
+                       key=lambda i: (area[i], i))
+        if not small:
+            break
+        merged = 0
+        for i in small:
+            if i not in members:
+                continue                      # absorbed earlier this pass
+            if area[i] >= limit:
+                # it ALREADY absorbed a sliver this pass and is no longer
+                # small: without this re-check the merge chains (A into B,
+                # then the fattened B into C), and the ascending sort makes
+                # that the normal case rather than the exception — six 0.9x
+                # neighbours collapsed into one 5.4x piece.  An oversized
+                # piece then trips the SCALE rescale and shows the texture
+                # coarser than everything around it, which is the very
+                # artefact this function exists to remove.
+                continue
+            share = {}
+            for f in members[i]:
+                for e in f.edges:
+                    for g in e.link_faces:
+                        j = owner.get(g)
+                        if j is None or j == i:
+                            continue
+                        share[j] = share.get(j, 0.0) + e.calc_length()
+            best, best_len = None, 0.0
+            ai = axis[i]
+            for j in sorted(share):
+                if share[j] <= best_len:
+                    continue
+                # cheap reject on the two means, then the real test: EVERY
+                # face of the sliver must survive inside the cone of the
+                # MERGED mean — otherwise the merge would re-introduce the
+                # very fold the cone split just prevented (the target's own
+                # faces are safe: a sliver under the area limit barely moves
+                # an area-weighted mean)
+                if not _organic_in_cone(ai, axis[j], cos_half):
+                    continue
+                merged_axis = axis[j] + ai
+                if not all(_organic_in_cone(normals[f], merged_axis, cos_half)
+                           for f in members[i]):
+                    continue
+                best, best_len = j, share[j]
+            if best is None:
+                continue                      # no compatible neighbour
+            for f in members[i]:
+                owner[f] = best
+            members[best].extend(members[i])
+            area[best] += area[i]
+            axis[best] = axis[best] + ai
+            del members[i], area[i], axis[i]
+            merged += 1
+        merged_total += merged
+        if not merged:
+            break
+    return [members[i] for i in sorted(members)], merged_total
+
+
+def _organic_patch_uvs(patch, world, normals, params):
+    """({BMVert: (u, v)}, rescaled) — ONE piece mapped onto the 0..1 square.
+
+    `world` is the shared per-vertex world table (_organic_world_table): the
+    piece builder already transformed these vertices, so re-transforming
+    them here would be the second of five passes over the same matrix.
+
+    Projection goes along the piece's OWN mean normal (that is the whole
+    point of the voxel pieces: the texel density follows the surface, not
+    one global plane), and the basis is right-handed w.r.t. that normal, so
+    the mapping is never mirrored.  Returns None for a degenerate piece
+    (no area, or a piece that collapses onto a line).
+
+    Three fill modes, and the difference is what the texture DOES:
+      * SCALE   — 1 UV square == `cell` x _ORGANIC_SCALE_SLACK metres, piece
+                  centred.  The texel size is then the same on every piece
+                  of every object, so a checker reads as one crisp grid over
+                  the whole model.  This is the default; the rare piece that
+                  still does not fit is uniformly shrunk and reported
+                  (`rescaled`).
+      * STRETCH — the piece bbox fills the square (non-uniform).  Every
+                  piece shows one whole tile, like the stub unwrap, so a
+                  small piece shows the texture bigger than its neighbours.
+      * FIT     — uniform version of STRETCH: aspect kept, square not full.
+    """
+    align, fill, margin = params['align'], params['fill'], params['margin']
+    n = Vector((0.0, 0.0, 0.0))
+    for f in patch:
+        n += normals[f]
+    if n.length < _ORGANIC_EPS:
+        for f in patch:               # fully folded piece: fall back to a face
+            if normals[f].length > _ORGANIC_EPS:
+                n = normals[f].copy()
+                break
+    if n.length < _ORGANIC_EPS:
+        return None
+    n.normalize()
+
+    x = y = None
+    if align == 'NONE':
+        vs = list(patch[0].verts)
+        if len(vs) > 1:
+            e = world[vs[1]] - world[vs[0]]   # fresh Vector: safe to mutate
+            e -= n * e.dot(n)
+            if e.length > _ORGANIC_EPS:
+                x = e.normalized()
+                y = n.cross(x)
+    if x is None:
+        # V "up": world +Z projected into the piece plane (world +Y as the
+        # fallback for pieces facing straight up or down)
+        up = Vector((0.0, 0.0, 1.0))
+        cand = up - n * up.dot(n)
+        if cand.length < 1e-4:
+            up = Vector((0.0, 1.0, 0.0))
+            cand = up - n * up.dot(n)
+        if cand.length < _ORGANIC_EPS:
+            return None
+        y = cand.normalized()
+        x = y.cross(n)                # (x x y)·n == +1  ->  no mirroring
+
+    verts, seen = [], set()
+    for f in patch:
+        for v in f.verts:
+            if v not in seen:
+                seen.add(v)
+                verts.append(v)
+    pts = [world[v] for v in verts]   # read-only view into the shared table
+    flat = [(p.dot(x), p.dot(y)) for p in pts]
+
+    if align == 'PCA' and len(flat) > 2:
+        cx = sum(p[0] for p in flat) / len(flat)
+        cy = sum(p[1] for p in flat) / len(flat)
+        sxx = syy = sxy = 0.0
+        for px, py in flat:
+            dx, dy = px - cx, py - cy
+            sxx += dx * dx
+            syy += dy * dy
+            sxy += dx * dy
+        if abs(sxy) > _ORGANIC_EPS or abs(sxx - syy) > _ORGANIC_EPS:
+            # principal-axis angle in the (x, y) frame; rotating the FRAME
+            # (not the points) keeps the map affine and the handedness safe
+            ang = 0.5 * atan2(2.0 * sxy, sxx - syy)
+            ca, sa = cos(ang), sin(ang)
+            x, y = (x * ca + y * sa), (y * ca - x * sa)
+            flat = [(p.dot(x), p.dot(y)) for p in pts]
+
+    min_x = min(p[0] for p in flat)
+    max_x = max(p[0] for p in flat)
+    min_y = min(p[1] for p in flat)
+    max_y = max(p[1] for p in flat)
+    w, h = max_x - min_x, max_y - min_y
+    out = {}
+    rescaled = False
+    if fill == 'STRETCH':
+        if w < _ORGANIC_EPS or h < _ORGANIC_EPS:
+            return None               # a line cannot be stretched onto a square
+        for v, (px, py) in zip(verts, flat):
+            u = (px - min_x) / w      # NON-UNIFORM stretch fills both axes
+            vv = (py - min_y) / h
+            out[v] = (0.5 + (u - 0.5) * margin, 0.5 + (vv - 0.5) * margin)
+        return out, rescaled
+
+    if w < _ORGANIC_EPS and h < _ORGANIC_EPS:
+        return None
+    if fill == 'SCALE':
+        # absolute: `tile` metres map to the whole square, so the texel size
+        # is identical on every piece.  An unusually long piece is shrunk to
+        # fit instead of letting UVs leave 0..1 (the integer UV part belongs
+        # to the UDIM tools)
+        scale = 1.0 / params['tile']
+        if max(w, h) * scale > 1.0:
+            scale = 1.0 / max(w, h)
+            rescaled = True
+    else:                             # FIT: uniform, the piece fills the square
+        scale = 1.0 / max(w, h)
+    cx, cy = (min_x + max_x) * 0.5, (min_y + max_y) * 0.5
+    for v, (px, py) in zip(verts, flat):
+        u = 0.5 + (px - cx) * scale
+        vv = 0.5 + (py - cy) * scale
+        out[v] = (0.5 + (u - 0.5) * margin, 0.5 + (vv - 0.5) * margin)
+    return out, rescaled
+
+
+def _organic_apply(obj, bm, faces, plan, params, stats, reselect=False):
+    """Cut (when planned), build the pieces and write their UVs.
+
+    `plan` must already come from _organic_plan_cut for THIS object, so the
+    line-count guard has fired before any mutation.  Returns the number of
+    faces actually unwrapped — 0 means the caller must NOT write the bmesh
+    back: a CANCELLED operator pushes no undo step, so committing the cut of
+    a run that unwrapped nothing would fuse it into the previous undo entry.
+
+    `reselect` is handed to _organic_cut (Edit Mode + «Выделенные фейсы»).
+    """
+    mat = obj.matrix_world
+    n_cuts = 0
+    if plan:
+        faces, n_cuts = _organic_cut(bm, mat, faces, params['cell'], plan,
+                                     reselect=reselect)
+        if n_cuts:
+            stats['dirty'] = True     # geometry changed — see _organic_stats
+        # bisect leaves the index tables dirty; the patch builder sorts by
+        # index for determinism, and normals are read through the area
+        # vectors, so only the indices need refreshing
+        bm.verts.index_update()
+        bm.edges.index_update()
+        bm.faces.index_update()
+    faces = [f for f in faces if f.is_valid and not f.hide]
+    stats['cuts'] += n_cuts
+    if not faces:
+        return 0
+    uv_layer = bm.loops.layers.uv.active
+    if uv_layer is None:
+        # verify() ADDS the layer, and on a live edit-BMesh that is a real
+        # mutation: it outlives Edit Mode whether or not update_edit_mesh is
+        # ever called, so it has to raise the dirty flag on its own
+        uv_layer = bm.loops.layers.uv.verify()
+        stats['dirty'] = True
+
+    # one world transform per vertex for the whole object: the patch builder
+    # and every per-piece projection below read this table instead of
+    # multiplying `mat` again (same expression, same numbers, ~5x fewer ops)
+    world = _organic_world_table(mat, faces)
+    patches, _centroids, normals, areas = _organic_build_patches(
+        mat, faces, params['cell'], params['cos_half'], world=world)
+    patches, merged = _organic_merge_slivers(
+        patches, normals, areas, params['cell'], params['merge'],
+        params['cos_half'])
+    stats['merged'] += merged
+    # final enforcement of the cone invariant: the merge phase is allowed to
+    # be optimistic (it only checks the sliver's own faces), so anything that
+    # still violates the cone is re-split here.  A fold is worse than a
+    # sliver, and this pass is what lets the fold counter in the report mean
+    # "genuinely folded", not "we did not look".
+    checked = []
+    for patch in patches:
+        axis = _organic_patch_axis(patch, normals)
+        if all(_organic_in_cone(normals[f], axis, params['cos_half'])
+               for f in patch):
+            checked.append(patch)
+        else:
+            checked.extend(_organic_split_cone(patch, normals,
+                                               params['cos_half']))
+    patches = checked
+
+    # integer UV part IS the tile number for the UDIM tools — a piece stays
+    # in the tile its own loops vote for
+    keep_tiles = object_has_udim(obj)
+    n_touched = 0
+    for patch in patches:
+        tile_uv = (0.0, 0.0)
+        if keep_tiles:
+            uvs = [tuple(loop[uv_layer].uv) for f in patch for loop in f.loops]
+            num = _face_tile_number(uvs)
+            if num is None:
+                # count FACES, like every other skip counter in this report:
+                # "12" next to "вырожденных пропущено 400" read as faces and
+                # let a user ship 400 untextured polygons believing 12
+                stats['out_of_tiles'] += len(patch)
+                continue
+            # the piece is placed in ONE tile (documented design), but the
+            # world voxel grid knows nothing about the UV tile layout, so a
+            # piece can straddle a border and drag its minority faces onto a
+            # foreign tile's texture.  That used to happen in total silence.
+            if any(_face_tile_number([tuple(loop[uv_layer].uv)
+                                      for loop in f.loops]) not in (None, num)
+                   for f in patch):
+                stats['crossed_tiles'] += 1
+            tile_uv = _tile_offset(num)
+        mapped = _organic_patch_uvs(patch, world, normals, params)
+        if mapped is None:
+            stats['degenerate'] += len(patch)
+            continue
+        table, rescaled = mapped
+        if rescaled:
+            stats['rescaled'] += 1
+        for f in patch:
+            face_uvs = []
+            for loop in f.loops:
+                u, v = table[loop.vert]
+                loop[uv_layer].uv = (u + tile_uv[0], v + tile_uv[1])
+                face_uvs.append((u, v))
+            # counted per FAN TRIANGLE, not per face: an n-gon (and the cut
+            # makes plenty of them) keeps a consistent whole-face winding
+            # while one of its fan triangles is already flipped — and the
+            # triangles are what gets rendered, baked and exported.  The
+            # piece map is right-handed w.r.t. the piece normal, so negative
+            # area == UV overlap inside the piece (report it, never hide it)
+            for i in range(1, len(face_uvs) - 1):
+                (x0, y0), (x1, y1) = face_uvs[0], face_uvs[i]
+                x2, y2 = face_uvs[i + 1]
+                if ((x1 - x0) * (y2 - y0)
+                        - (x2 - x0) * (y1 - y0)) < _ORGANIC_FOLD_EPS:
+                    stats['folds'] += 1
+        stats['patches'] += 1
+        n_touched += len(patch)
+
+    stats['faces'] += n_touched
+    if n_touched:
+        stats['dirty'] = True
+        _note_uv_overwrite_counts(obj, len(bm.faces), n_touched,
+                                  stats['atlas_objects'], stats['udim_objects'])
+    return n_touched
+
+
+def _organic_report(op, stats, params, blocked=(), skipped_no_faces=0,
+                    committed=False, linked=(), failed=()):
+    """One report for both organic operators.
+
+    Returns True when the operator must end with {'FINISHED'}.
+
+    `committed` says the caller works on the LIVE edit-BMesh, i.e. its
+    changes are already in the mesh and cannot be taken back by the
+    operator.  Then a run that unwrapped nothing STILL has to finish:
+    a {'CANCELLED'} return pushes no undo step, so the cut would be welded
+    into the PREVIOUS undo entry and Ctrl+Z could never take it back.
+    """
+    if stats['faces'] == 0:
+        msg = "Развернуть нечего: нет подходящих фейсов"
+        # the accumulated skip counters ARE the answer to "why?" — without
+        # them a fully parked UDIM object reported only the bare phrase and
+        # left the user guessing (reproduced: 500 faces in out_of_tiles)
+        reasons = []
+        if stats['out_of_tiles']:
+            reasons.append(f"вне валидной UDIM-зоны фейсов {stats['out_of_tiles']}")
+        if stats['degenerate']:
+            reasons.append(f"вырожденных фейсов {stats['degenerate']}")
+        if skipped_no_faces:
+            reasons.append(f"объектов без фейсов {skipped_no_faces}")
+        if stats['shared_matrix_objects']:
+            reasons.append("общий меш с разными трансформами: "
+                           + ", ".join(stats['shared_matrix_objects']))
+        if reasons:
+            msg += " — " + ", ".join(reasons)
+        if blocked:
+            msg += f" (пропущены объекты с shape keys: {', '.join(blocked)})"
+        if linked:
+            msg += f" (данные из библиотеки: {', '.join(linked)})"
+        if failed:
+            msg += f" (сбой: {'; '.join(failed)})"
+        if committed and stats['dirty']:
+            if stats['cuts']:
+                msg += f" — но меш уже нарезан ({stats['cuts']} плоскостей)"
+            msg += ", отменить можно через Ctrl+Z"
+            agr_report(op, 'WARNING', msg)
+            return True
+        agr_report(op, 'ERROR', msg)
+        return False
+
+    msg = (f"✅ Органика: кусков {stats['patches']}, фейсов {stats['faces']}, "
+           f"кусок {params['cell']:.3g} м")
+    if params['fill'] == 'SCALE':
+        msg += ", 1 квадрат = {0:.3g} м".format(params['tile'])
+    if stats['cuts']:
+        msg += f", плоскостей реза {stats['cuts']}"
+    if stats['merged']:
+        msg += f", слито мелких {stats['merged']}"
+    level = 'INFO'
+    if stats['degenerate']:
+        # skipped faces keep their OLD UVs — the status line must never be
+        # green over them (that is the whole point of counting per face)
+        msg += f", вырожденных фейсов пропущено {stats['degenerate']}"
+        level = 'WARNING'
+    if stats['out_of_tiles']:
+        msg += f", вне валидной UDIM-зоны фейсов {stats['out_of_tiles']}"
+        level = 'WARNING'
+    if stats['rescaled']:
+        msg += (f", кусков крупнее ячейки (масштаб уменьшен) "
+                f"{stats['rescaled']}")
+    if stats['crossed_tiles']:
+        msg += (f" | ⚠️ кусков через границу UDIM-тайла {stats['crossed_tiles']} — "
+                f"их фейсы съехали в один тайл (уменьшите размер куска)")
+        level = 'WARNING'
+    if stats['shared_matrix_objects']:
+        # the whole pipeline is world-space (voxel keys, cut planes, the +Z
+        # projection basis), so one shared mesh can only be cut for ONE
+        # transform - the other users get a grid offset by their own delta
+        msg += (f" | ⚠️ общий меш с разными трансформами, сетка взята по одному "
+                f"объекту: {', '.join(stats['shared_matrix_objects'])}")
+        level = 'WARNING'
+    if skipped_no_faces:
+        msg += f", без фейсов пропущено {skipped_no_faces}"
+    if stats['folds']:
+        msg += (f" | ⚠️ перевёрнутых треугольников {stats['folds']} — "
+                f"уменьшите «Разброс нормалей» или размер куска")
+        level = 'WARNING'
+    if blocked:
+        msg += (f" | ⚠️ пропущены объекты с shape keys (резать нельзя): "
+                f"{', '.join(blocked)}")
+        level = 'WARNING'
+    if linked:
+        msg += (f" | ⚠️ пропущены данные из библиотеки (только чтение): "
+                f"{', '.join(linked)}")
+        level = 'WARNING'
+    if failed:
+        msg += f" | ❌ сбой на объектах: {'; '.join(failed)}"
+        level = 'WARNING'
+    if stats['modifier_objects']:
+        msg += (f" | развёртка по базовому мешу, модификаторы не применены: "
+                f"{', '.join(stats['modifier_objects'])}")
+    if stats['atlas_objects']:
+        msg += f" | ⚠️ перезаписаны UV атласа: {', '.join(stats['atlas_objects'])}"
+        level = 'WARNING'
+    if stats['udim_objects']:
+        msg += (f" | ⚠️ перезаписана развёртка UDIM-объектов: "
+                f"{', '.join(stats['udim_objects'])}")
+        level = 'WARNING'
+    # said out loud on EVERY run: overlapping UVs are legal here (that is the
+    # point — one tile per piece), but they are inside 0..1, so the atlas and
+    # bake guards cannot see them and would happily produce garbage
+    msg += " | куски лежат внахлёст: для запекания и атласа не годится"
+    agr_report(op, level, msg)
+    return True
+
+
+def _organic_cap_error(op, over):
+    agr_report(op, 'ERROR',
+               "Слишком мелкий кусок для: " + ", ".join(over) +
+               f" (> {_ORGANIC_MAX_CUT_LINES} плоскостей реза) — увеличьте "
+               "размер куска: рез каждой плоскостью идёт по всей геометрии, "
+               "и время растёт быстрее их числа")
+
+
+# ============================================================
 # Core: unwrap
 # ============================================================
 
@@ -1121,14 +2042,18 @@ def _do_unwrap(op, context, settings):
         return False
     origin, x_dir, y_dir, cell_u, cell_v = basis
     tol = settings.snap_tolerance
-    surface = settings.projection == 'SURFACE'
+    surface = _surface_mode(settings)
     frames = _make_frames(settings, targets, basis)
+    # plan view: watch for faces the projection collapses (see _TOPZ_FLAT_EPS)
+    plan_normal = x_dir.cross(y_dir) if settings.grid_source == 'TOPZ' else None
 
     total = 0
     oversize = 0
+    vertical = 0
     atlas_objects = []
     udim_objects = []
     for obj, bm, faces in targets:
+        op._mutated = True   # live edit-BMesh: writes start here (see mixin)
         mat = obj.matrix_world
         _note_uv_overwrite(obj, bm, faces, atlas_objects, udim_objects)
         uv_layer = bm.loops.layers.uv.verify()
@@ -1141,6 +2066,13 @@ def _do_unwrap(op, context, settings):
         # oversize counter suggests cutting.
         for f in faces:
             pts = [mat @ v.co for v in f.verts]
+            if plan_normal is not None:
+                fn = Vector((0.0, 0.0, 0.0))
+                for i in range(1, len(pts) - 1):
+                    fn += (pts[i] - pts[0]).cross(pts[i + 1] - pts[0])
+                if (fn.length > 1e-12
+                        and abs(fn.dot(plan_normal)) < _TOPZ_FLAT_EPS * fn.length):
+                    vertical += 1
             if surface:
                 fh, fanchor, fu0 = frames[f]
                 gus = [(fu0 + (p - fanchor).dot(fh)) / cell_u for p in pts]
@@ -1171,7 +2103,10 @@ def _do_unwrap(op, context, settings):
     if oversize:
         msg += (f"; {oversize} фейс(ов) больше одной ячейки — "
                 "примените «Разрезать по сетке»")
-    if udim_objects or atlas_objects or oversize:
+    if vertical:
+        msg += (f"; {vertical} фейс(ов) почти вертикальны — вид сверху "
+                "вырождает их UV (для стен нужна мировая сетка)")
+    if udim_objects or atlas_objects or oversize or vertical:
         agr_report(op, 'WARNING', msg)
     else:
         agr_report(op, 'INFO', msg)
@@ -1191,7 +2126,7 @@ def _do_cut(op, context, settings):
     if basis is None:
         return False
     origin, x_dir, y_dir, cell_u, cell_v = basis
-    surface = settings.projection == 'SURFACE'
+    surface = _surface_mode(settings)
     frames = _make_frames(settings, targets, basis)
 
     # ---- phase 0: plan EVERY object before ANY bisect.  The span/limit
@@ -1250,6 +2185,7 @@ def _do_cut(op, context, settings):
     total_cuts = 0
     total_new = 0
     for obj, bm, faces, u_plan, min_u, max_u, min_v, max_v in plans:
+        op._mutated = True   # live edit-BMesh: bisects start here (see mixin)
         mat = obj.matrix_world
         mat_inv = mat.inverted_safe()
         # world normal -> local plane normal for bisect_plane (transpose,
@@ -1379,7 +2315,7 @@ def _uv_overlay_build(context, settings):
     if basis is None:
         return {"error": "сетка не определена (см. настройки)"}
     origin, x_dir, y_dir, cell_u, cell_v = basis
-    surface = settings.projection == 'SURFACE'
+    surface = _surface_mode(settings)
     frames = _make_frames(settings, targets, basis)
 
     cut_pts = []
@@ -1481,9 +2417,21 @@ def _uv_overlay_build(context, settings):
 
         arrow_s(axis_u_pts, cu_v, y_dir)
         arrow_s(axis_v_pts, cv_v, h_dir)
-    elif centroid_n and normal_sum.length > 1e-9 and gmin_u is not None:
-        mean_n = normal_sum.normalized()
+    elif centroid_n and gmin_u is not None \
+            and (normal_sum.length > 1e-9 or settings.grid_source == 'TOPZ'):
+        # TOPZ needs no mean normal at all — its plane is horizontal by
+        # definition — so it must NOT be gated on one.  The area vectors of a
+        # closed mesh (a cube, a building shell) cancel exactly, and that
+        # used to suppress the entire plan-view preview: lattice, cell
+        # outline and axis arrows, leaving only the orange cut segments.
         centroid /= centroid_n
+        if settings.grid_source == 'TOPZ':
+            # plan view: the lattice lives in a HORIZONTAL plane through the
+            # selection (following the face normal would park a top-down
+            # grid beside a wall instead of cutting through it)
+            mean_n = Vector((0.0, 0.0, 1.0))
+        else:
+            mean_n = normal_sum.normalized()
         # draw the lattice in the dominant surface plane (the origin may sit
         # off that plane, e.g. WORLD origin (0,0,0) for a wall at y=5)
         o_draw = origin + mean_n * ((centroid - origin).dot(mean_n) + lift_len)
@@ -1701,10 +2649,20 @@ class _AGR_UVGridPollMixin:
     def execute(self, context):
         # Right after an undo the edit-mesh BMesh handed out by
         # bmesh.from_edit_mesh can still expose dead elements — turn the
-        # crash into a friendly "run it again" instead of a traceback
+        # crash into a friendly "run it again" instead of a traceback.
+        # `_mutated` is raised by the worker functions at their FIRST write
+        # into the live edit-BMesh: after that point {'CANCELLED'} would
+        # push no undo step and weld those writes into the PREVIOUS undo
+        # entry, so a late ReferenceError must finish instead.
+        self._mutated = False
         try:
             return self._execute(context)
         except ReferenceError:
+            if getattr(self, "_mutated", False):
+                agr_report(self, 'WARNING',
+                           "Данные меша устарели посреди операции — часть "
+                           "изменений уже в меше, отменить их можно через Ctrl+Z")
+                return {'FINISHED'}
             agr_report(self, 'ERROR',
                        "Данные меша устарели (например, после Undo) — "
                        "запустите оператор ещё раз")
@@ -2018,6 +2976,7 @@ class AGR_OT_UVUnwrapStubSelected(_AGR_UVGridPollMixin, Operator):
             if not faces:
                 continue
             selected_any = True
+            self._mutated = True   # live edit-BMesh: writes start here (see mixin)
             uv_layer = bm.loops.layers.uv.active
             if uv_layer is None:
                 uv_layer = bm.loops.layers.uv.new("UVMap")
@@ -2077,6 +3036,197 @@ class AGR_OT_UVUnwrapStubSelected(_AGR_UVGridPollMixin, Operator):
         return {'FINISHED'}
 
 
+class AGR_OT_UVOrganicUnwrap(Operator):
+    """Cut organic meshes by the world 3D grid, one UV square per piece"""
+    bl_idname = "agr.uv_organic_unwrap"
+    bl_label = "Нарезать органику"
+    bl_description = ("Нарезать выбранные меши мировой 3D-сеткой и развернуть "
+                      "КАЖДЫЙ кусок на свой UV-квадрат 0..1: кусок проецируется "
+                      "по своей нормали, поэтому квадраты остаются квадратами и "
+                      "на сложной органике (скульпт, дерево, Сузанна). Куски "
+                      "лежат в одном квадрате внахлёст — тайловая текстура "
+                      "показывает по одному чистому тайлу на кусок; для "
+                      "запекания и атласа такая развёртка НЕ годится")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        if context.mode != 'OBJECT':
+            cls.poll_message_set("Работает в объектном режиме")
+            return False
+        if any(o.type == 'MESH' for o in context.selected_objects):
+            return True
+        if context.active_object is not None and context.active_object.type == 'MESH':
+            return True
+        cls.poll_message_set("Выберите MESH-объекты")
+        return False
+
+    def execute(self, context):
+        settings = _get_settings(context)
+        if settings is None:
+            return {'CANCELLED'}
+        params = _organic_params(settings)
+
+        objs = [o for o in context.selected_objects if o.type == 'MESH']
+        if not objs and context.active_object is not None \
+                and context.active_object.type == 'MESH':
+            objs = [context.active_object]
+
+        stats = _organic_stats()
+        # library data is READ-ONLY by contract, but bmesh writes it anyway:
+        # bm.to_mesh() on a linked datablock does not raise, it mutates the
+        # library mesh in place (verified on 5.2) — an edit nobody can save
+        # that hits every user of that library
+        linked = [o.name for o in objs
+                  if o.library is not None or o.data.library is not None]
+        objs = [o for o in objs
+                if o.library is None and o.data.library is None]
+
+        # one pass per MESH datablock: linked duplicates share the mesh, a
+        # second pass would cut the same geometry twice.  The catch is that
+        # this pipeline is WORLD-space, so the pass runs with ONE object's
+        # matrix - a shared mesh whose users sit at different transforms
+        # cannot be right for all of them, and that must be said out loud
+        # instead of silently favouring whoever came first in the selection.
+        seen_data, unique = {}, []
+        for o in objs:
+            first = seen_data.get(o.data)
+            if first is not None:
+                if not _matrix_close(first.matrix_world, o.matrix_world):
+                    stats['shared_matrix_objects'].append(o.name)
+                continue
+            seen_data[o.data] = o
+            unique.append(o)
+
+        prepared, blocked, over, failed = [], [], [], []
+        skipped_no_faces = 0
+        try:
+            for obj in unique:
+                mesh = obj.data
+                if mesh.shape_keys is not None:
+                    # bmesh.from_mesh() does not read shape keys, so writing
+                    # the mesh back would drop them — and that holds even
+                    # with the cut switched off.  Edit Mode («Нарезать
+                    # выделенное») works on the live edit-BMesh and carries
+                    # them correctly, so send the user there instead.
+                    blocked.append(obj.name)
+                    continue
+                bm = bmesh.new()
+                bm.from_mesh(mesh)
+                faces = [f for f in bm.faces if not f.hide]
+                if not faces:
+                    bm.free()
+                    skipped_no_faces += 1
+                    continue
+                plan = (_organic_plan_cut(obj.matrix_world, faces, params['cell'])
+                        if params['cut'] else [])
+                if plan is None:
+                    over.append(obj.name)
+                    bm.free()
+                    continue
+                if obj.modifiers:
+                    stats['modifier_objects'].append(obj.name)
+                prepared.append((obj, bm, faces, plan))
+
+            if over:
+                # nothing has been written yet — abort the WHOLE operator
+                _organic_cap_error(self, over)
+                return {'CANCELLED'}
+            if not prepared:
+                msg = "Нет мешей для нарезки"
+                if blocked:
+                    msg += f" (пропущены объекты с shape keys: {', '.join(blocked)})"
+                if linked:
+                    msg += f" (данные из библиотеки: {', '.join(linked)})"
+                agr_report(self, 'ERROR', msg)
+                return {'CANCELLED'}
+
+            for obj, bm, faces, plan in prepared:
+                # per-object isolation: once ANY mesh has been written the
+                # operator must still finish, because a {'CANCELLED'} return
+                # pushes no undo step and would weld that write into the
+                # PREVIOUS undo entry, out of Ctrl+Z's reach
+                try:
+                    if _organic_apply(obj, bm, faces, plan, params, stats):
+                        bm.to_mesh(obj.data)
+                        obj.data.update()
+                except Exception as exc:
+                    failed.append(f"{obj.name}: {exc}")
+        finally:
+            for _obj, bm, _faces, _plan in prepared:
+                bm.free()
+
+        if not _organic_report(self, stats, params, blocked, skipped_no_faces,
+                               linked=linked, failed=failed):
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class AGR_OT_UVOrganicUnwrapSelected(_AGR_UVGridPollMixin, Operator):
+    """Cut the target faces by the world 3D grid, one UV square per piece"""
+    bl_idname = "agr.uv_organic_unwrap_selected"
+    bl_label = "Нарезать выделенное"
+    bl_description = ("То же самое в режиме редактирования: нарезать и "
+                      "развернуть выделенные фейсы (или весь меш — по "
+                      "переключателю «Область»). Единственный путь для мешей "
+                      "с shape keys")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def _execute(self, context):
+        settings = _get_settings(context)
+        if settings is None:
+            return {'CANCELLED'}
+        params = _organic_params(settings)
+        targets = _collect_targets(context, settings)
+        if not targets:
+            _report_no_targets(self, settings)
+            return {'CANCELLED'}
+
+        stats = _organic_stats()
+        plans, over = [], []
+        for obj, bm, faces in targets:
+            plan = (_organic_plan_cut(obj.matrix_world, faces, params['cell'])
+                    if params['cut'] else [])
+            if plan is None:
+                over.append(obj.name)
+                continue
+            plans.append((obj, bm, faces, plan))
+        if over:
+            # plan EVERY object before ANY bisect: a cancelled operator
+            # pushes no undo step, so a partial cut would be unrecoverable
+            _organic_cap_error(self, over)
+            return {'CANCELLED'}
+
+        reselect = settings.selection_mode == 'SELECTED'
+        failed = []
+        for obj, bm, faces, plan in plans:
+            # per-object isolation, same as the Object path: this is the
+            # LIVE edit-BMesh, so once ANY object has been cut the operator
+            # must still finish — an uncaught exception here would skip
+            # FINISHED, push no undo step and weld the cut into the
+            # PREVIOUS undo entry, out of Ctrl+Z's reach (reproduced with
+            # two objects in multi-object Edit Mode)
+            self._mutated = True
+            try:
+                _organic_apply(obj, bm, faces, plan, params, stats,
+                               reselect=reselect)
+                bmesh.update_edit_mesh(obj.data, loop_triangles=True,
+                                       destructive=bool(plan))
+            except Exception as exc:
+                failed.append(f"{obj.name}: {exc}")
+
+        # committed=True: bmesh.from_edit_mesh hands out THE edit BMesh, not
+        # a copy, so the bisect above is already in the mesh — it survives
+        # leaving Edit Mode even with update_edit_mesh never called (that
+        # call only refreshes the tessellation).  There is therefore no
+        # "do not commit" option here, and cancelling would leave the cut
+        # un-undoable; _organic_report finishes with a WARNING instead
+        if not _organic_report(self, stats, params, committed=True,
+                               failed=failed):
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
 class AGR_PT_UVPanel(Panel):
     """AGR UV panel in the AGR Tools sidebar"""
     bl_label = "AGR UV"
@@ -2108,12 +3258,16 @@ class AGR_PT_UVPanel(Panel):
             sub.enabled = s.has_grid
             sub.operator("agr.uv_grid_clear", text="", icon='X')
         else:
+            topz_src = s.grid_source == 'TOPZ'
             row = col.row(align=True)
-            row.prop(s, "world_cell_u", text="U")
-            row.prop(s, "world_cell_v", text="V")
+            row.prop(s, "world_cell_u", text="X" if topz_src else "U")
+            row.prop(s, "world_cell_v", text="Y" if topz_src else "V")
             col.prop(s, "world_angle", text="Поворот")
-            row = col.row(align=True)
-            row.prop(s, "origin_mode", expand=True)
+            if s.grid_source == 'TOPZ':
+                col.label(text="Вид сверху: U=+X, V=+Y, начало (0,0,0)", icon='AXIS_TOP')
+            else:
+                row = col.row(align=True)
+                row.prop(s, "origin_mode", expand=True)
 
         if context.mode != 'EDIT_MESH':
             layout.label(text="Инструменты работают в Edit Mode", icon='INFO')
@@ -2133,13 +3287,24 @@ class AGR_PT_UVPanel(Panel):
 
         layout.separator()
         col = layout.column(align=True)
+        topz = s.grid_source == 'TOPZ'
+        # plan view ignores both of these — grey them out instead of hiding
+        # them so the panel does not jump when the source changes
         row = col.row(align=True)
+        row.enabled = not topz
         row.prop(s, "projection", expand=True)
         row = col.row(align=True)
         row.prop(s, "selection_mode", expand=True)
-        col.prop(s, "auto_orient")
+        sub = col.row(align=True)
+        sub.enabled = not topz
+        sub.prop(s, "auto_orient")
         row = col.row(align=True)
-        row.prop(s, "swap_axes", toggle=True)
+        # swap flips handedness and TOPZ has no auto-orient to compensate -
+        # _resolve_basis ignores it there, so grey it out (flips stay: an
+        # explicit mirror is intentional under every source)
+        sub = row.row(align=True)
+        sub.enabled = not topz
+        sub.prop(s, "swap_axes", toggle=True)
         row.prop(s, "flip_u", toggle=True)
         row.prop(s, "flip_v", toggle=True)
         row = col.row(align=True)
@@ -2181,6 +3346,46 @@ class AGR_PT_UVStubPanel(Panel):
             col.label(text="«Выделенные фейсы» — в Edit Mode", icon='INFO')
 
 
+class AGR_PT_UVOrganicPanel(Panel):
+    """Organic (voxel-piece) unwrap tools (sub-panel of AGR UV)"""
+    bl_label = "Органика"
+    bl_idname = "AGR_PT_uv_organic_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'AGR Tools'
+    bl_parent_id = "AGR_PT_uv_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        s = _get_settings(context)
+        if s is None:
+            return
+        col = layout.column(align=True)
+        col.prop(s, "organic_cell", text="Кусок")
+        col.prop(s, "organic_cut", text="Резать меш")
+        col.prop(s, "organic_angle", text="Разброс нормалей")
+        col.prop(s, "organic_merge", text="Слить мелкие")
+        col.prop(s, "organic_margin", text="Отступ")
+        row = layout.row(align=True)
+        row.prop(s, "organic_fill", expand=True)
+        row = layout.row(align=True)
+        row.prop(s, "organic_align", expand=True)
+        # scale_y belongs to the LAYOUT, not to the item added after it —
+        # re-assigning it mid-column would resize the whole column (both
+        # buttons AND the labels below).  Emphasis therefore needs its own
+        # column, exactly like the stacked groups in ui.py:293/297/302
+        col = layout.column(align=True)
+        col.scale_y = 1.3
+        col.operator("agr.uv_organic_unwrap", icon='MOD_REMESH')
+
+        col = layout.column(align=True)
+        col.operator("agr.uv_organic_unwrap_selected", icon='UV_FACESEL')
+        col.label(text="Куски внахлёст: не для запекания", icon='INFO')
+        if context.mode == 'EDIT_MESH':
+            col.label(text="«Область» берётся из настроек выше", icon='INFO')
+
+
 # ============================================================
 # Registration
 # ============================================================
@@ -2194,8 +3399,11 @@ classes = (
     AGR_OT_UVGridCutUnwrap,
     AGR_OT_UVUnwrapStub,
     AGR_OT_UVUnwrapStubSelected,
+    AGR_OT_UVOrganicUnwrap,
+    AGR_OT_UVOrganicUnwrapSelected,
     AGR_PT_UVPanel,
     AGR_PT_UVStubPanel,
+    AGR_PT_UVOrganicPanel,
 )
 
 

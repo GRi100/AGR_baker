@@ -2003,6 +2003,509 @@ check("stranger: stranger itself untouched",
       and abs(max(v.co.z for v in stranger_mesh.vertices) - 2.0) < 1e-5)
 
 # ---------------------------------------------------------------------------
+# Mirror integrity: the panel indicator, the refresh operator and the
+# save-time autosync.  Background: the memory has TWO carriers and only the
+# color mirror crosses FBX.  The mirror is one contiguous run from loop 0,
+# so deleting the faces that sit at the head of the mesh decapitates it -
+# while the idprop (and therefore the whole panel) keeps looking healthy.
+import bmesh as _bmesh
+
+
+def delete_face(obj, index):
+    """Delete ONE polygon the way a user would (mesh edit, no AGR op)."""
+    bm = _bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    _bmesh.ops.delete(bm, geom=[bm.faces[index]], context='FACES_ONLY')
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+    bpy.context.view_layer.update()
+
+
+def build_trio(names=("A1", "A2", "B1")):
+    mesh_a = make_cube_mesh("MeshA")
+    mesh_b = make_cube_mesh("MeshB")
+    objs = [add_obj(names[0], mesh_a, TRS((0, 0, 0))),
+            add_obj(names[1], mesh_a, TRS((3, 0, 0))),
+            add_obj(names[2], mesh_b, TRS((0, 5, 0)))]
+    select_only(objs, objs[0])
+    bpy.ops.agr.link_join()
+    return bpy.data.objects[names[0]]
+
+
+def fbx_roundtrip(cont, tag):
+    """Plain DEFAULT export/import - no custom properties, so the color
+    mirror is the only carrier (exactly the user's pipeline)."""
+    path = os.path.join(bpy.app.tempdir, f"agr_link_{tag}.fbx")
+    select_only([cont], cont)
+    bpy.ops.export_scene.fbx(filepath=path, use_selection=True)
+    reset_scene()
+    bpy.ops.import_scene.fbx(filepath=path)
+    return next((o for o in bpy.data.objects
+                 if o.type == 'MESH' and linkmod.is_container(o)), None)
+
+
+print("\n=== 61. MIRROR STATE: head-of-mesh edit decapitates the mirror ===")
+reset_scene()
+cont = build_trio()
+check("mirror: OK right after join", linkmod._mirror_state(cont) == linkmod.MIRROR_OK,
+      linkmod._mirror_state(cont))
+delete_face(cont, 0)                       # the very first face = first loops
+check("mirror: BROKEN after deleting the first face",
+      linkmod._mirror_state(cont) == linkmod.MIRROR_BROKEN, linkmod._mirror_state(cont))
+check("mirror: idprop still healthy (why nobody notices)",
+      linkmod.is_container(cont) and linkmod.read_table(cont) is not None)
+lost = fbx_roundtrip(cont, "broken")
+check("mirror: broken mirror does NOT survive FBX", lost is None)
+
+print("\n=== 62. MIRROR STATE: refresh repairs it, FBX then carries memory ===")
+reset_scene()
+cont = build_trio()
+delete_face(cont, 0)
+select_only([cont], cont)
+check("repair: refresh FINISHED", bpy.ops.agr.link_refresh(scope='ACTIVE') == {'FINISHED'},
+      status())
+check("repair: mirror OK again", linkmod._mirror_state(cont) == linkmod.MIRROR_OK,
+      linkmod._mirror_state(cont))
+cont2 = fbx_roundtrip(cont, "repaired")
+check("repair: container recognised after FBX", cont2 is not None)
+if cont2 is not None:
+    select_only([cont2], cont2)
+    check("repair: still disassembles", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+    check("repair: originals back", {"A1", "A2", "B1"} <= {o.name for o in bpy.data.objects},
+          str(sorted(o.name for o in bpy.data.objects)))
+
+print("\n=== 63. MIRROR STATE: tail edit reports STALE, not BROKEN ===")
+reset_scene()
+cont = build_trio()
+delete_face(cont, len(cont.data.polygons) - 1)   # header intact, loop count changed
+check("stale: verdict STALE", linkmod._mirror_state(cont) == linkmod.MIRROR_STALE,
+      linkmod._mirror_state(cont))
+select_only([cont], cont)
+bpy.ops.agr.link_refresh(scope='ACTIVE')
+check("stale: OK after refresh", linkmod._mirror_state(cont) == linkmod.MIRROR_OK)
+check("stale: plain mesh has no verdict",
+      linkmod._mirror_state(add_obj("Plain", make_cube_mesh("MeshP"))) == linkmod.MIRROR_NONE)
+
+print("\n=== 64. REFRESH ALL: every container in the scene at once ===")
+reset_scene()
+c1 = build_trio(("A1", "A2", "B1"))
+c2 = build_trio(("C1", "C2", "D1"))
+delete_face(c1, 0)
+delete_face(c2, 0)
+check("all: both broken before", linkmod._mirror_state(c1) == linkmod.MIRROR_BROKEN
+      and linkmod._mirror_state(c2) == linkmod.MIRROR_BROKEN)
+check("all: FINISHED", bpy.ops.agr.link_refresh(scope='ALL') == {'FINISHED'}, status())
+check("all: both repaired", linkmod._mirror_state(c1) == linkmod.MIRROR_OK
+      and linkmod._mirror_state(c2) == linkmod.MIRROR_OK)
+check("all: report counts both", "2 из 2" in status(), status())
+reset_scene()
+check("all: empty scene is CANCELLED, not an error",
+      expect_cancel(lambda: bpy.ops.agr.link_refresh(scope='ALL')))
+
+print("\n=== 65. AUTOSYNC: save repacks whatever the mesh says is stale ===")
+# No bookkeeping is consulted: the verdict is read off the mirror's own
+# frame header, so the autosync cannot be blinded by a missing mark.
+reset_scene()
+cont = build_trio()
+delete_face(cont, 0)
+check("autosync: broken before save", linkmod._mirror_state(cont) == linkmod.MIRROR_BROKEN)
+save_path = os.path.join(bpy.app.tempdir, "agr_link_autosync.blend")
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+check("autosync: repacked by save_pre", linkmod._mirror_state(cont) == linkmod.MIRROR_OK,
+      linkmod._mirror_state(cont))
+cont2 = fbx_roundtrip(cont, "autosync")
+check("autosync: memory now crosses FBX", cont2 is not None)
+
+print("--- 65b. A container broken with NO mark at all is still repaired ---")
+# The old design only repacked what its depsgraph handler had marked, so an
+# undo, a dev reload or a file that arrived already broken went unnoticed.
+reset_scene()
+cont = build_trio()
+linkmod._NO_AUTOSYNC.clear()
+linkmod._remove_color_mirror(cont.data)      # nothing marks this
+check("nomark: mirror gone", linkmod._mirror_state(cont) == linkmod.MIRROR_NONE,
+      linkmod._mirror_state(cont))
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+check("nomark: repacked anyway", linkmod._mirror_state(cont) == linkmod.MIRROR_OK,
+      linkmod._mirror_state(cont))
+
+print("--- 65c. A second save is a no-op (the repack cannot re-dirty itself) ---")
+before = len(cont.data.loops)
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+check("noop: still OK", linkmod._mirror_state(cont) == linkmod.MIRROR_OK)
+check("noop: mesh untouched", len(cont.data.loops) == before)
+
+print("\n=== 66. AUTOSYNC: the switch really switches it off ===")
+reset_scene()
+cont = build_trio()
+bpy.context.scene.agr_link_autosync = False
+delete_face(cont, 0)
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+check("off: mirror left broken", linkmod._mirror_state(cont) == linkmod.MIRROR_BROKEN,
+      linkmod._mirror_state(cont))
+bpy.context.scene.agr_link_autosync = True
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+check("off: switching it back on catches up without any mark",
+      linkmod._mirror_state(cont) == linkmod.MIRROR_OK, linkmod._mirror_state(cont))
+
+print("\n=== 67. MIRROR STATE is never cached: an undone repair shows through ===")
+# The verdict used to be cached on (mesh name, loop count, idprop length) -
+# none of which changes when only the mirror is rewound, so the panel kept
+# showing a green all-clear over a mirror that was gone.
+reset_scene()
+cont = build_trio()
+check("uncached: OK after join", linkmod._mirror_state(cont) == linkmod.MIRROR_OK)
+fp_before = (cont.data.name, len(cont.data.loops), len(cont.get(linkmod.PROP_KEY) or ""))
+linkmod._remove_color_mirror(cont.data)      # what an undo of the repair leaves
+fp_after = (cont.data.name, len(cont.data.loops), len(cont.get(linkmod.PROP_KEY) or ""))
+check("uncached: the old fingerprint is blind to it", fp_before == fp_after, str(fp_after))
+check("uncached: verdict follows the DATA", linkmod._mirror_state(cont) == linkmod.MIRROR_NONE,
+      linkmod._mirror_state(cont))
+
+print("\n=== 68. AUTOSYNC refuses to absorb a plain Ctrl+J behind the user's back ===")
+# A repack writes ONE blob over the whole mesh, so absorbing first is the
+# only way to keep a merged container's memory - and absorbing is a
+# structural, non-undoable change that must stay behind the explicit button.
+reset_scene()
+c1 = build_trio(("A1", "A2", "B1"))
+c2 = build_trio(("C1", "C2", "D1"))
+select_only([c2, c1], c1)
+bpy.ops.object.join()                        # PLAIN Blender join
+linkmod._NO_AUTOSYNC.clear()
+merged_table, extra = linkmod._peek_merged(c1)
+check("windows: the merged view sees both tables", extra >= 1, f"extra={extra}")
+n_merged = len(merged_table.get("instances", {}))
+# the join alone already makes the mirror non-OK (the frame at loop 0 was
+# written for the pre-join loop count), so the autosync WANTS this container
+check("windows: mirror is not OK after the plain join",
+      linkmod._mirror_state(c1) != linkmod.MIRROR_OK, linkmod._mirror_state(c1))
+check("windows: foreign windows detected", linkmod._has_foreign_windows(c1.data))
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+check("windows: container was SKIPPED, not silently absorbed",
+      c1.name in linkmod._NO_AUTOSYNC and linkmod._NO_AUTOSYNC[c1.name][1] == "windows",
+      str(linkmod._NO_AUTOSYNC.get(c1.name)))
+still, extra2 = linkmod._peek_merged(c1)
+check("windows: merged memory intact after the save",
+      len(still.get("instances", {})) == n_merged, f"{len(still.get('instances', {}))}/{n_merged}")
+select_only([c1], c1)
+bpy.ops.agr.link_refresh(scope='ACTIVE')     # the explicit button DOES absorb
+check("windows: the button absorbs and repairs",
+      linkmod._mirror_state(c1) == linkmod.MIRROR_OK, linkmod._mirror_state(c1))
+check("windows: skip mark cleared by the explicit action",
+      c1.name not in linkmod._NO_AUTOSYNC)
+
+print("\n=== 70. Reference vote tolerates the quantisation delta ===")
+# The ballot used to be an EXACT byte hash of the coordinates while every
+# other comparison in the group logic honours extra_atol.  After a plain
+# Ctrl+J of two containers plus an FBX roundtrip the stored originals come
+# back QUANTISED, each window against its own co_min/co_size, so honest
+# copies of one group differ by ~co_quant/2 - they each landed in their own
+# bucket, the majority evaporated, and a repainted minority took the group.
+import numpy as np  # noqa: E402  (bundled with Blender, used by the gate check)
+
+reset_scene()
+mat_ok = bpy.data.materials.new("M_Ok")
+mat_bad = bpy.data.materials.new("M_Bad")
+
+
+def _vote_member(name, delta, mat, offset):
+    """One intact chunk: same topology, coords off by `delta`, paint `mat`."""
+    me = make_cube_mesh("VMesh_" + name)
+    me.materials.append(mat)
+    for v in me.vertices:
+        v.co.x += delta
+    obj = add_obj(name, me, TRS((offset, 0, 0)))
+    return obj, obj.matrix_world.copy(), {"iid": 0, "intact": True,
+                                          "fitted": True, "converged": True,
+                                          "pts": None}
+
+
+QUANT = 0.0152          # a co_quant measured on a real 500 m-extent window
+DELTA = 2.67e-4         # the inter-window divergence measured with it
+# healthy majority (3), split across windows; repainted minority (2) in one
+members = [_vote_member("A1", 0.0, mat_ok, 0),
+           _vote_member("P1", 0.0, mat_bad, 3),
+           _vote_member("P2", 0.0, mat_bad, 6),
+           _vote_member("A2", DELTA, mat_ok, 9),
+           _vote_member("A3", DELTA, mat_ok, 12)]
+
+check("vote: the integer pre-key ignores the quantisation delta",
+      linkmod._ballot_key(members[0][0].data) == linkmod._ballot_key(members[3][0].data))
+check("vote: the pre-key still separates a repaint",
+      linkmod._ballot_key(members[0][0].data) != linkmod._ballot_key(members[1][0].data))
+rep = linkmod._vote_reference(members, QUANT)
+check("vote: the healthy majority wins", rep is not None and rep.name == "A1",
+      rep.name if rep else "None")
+# and this is exactly what the old zero-tolerance ballot could not do:
+# with no budget the three healthy copies split 1+2 and the repaint's 2 win
+rep0 = linkmod._vote_reference(members, 0.0)
+check("vote: with NO tolerance the repainted minority would have taken it",
+      rep0 is not None and rep0.name == "P1", rep0.name if rep0 else "None")
+
+print("--- 70b. The last-resort vertex gate samples ACROSS members ---")
+# 64 slots filled from one concatenated array meant the first chunk alone
+# consumed them all, so a stranger that merely contained THAT chunk's
+# points walked in and its materials/UV overwrote the whole group.
+reset_scene()
+stranger = make_cube_mesh("Stranger")
+near = np.array([[v.co.x, v.co.y, v.co.z] for v in stranger.vertices],
+                dtype=np.float32)
+far = near + np.float32(5.0)          # points the stranger does NOT contain
+head = [(None, None, {"pts": near[:1].repeat(32, axis=0)})]
+tail = [(None, None, {"pts": far[:1].repeat(32, axis=0)})]
+check("gate: a stranger missing a LATER member's points is rejected",
+      not linkmod._alive_contains_stored_points(stranger, head + tail, 0.0))
+check("gate: a candidate containing every member's points passes",
+      linkmod._alive_contains_stored_points(stranger, head + head, 0.0))
+check("gate: no stored points at all => REFUSE, not a counts-only pass",
+      not linkmod._alive_contains_stored_points(
+          stranger, [(None, None, {"pts": None})], 0.0))
+
+print("--- 70c. The gate covers members the old stride never sampled ---")
+# Two members of 32 points fit the old 64-slot concatenated sample exactly,
+# so the pair-check above stayed green on the pre-fix code.  THREE members
+# pin the budget bug (the first two ate all 64 slots), and >64 members pin
+# the stride bug: `pts[::len(pts) // limit][:limit]` degenerated to the
+# FIRST 64 members whenever len // 64 == 1, so a stranger holding only the
+# leading chunks' points walked in.
+head3 = [(None, None, {"pts": near[:1].repeat(32, axis=0)})] * 2
+tail3 = [(None, None, {"pts": far[:1].repeat(32, axis=0)})]
+check("gate: three members - the LAST one's points are still checked",
+      not linkmod._alive_contains_stored_points(stranger, head3 + tail3, 0.0))
+many = ([(None, None, {"pts": near[:1]})] * 100
+        + [(None, None, {"pts": far[:1]})])
+check("gate: member 101 of 101 is still sampled (linspace, not stride)",
+      not linkmod._alive_contains_stored_points(stranger, many, 0.0))
+
+print("\n=== 69. Saving in EDIT MODE must not destroy a healthy mirror ===")
+# The repack used to run blind on a mesh whose attribute arrays are empty
+# while an edit BMesh is open: foreach_get raised, the except wiped the
+# mirror, and the handler still reported success.
+reset_scene()
+cont = build_trio()
+check("editmode: healthy before", linkmod._mirror_state(cont) == linkmod.MIRROR_OK)
+bpy.context.view_layer.objects.active = cont
+bpy.ops.object.mode_set(mode='EDIT')
+bm_live = _bmesh.from_edit_mesh(cont.data)
+bm_live.verts.ensure_lookup_table()
+bm_live.verts[0].co.x += 0.25                # a plain vertex move
+_bmesh.update_edit_mesh(cont.data)
+check("editmode: verdict is UNKNOWN, not a false alarm",
+      linkmod._mirror_state(cont) == linkmod.MIRROR_UNKNOWN, linkmod._mirror_state(cont))
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+bpy.ops.object.mode_set(mode='OBJECT')
+check("editmode: mirror SURVIVED the save", linkmod._mirror_state(cont) == linkmod.MIRROR_OK,
+      linkmod._mirror_state(cont))
+check("editmode: memory still crosses FBX", fbx_roundtrip(cont, "editmode") is not None)
+
+print("\n=== 71. MIRROR STATE: a payload that no longer FITS is BROKEN ===")
+# The verdict used to rest on the frame header alone, so a mirror that lost
+# one of its layers - deleted by hand in the Color Attributes list, or
+# dropped by an exporter with a vertex-color cap - kept a valid header and
+# an unchanged loop count and was reported OK.  decode_colors could only
+# ever fail on it: the panel stayed silent and the FBX shipped memory
+# nobody can read.
+reset_scene()
+cont = build_trio()
+layers = [a.name for a in cont.data.attributes
+          if a.name.startswith(linkmod.TABLE_COL_PREFIX)]
+check("capacity: the mirror really spans several layers", len(layers) >= 2,
+      str(layers))
+check("capacity: healthy before", linkmod._mirror_state(cont) == linkmod.MIRROR_OK)
+loops_before = len(cont.data.loops)
+cont.data.attributes.remove(cont.data.attributes[sorted(layers)[-1]])
+check("capacity: loop count is untouched (the old test would pass)",
+      len(cont.data.loops) == loops_before)
+check("capacity: verdict is BROKEN, not OK",
+      linkmod._mirror_state(cont) == linkmod.MIRROR_BROKEN, linkmod._mirror_state(cont))
+check("capacity: and the blob really is undecodable",
+      linkmod._LINK_STORE.decode_colors(cont.data) is None)
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+check("capacity: the autosync repairs it on save",
+      linkmod._mirror_state(cont) == linkmod.MIRROR_OK, linkmod._mirror_state(cont))
+
+print("\n=== 72. A container without co/orig attrs KEEPS its mirror ===")
+# _pack_tracking_to_colors needs three attributes; on a miss it used to
+# delete the mirror - which may be the last surviving copy of the original
+# coordinates.  The save-time autosync reached that path on its own.
+reset_scene()
+cont = build_trio()
+for name in (linkmod.CO_ATTR, linkmod.ORIG_ATTR):
+    cont.data.attributes.remove(cont.data.attributes[name])
+delete_face(cont, len(cont.data.polygons) - 1)     # make the autosync want it
+before = sorted(a.name for a in cont.data.attributes
+                if a.name.startswith(linkmod.TABLE_COL_PREFIX))
+check("nocoords: mirror present before the save", bool(before), str(before))
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+after = sorted(a.name for a in cont.data.attributes
+               if a.name.startswith(linkmod.TABLE_COL_PREFIX))
+check("nocoords: the autosync did NOT destroy the mirror", after == before,
+      f"{before} -> {after}")
+check("nocoords: the table still reads", linkmod.read_table(cont) is not None)
+
+print("\n=== 73. Merged into a PLAIN mesh: windows, not a false alarm ===")
+# The container's window survives at a non-zero loop offset and a default
+# FBX carries it (test 39), but peek_frame_header only looks at loop 0 - so
+# the panel printed a red "Зеркало разрушено" over a perfectly exportable
+# container, right above its own "влито контейнеров" line.
+reset_scene()
+cont = build_trio()
+plain = add_obj("Plain", make_cube_mesh("MeshPlain"), T(0, -6, 0))
+select_only([cont, plain], plain)              # the PLAIN mesh is active
+bpy.ops.object.join()
+check("plainjoin: the table is still readable through the window",
+      linkmod._peek_merged(plain)[0] is not None)
+check("plainjoin: verdict is WINDOWS, not BROKEN",
+      linkmod._mirror_state(plain) == linkmod.MIRROR_WINDOWS,
+      linkmod._mirror_state(plain))
+check("plainjoin: and it is still not OK (absorb is pending)",
+      linkmod._mirror_state(plain) != linkmod.MIRROR_OK)
+
+print("\n=== 74. link_refresh: a run that repacked NOTHING cancels ===")
+# scope='ALL' used to return FINISHED even when every single container was
+# skipped - an UNDO-flagged operator pushing an empty undo step and an "✅"
+# over "память обновлена у 0 из N".  The single-target path always got this
+# right; the batch path now agrees with it.
+reset_scene()
+c1 = build_trio(("A1", "A2", "B1"))
+c2 = build_trio(("C1", "C2", "D1"))
+for cont in (c1, c2):
+    # idprop stays (so it still counts as a container) but nothing is left
+    # to repack FROM: no tracking attrs and no mirror to rebuild them
+    linkmod._remove_tracking_attrs(cont.data)
+check("refresh-all: both are still recognised as containers",
+      linkmod._has_link_data(c1) and linkmod._has_link_data(c2))
+check("refresh-all: every container skipped => CANCELLED",
+      expect_cancel(lambda: bpy.ops.agr.link_refresh(scope='ALL')))
+check("refresh-all: the report says 0 of 2", "0 из 2" in status(), status())
+check("refresh-all: nothing was mutated", linkmod.read_table(c1) is not None
+      and linkmod.read_table(c2) is not None)
+
+print("\n=== 75. MIRROR STATE: deleting AGR_Link_CO/ID is BROKEN, not OK ===")
+# The verdict checked only the AGR_Link_T* table layers; the two tracking
+# layers have names outside the "<prefix>N" filter, so a user deleting one
+# in the Color Attributes list kept a green panel while the import path
+# could only ever fail with "нет атрибута agr_link_id".
+reset_scene()
+cont = build_trio()
+check("colayers: healthy before", linkmod._mirror_state(cont) == linkmod.MIRROR_OK)
+cont.data.attributes.remove(cont.data.attributes[linkmod.COL_CO])
+check("colayers: verdict is BROKEN, not OK",
+      linkmod._mirror_state(cont) == linkmod.MIRROR_BROKEN,
+      linkmod._mirror_state(cont))
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+check("colayers: the autosync rebuilds the layer on save",
+      linkmod._mirror_state(cont) == linkmod.MIRROR_OK
+      and cont.data.attributes.get(linkmod.COL_CO) is not None,
+      linkmod._mirror_state(cont))
+
+print("\n=== 76. MIRROR STATE: a foreign FLOAT '<prefix>N' cannot fake capacity ===")
+# frame_capacity counts only layers decode can read: a FLOAT attribute that
+# merely borrowed the name used to inflate a name-only count and re-create
+# the very false-OK the capacity gate was written to kill.
+reset_scene()
+cont = build_trio()
+layers = sorted(a.name for a in cont.data.attributes
+                if a.name.startswith(linkmod.TABLE_COL_PREFIX))
+# drop a real layer, then plant an impostor so the NAME count stays intact
+cont.data.attributes.remove(cont.data.attributes[layers[-1]])
+cont.data.attributes.new(layers[-1], 'FLOAT', 'POINT')
+check("impostor: verdict is BROKEN, not OK",
+      linkmod._mirror_state(cont) == linkmod.MIRROR_BROKEN,
+      linkmod._mirror_state(cont))
+check("impostor: the blob really is undecodable",
+      linkmod._LINK_STORE.decode_colors(cont.data) is None)
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+check("impostor: the autosync repairs it on save",
+      linkmod._mirror_state(cont) == linkmod.MIRROR_OK, linkmod._mirror_state(cont))
+
+print("\n=== 77. Same-loop-count corruption: caught by the save-time CRC ===")
+# Sort Elements or "delete a quad + build another" keeps the loop count, so
+# the header probe stays OK over a CRC-dead payload - the .blend looks
+# healthy while the FBX ships no memory.  The deep byte check runs once per
+# save and repacks exactly these.
+reset_scene()
+cont = build_trio()
+check("crc: healthy before", linkmod._mirror_state(cont) == linkmod.MIRROR_OK)
+t0 = cont.data.attributes[linkmod.TABLE_COL_PREFIX + "0"]
+n0 = len(t0.data)
+mid = n0 // 2
+for i in range(mid, min(mid + 8, n0)):
+    t0.data[i].color_srgb = (0.5, 0.5, 0.5, 0.5)   # stomp payload bytes only
+check("crc: loop count untouched - the header probe still says OK",
+      linkmod._mirror_state(cont) == linkmod.MIRROR_OK, linkmod._mirror_state(cont))
+check("crc: but the deep byte check sees the corruption",
+      linkmod._LINK_STORE.verify_frame(cont.data) is False)
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+check("crc: the autosync repacked it on save",
+      linkmod._LINK_STORE.verify_frame(cont.data) is True
+      and linkmod._LINK_STORE.decode_colors(cont.data) is not None)
+
+print("\n=== 78. UDIM/atlas records survive the edit that killed them ===")
+# Same dual-carrier design, same decapitation: deleting the FIRST face
+# beheads AGR_UDIM_T*/AGR_Atlas_T* while the idprop keeps the .blend
+# working - and a default FBX used to ship without either record, in total
+# silence (the integrity machinery only watched the link namespace).
+from AGR_tools.core.udim_store import UDIM_STORE      # noqa: E402
+from AGR_tools.core.atlas_store import ATLAS_STORE    # noqa: E402
+reset_scene()
+carrier = add_obj("Carrier", make_cube_mesh("MeshCarrier"))
+udim_rec = {"object_name": "Carrier", "address": "Addr", "obj_type": "Ground",
+            "udim_tiles": [{"udim_number": 1001, "material_index": 0,
+                            "material_name": "M_Addr_Ground_1",
+                            "set_name": "S_Wall"}]}
+atlas_rec = {"version": 1,
+             "atlases": [{"atlas_name": "A_Test", "atlas_type": "HIGH",
+                          "atlas_size": 1024, "material_name": "M_Addr_Ground_1",
+                          "bin": 0, "folder": "//AGR_BAKE/A_Test",
+                          "created_atlases": {}, "layout": []}]}
+check("aux: both records written", UDIM_STORE.write(carrier, udim_rec)
+      and ATLAS_STORE.write(carrier, atlas_rec))
+delete_face(carrier, 0)                      # beheads BOTH mirrors
+check("aux: both mirrors decapitated",
+      UDIM_STORE.decode_colors(carrier.data) is None
+      and ATLAS_STORE.decode_colors(carrier.data) is None)
+check("aux: the idprops still read",
+      UDIM_STORE.read(carrier) is not None
+      and ATLAS_STORE.read(carrier) is not None)
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+check("aux: the autosync repacked both on save",
+      UDIM_STORE.decode_colors(carrier.data) is not None
+      and ATLAS_STORE.decode_colors(carrier.data) is not None)
+
+print("\n=== 79. Autosync must NOT invent a phantom instance (absorb contract) ===")
+# FBX-imported container (no idprop) + a plain Ctrl+J into it: read_table's
+# merged view synthesises a zero-instance for the untracked tail, and the
+# save handler used to persist it UNSTAMPED - a group claiming faces no
+# face carries (recoverable only as a _leftover husk), written silently in
+# save_pre, outside undo.  absorb=False must refuse; the explicit button
+# does the real absorption.
+reset_scene()
+cont = build_trio()
+del cont[linkmod.PROP_KEY]                    # simulate the FBX-import state
+plain = add_obj("Plain", make_cube_mesh("MeshP2"), T(0, -6, 0))
+select_only([plain, cont], cont)              # container is ACTIVE
+bpy.ops.object.join()
+check("phantom: the merged view still parses (virtual zero-instance)",
+      linkmod.read_table(cont) is not None)
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+check("phantom: the autosync refused instead of persisting it",
+      cont.get(linkmod.PROP_KEY) is None,
+      str(cont.get(linkmod.PROP_KEY))[:60])
+check("phantom: the refusal is marked 'unmarked'",
+      linkmod._NO_AUTOSYNC.get(cont.name, (None, None))[1] == "unmarked",
+      str(linkmod._NO_AUTOSYNC.get(cont.name)))
+# the explicit button DOES the absorption - and the result is stamped
+select_only([cont], cont)
+bpy.ops.agr.link_refresh(scope='ACTIVE')
+tbl = linkmod._parse_table(cont.get(linkmod.PROP_KEY))
+check("phantom: «Закрепить память» materialises a STAMPED table",
+      tbl is not None and len(tbl.get("instances", {})) == 4,
+      str(len((tbl or {}).get("instances", {}))))
+
+# ---------------------------------------------------------------------------
 print("\n" + "=" * 60)
 if FAILS:
     print(f"❌ {len(FAILS)} FAILED:")
