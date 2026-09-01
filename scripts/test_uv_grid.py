@@ -6,7 +6,7 @@ import traceback
 
 import bpy
 import bmesh
-from math import cos, pi, radians, sin
+from math import cos, degrees, pi, radians, sin
 from mathutils import Euler, Matrix, Vector
 
 # repo root = parent of scripts/ — works from any checkout location
@@ -95,6 +95,16 @@ def select_edge_between(bm, obj, wa, wb):
             e.select = True
             for v in e.verts:
                 v.select = True
+            return True
+    return False
+
+
+def select_vert_at(bm, obj, wco):
+    """Select the single vertex whose WORLD position matches wco."""
+    mat = obj.matrix_world
+    for v in bm.verts:
+        if (mat @ v.co - Vector(wco)).length < 1e-5:
+            v.select = True
             return True
     return False
 
@@ -1543,6 +1553,357 @@ try:
     check("TOPZ: SURFACE projection is forced off (identical result)",
           nf_pl == nf_sf and uv_pl == uv_sf,
           f"faces {nf_pl} vs {nf_sf}, uv equal={uv_pl == uv_sf}")
+
+    print("=" * 60)
+    print("TEST 38: angle from edge — TOPZ plan grid")
+    rot30 = Matrix.Rotation(radians(30), 4, 'Z')
+    plan = make_grid_object("AnglePlan", 4, 4, cell=1.0, matrix=rot30)
+    bm = enter_edit(plan)
+    deselect_all(bm)
+    wa, wb = rot30 @ Vector((0, 0, 0)), rot30 @ Vector((1, 0, 0))
+    check("edge for angle pick found", select_edge_between(bm, plan, wa, wb))
+    reset_settings()
+    s = settings()
+    s.grid_source = 'TOPZ'
+    r = bpy.ops.agr.uv_grid_angle_from_edge()
+    check("TOPZ angle pick FINISHED", r == {'FINISHED'})
+    check("TOPZ angle = 30 deg", abs(degrees(s.world_angle) - 30.0) < 0.01,
+          f"angle={degrees(s.world_angle):.3f}")
+    # end-to-end: with the grid rotated to match, the rotated floor unwraps
+    # into exact 0..1 cells (a wrong angle would leave cells straddling lines)
+    r = bpy.ops.agr.uv_grid_unwrap()
+    check("TOPZ unwrap after angle pick FINISHED", r == {'FINISHED'})
+    bm = bmesh.from_edit_mesh(plan.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    check("TOPZ rotated floor lands in 0..1", all_uvs_in_unit(bm, uv_layer))
+    exact = all(abs(c - round(c)) < 1e-4
+                for f in bm.faces for loop in f.loops for c in loop[uv_layer].uv)
+    check("TOPZ rotated floor corners exact", exact)
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # an edge has no direction: 105 deg must come back as -75 (mod 180,
+    # representative closest to zero)
+    rot105 = Matrix.Rotation(radians(105), 4, 'Z')
+    plan2 = make_grid_object("AnglePlan2", 1, 1, cell=1.0, matrix=rot105)
+    bm = enter_edit(plan2)
+    deselect_all(bm)
+    check("105 deg edge found", select_edge_between(
+        bm, plan2, rot105 @ Vector((0, 0, 0)), rot105 @ Vector((1, 0, 0))))
+    reset_settings()
+    s = settings()
+    s.grid_source = 'TOPZ'
+    bpy.ops.agr.uv_grid_angle_from_edge()
+    check("angle reduced mod 180 to (-90, 90]",
+          abs(degrees(s.world_angle) + 75.0) < 0.01,
+          f"angle={degrees(s.world_angle):.3f}")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # error paths: vertical edge under TOPZ, zero / two edges, EDGES source
+    wallv = make_grid_object("AngleWallV", 1, 1, cell=1.0, plane="XZ")
+    bm = enter_edit(wallv)
+    deselect_all(bm)
+    check("vertical edge found", select_edge_between(bm, wallv, (0, 0, 0), (0, 0, 1)))
+    reset_settings()
+    s = settings()
+    s.grid_source = 'TOPZ'
+    check("vertical edge under TOPZ is refused",
+          expect_cancel(lambda: bpy.ops.agr.uv_grid_angle_from_edge()))
+    bm = bmesh.from_edit_mesh(wallv.data)
+    deselect_all(bm)
+    check("no edge is refused",
+          expect_cancel(lambda: bpy.ops.agr.uv_grid_angle_from_edge()))
+    select_edge_between(bm, wallv, (0, 0, 0), (1, 0, 0))
+    select_edge_between(bm, wallv, (0, 0, 0), (0, 0, 1))
+    check("two edges are refused",
+          expect_cancel(lambda: bpy.ops.agr.uv_grid_angle_from_edge()))
+    s.grid_source = 'EDGES'
+    bm = bmesh.from_edit_mesh(wallv.data)
+    deselect_all(bm)
+    select_edge_between(bm, wallv, (0, 0, 0), (1, 0, 0))
+    check("EDGES source is refused",
+          expect_cancel(lambda: bpy.ops.agr.uv_grid_angle_from_edge()))
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 39: angle from edge — WORLD wall, bare edge click")
+    # rotation about Y spins the XZ wall in its own plane: the wall normal
+    # stays +-Y while every "horizontal" edge now slopes at 25 deg
+    tilt = Matrix.Rotation(radians(25), 4, 'Y')
+    wall9 = make_grid_object("AngleWall", 4, 3, cell=1.0, plane="XZ", matrix=tilt)
+    bm = enter_edit(wall9)
+    deselect_all(bm)
+    check("sloped wall edge found", select_edge_between(
+        bm, wall9, tilt @ Vector((0, 0, 0)), tilt @ Vector((1, 0, 0))))
+    reset_settings()
+    s = settings()
+    s.grid_source = 'WORLD'
+    s.selection_mode = 'SELECTED'   # nothing but the edge is selected:
+    r = bpy.ops.agr.uv_grid_angle_from_edge()   # normal comes from its faces
+    check("WORLD angle pick FINISHED (normal from edge faces)", r == {'FINISHED'})
+    check("WORLD angle magnitude = 25 deg",
+          abs(abs(degrees(s.world_angle)) - 25.0) < 0.01,
+          f"angle={degrees(s.world_angle):.3f}")
+    bm = bmesh.from_edit_mesh(wall9.data)
+    for f in bm.faces:
+        f.select = True
+    r = bpy.ops.agr.uv_grid_unwrap()
+    check("tilted wall unwrap FINISHED", r == {'FINISHED'})
+    bm = bmesh.from_edit_mesh(wall9.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    check("tilted wall lands in 0..1", all_uvs_in_unit(bm, uv_layer))
+    exact = all(abs(c - round(c)) < 1e-4
+                for f in bm.faces for loop in f.loops for c in loop[uv_layer].uv)
+    check("tilted wall corners exact", exact)
+    check("tilted wall not mirrored", all(shoelace(f, uv_layer) > 0 for f in bm.faces))
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 40: offset from point — intersection lands at the vertex")
+    off = Matrix.Translation((0.3, 0.6, 0.0))
+    ofl = make_grid_object("OffsetFloor", 2, 2, cell=1.0, matrix=off)
+    bm = enter_edit(ofl)
+    deselect_all(bm)
+    check("anchor vertex found", select_vert_at(bm, ofl, (0.3, 0.6, 0.0)))
+    reset_settings()
+    s = settings()
+    s.grid_source = 'TOPZ'
+    s.selection_mode = 'ALL'
+    r = bpy.ops.agr.uv_grid_offset_from_point()
+    check("TOPZ offset pick FINISHED", r == {'FINISHED'})
+    # NEAREST corner: 0.6 -> -0.4, the equivalent small representative
+    check("offsets = 0.3 / -0.4",
+          abs(s.offset_u - 0.3) < 1e-5 and abs(s.offset_v + 0.4) < 1e-5,
+          f"offsets=({s.offset_u:.4f}, {s.offset_v:.4f})")
+    # idempotence: any lattice-mate vertex keeps the offsets unchanged
+    bm = bmesh.from_edit_mesh(ofl.data)
+    deselect_all(bm)
+    select_vert_at(bm, ofl, (1.3, 1.6, 0.0))
+    bpy.ops.agr.uv_grid_offset_from_point()
+    check("lattice-mate vertex is a no-op",
+          abs(s.offset_u - 0.3) < 1e-5 and abs(s.offset_v + 0.4) < 1e-5,
+          f"offsets=({s.offset_u:.4f}, {s.offset_v:.4f})")
+    # a huge pre-existing offset wraps back to the small representative
+    s.offset_u = 0.9
+    bm = bmesh.from_edit_mesh(ofl.data)
+    deselect_all(bm)
+    select_vert_at(bm, ofl, (0.3, 0.6, 0.0))
+    bpy.ops.agr.uv_grid_offset_from_point()
+    check("offset wraps to the small representative",
+          abs(s.offset_u - 0.3) < 1e-5, f"offset_u={s.offset_u:.4f}")
+    # end-to-end: the shifted floor now unwraps into exact 0..1 cells
+    r = bpy.ops.agr.uv_grid_unwrap()
+    check("unwrap after offset FINISHED", r == {'FINISHED'})
+    bm = bmesh.from_edit_mesh(ofl.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    exact = all(abs(c - round(c)) < 1e-4
+                for f in bm.faces for loop in f.loops for c in loop[uv_layer].uv)
+    check("shifted floor corners exact", exact and all_uvs_in_unit(bm, uv_layer))
+    # direct assertion: the picked point sits ON a lattice intersection of
+    # the RESOLVED basis (offsets included)
+    tg = uvmod._collect_targets(bpy.context, s)
+    basis = uvmod._resolve_basis(None, s, tg, quiet=True)
+    check("basis resolves after offset pick", basis is not None)
+    if basis is not None:
+        o, xd, yd, cu, cv = basis
+        dd = Vector((0.3, 0.6, 0.0)) - o
+        gu, gv = dd.dot(xd) / cu, dd.dot(yd) / cv
+        check("point on lattice intersection",
+              abs(gu - round(gu)) < 1e-6 and abs(gv - round(gv)) < 1e-6,
+              f"g=({gu:.6f}, {gv:.6f})")
+
+    # EDGES source: the stored grid shifts through the same offsets
+    reset_settings()
+    s = settings()
+    s.has_grid = True
+    s.origin = (0, 0, 0)
+    s.u_dir = (1, 0, 0)
+    s.v_dir = (0, 1, 0)
+    s.cell_u = s.cell_v = 1.0
+    s.selection_mode = 'ALL'
+    bm = bmesh.from_edit_mesh(ofl.data)
+    deselect_all(bm)
+    select_vert_at(bm, ofl, (1.3, 0.6, 0.0))
+    r = bpy.ops.agr.uv_grid_offset_from_point()
+    check("EDGES offset pick FINISHED", r == {'FINISHED'})
+    check("EDGES offsets = 0.3 / -0.4",
+          abs(s.offset_u - 0.3) < 1e-5 and abs(s.offset_v + 0.4) < 1e-5,
+          f"offsets=({s.offset_u:.4f}, {s.offset_v:.4f})")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # WORLD source, bare vertex click: axes resolve from the vertex's faces
+    woff = Matrix.Translation((0.2, 0.0, 0.7))
+    wall10 = make_grid_object("OffsetWall", 2, 2, cell=1.0, plane="XZ", matrix=woff)
+    bm = enter_edit(wall10)
+    deselect_all(bm)
+    check("wall vertex found", select_vert_at(bm, wall10, (1.2, 0.0, 1.7)))
+    reset_settings()
+    s = settings()
+    s.grid_source = 'WORLD'
+    s.origin_mode = 'WORLD'
+    s.selection_mode = 'SELECTED'   # nothing but the vertex is selected
+    r = bpy.ops.agr.uv_grid_offset_from_point()
+    check("WORLD bare-vertex pick FINISHED", r == {'FINISHED'})
+    check("WORLD offsets snap the wall grid",
+          abs(abs(s.offset_u) - 0.2) < 1e-5 and abs(abs(s.offset_v) - 0.3) < 1e-5,
+          f"offsets=({s.offset_u:.4f}, {s.offset_v:.4f})")
+    bm = bmesh.from_edit_mesh(wall10.data)
+    for f in bm.faces:
+        f.select = True
+    r = bpy.ops.agr.uv_grid_unwrap()
+    check("wall unwrap after offset FINISHED", r == {'FINISHED'})
+    bm = bmesh.from_edit_mesh(wall10.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    exact = all(abs(c - round(c)) < 1e-4
+                for f in bm.faces for loop in f.loops for c in loop[uv_layer].uv)
+    check("offset wall corners exact", exact and all_uvs_in_unit(bm, uv_layer))
+
+    # error paths: no vertex / two verts (an edge) / EDGES without a grid
+    bm = bmesh.from_edit_mesh(wall10.data)
+    deselect_all(bm)
+    check("no vertex is refused",
+          expect_cancel(lambda: bpy.ops.agr.uv_grid_offset_from_point()))
+    select_edge_between(bm, wall10, (0.2, 0, 0.7), (1.2, 0, 0.7))
+    check("two verts (an edge) are refused",
+          expect_cancel(lambda: bpy.ops.agr.uv_grid_offset_from_point()))
+    s.grid_source = 'EDGES'
+    s.has_grid = False
+    bm = bmesh.from_edit_mesh(wall10.data)
+    deselect_all(bm)
+    select_vert_at(bm, wall10, (0.2, 0.0, 0.7))
+    check("EDGES without a grid is refused",
+          expect_cancel(lambda: bpy.ops.agr.uv_grid_offset_from_point()))
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 41: angle from edge — tilted hip roof (floor branch, exact solve)")
+    # plane with normal n=(0.4, 0.4, 0.8246): |n.z|>0.7 puts _world_base_axes
+    # into the floor branch where base X/Y are NOT perpendicular to n — the
+    # naive "rotate base_x onto the edge" formula left U up to 19.5° off
+    n = Vector((0.4, 0.4, 0.0))
+    n.z = (1.0 - n.length_squared) ** 0.5
+    ex = Vector((1.0, 0.0, 0.0))
+    e_dir = (ex - n * ex.dot(n)).normalized()   # in-plane edge direction
+    w_dir = n.cross(e_dir)
+    roof_mesh = bpy.data.meshes.new("HipRoof")
+    p0 = Vector((0.0, 0.0, 0.0))
+    roof_mesh.from_pydata(
+        [tuple(p0), tuple(p0 + 2 * e_dir), tuple(p0 + 2 * e_dir + w_dir),
+         tuple(p0 + w_dir)], [], [(0, 1, 2, 3)])
+    roof_mesh.validate()
+    roof = bpy.data.objects.new("HipRoof", roof_mesh)
+    bpy.context.collection.objects.link(roof)
+    bm = enter_edit(roof)
+    deselect_all(bm)
+    check("roof edge found", select_edge_between(bm, roof, tuple(p0),
+                                                 tuple(p0 + 2 * e_dir)))
+    reset_settings()
+    s = settings()
+    s.grid_source = 'WORLD'
+    s.origin_mode = 'WORLD'
+    r = bpy.ops.agr.uv_grid_angle_from_edge()
+    check("hip-roof angle pick FINISHED", r == {'FINISHED'})
+    bm = bmesh.from_edit_mesh(roof.data)
+    for f in bm.faces:
+        f.select = True
+    tg = uvmod._collect_targets(bpy.context, s)
+    basis = uvmod._resolve_basis(None, s, tg, quiet=True)
+    check("hip-roof basis resolves", basis is not None)
+    if basis is not None:
+        _o, xd, yd, _cu, _cv = basis
+        check("hip roof: V constant along the edge (grid lines follow it)",
+              abs(e_dir.dot(yd)) < 1e-5,
+              f"e·y={e_dir.dot(yd):.6f}, e·x={e_dir.dot(xd):.6f}")
+        check("hip roof: U really runs along the edge",
+              abs(e_dir.dot(xd)) > 0.5, f"e·x={e_dir.dot(xd):.6f}")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 42: crease guards — edge/vertex on facade∩ground are refused")
+    crease_mesh = bpy.data.meshes.new("CreaseMesh")
+    crease_mesh.from_pydata(
+        [(0, 0, 0), (2, 0, 0), (2, 0, 2), (0, 0, 2),   # facade, XZ plane
+         (0, 4, 0), (2, 4, 0)],                        # ground extends +Y
+        [], [(0, 1, 2, 3), (0, 4, 5, 1)])
+    crease_mesh.validate()
+    crease = bpy.data.objects.new("CreaseMesh", crease_mesh)
+    bpy.context.collection.objects.link(crease)
+    bm = enter_edit(crease)
+    deselect_all(bm)
+    check("crease edge found", select_edge_between(bm, crease, (0, 0, 0), (2, 0, 0)))
+    reset_settings()
+    s = settings()
+    s.grid_source = 'WORLD'
+    s.origin_mode = 'WORLD'
+    check("angle pick on a crease edge is refused",
+          expect_cancel(lambda: bpy.ops.agr.uv_grid_angle_from_edge()))
+    # top edge belongs to the facade alone — the guard must let it through
+    bm = bmesh.from_edit_mesh(crease.data)
+    deselect_all(bm)
+    select_edge_between(bm, crease, (0, 0, 2), (2, 0, 2))
+    r = bpy.ops.agr.uv_grid_angle_from_edge()
+    check("angle pick on a facade-only edge passes", r == {'FINISHED'})
+    # corner vertex mixes facade and ground normals — offsets would be
+    # measured along axes the unwrap never uses
+    bm = bmesh.from_edit_mesh(crease.data)
+    deselect_all(bm)
+    check("corner vertex found", select_vert_at(bm, crease, (0, 0, 0)))
+    check("offset pick on a corner vertex is refused",
+          expect_cancel(lambda: bpy.ops.agr.uv_grid_offset_from_point()))
+    bm = bmesh.from_edit_mesh(crease.data)
+    deselect_all(bm)
+    select_vert_at(bm, crease, (0, 0, 2))   # facade-only vertex
+    r = bpy.ops.agr.uv_grid_offset_from_point()
+    check("offset pick on a facade-only vertex passes", r == {'FINISHED'})
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 43: offset from point under SURFACE — arc-U residual via frames")
+    swall = make_grid_object("SurfWall", 4, 3, cell=1.0, plane="XZ",
+                             matrix=Matrix.Translation((2.37, 0.0, 0.4)))
+    bm = enter_edit(swall)
+    deselect_all(bm)
+    check("surf vertex found", select_vert_at(bm, swall, (3.37, 0.0, 1.4)))
+    reset_settings()
+    s = settings()
+    s.grid_source = 'WORLD'
+    s.origin_mode = 'WORLD'
+    s.projection = 'SURFACE'
+    s.selection_mode = 'ALL'    # targets exist -> frames available
+    s.world_cell_u = 0.8
+    s.world_cell_v = 1.0
+    r = bpy.ops.agr.uv_grid_offset_from_point()
+    check("SURFACE offset pick FINISHED", r == {'FINISHED'})
+    # picked vertex sits 1.0 m of arc from the component minimum: residual
+    # to the nearest 0.8-line is 0.2 m (sign depends on the arc direction)
+    check("SURFACE offsets: |U|=0.2 (arc), V=0.4",
+          abs(abs(s.offset_u) - 0.2) < 1e-5 and abs(s.offset_v - 0.4) < 1e-5,
+          f"offsets=({s.offset_u:.4f}, {s.offset_v:.4f})")
+    r = bpy.ops.agr.uv_grid_unwrap()
+    check("SURFACE unwrap after offset FINISHED", r == {'FINISHED'})
+    bm = bmesh.from_edit_mesh(swall.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    inv = swall.matrix_world.inverted()
+    target_local = inv @ Vector((3.37, 0.0, 1.4))
+    picked_uvs = [Vector(loop[uv_layer].uv) for f in bm.faces for loop in f.loops
+                  if (loop.vert.co - target_local).length < 1e-5]
+    check("picked vertex lands ON the arc grid line",
+          bool(picked_uvs) and all(abs(uv.x - round(uv.x)) < 1e-4
+                                   and abs(uv.y - round(uv.y)) < 1e-4
+                                   for uv in picked_uvs),
+          f"uvs={[tuple(round(c, 4) for c in uv) for uv in picked_uvs]}")
+    # frames unavailable (SELECTED mode, nothing but the vertex selected):
+    # U must stay untouched, V still applies
+    s.offset_u = s.offset_v = 0.0
+    s.selection_mode = 'SELECTED'
+    bm = bmesh.from_edit_mesh(swall.data)
+    deselect_all(bm)
+    select_vert_at(bm, swall, (3.37, 0.0, 1.4))
+    r = bpy.ops.agr.uv_grid_offset_from_point()
+    check("SURFACE offset without frames FINISHED (V-only)", r == {'FINISHED'})
+    check("U untouched, V applied",
+          abs(s.offset_u) < 1e-9 and abs(s.offset_v - 0.4) < 1e-5,
+          f"offsets=({s.offset_u:.4f}, {s.offset_v:.4f})")
+    bpy.ops.object.mode_set(mode='OBJECT')
 
 except Exception:
     traceback.print_exc()

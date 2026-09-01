@@ -44,7 +44,7 @@ import bpy
 import bmesh
 import gpu
 from gpu_extras.batch import batch_for_shader
-from math import atan2, ceil, cos, floor, hypot, pi, radians, sin
+from math import atan2, ceil, cos, degrees, floor, hypot, pi, radians, sin
 from mathutils import Matrix, Vector, geometry
 
 from bpy.props import (
@@ -395,6 +395,96 @@ def _mean_world_normal(targets):
             for i in range(1, len(ws) - 1):
                 n += (ws[i] - ws[0]).cross(ws[i + 1] - ws[0])
     return n
+
+
+def _world_base_axes(n):
+    """Unrotated WORLD-grid axes for the normalized mean normal `n`.
+
+    The ONE derivation shared by _resolve_basis and the angle-from-edge
+    pick (they MUST agree on what world_angle=0 means): floor/ceiling ->
+    U=+X/V=+Y, wall -> U horizontal along the wall, V up the wall.
+    world_angle then rotates these around `n`.
+    """
+    if abs(n.z) > 0.7:  # floor / ceiling
+        return Vector((1.0, 0.0, 0.0)), Vector((0.0, 1.0, 0.0))
+    x_dir = Vector((0.0, 0.0, 1.0)).cross(n).normalized()
+    return x_dir, n.cross(x_dir).normalized()
+
+
+# Pipettes, WORLD source: max spread between the link-face normals of the
+# picked element.  Beyond this the element sits on a crease (wall∩roof,
+# wall∩ground) and the area-weighted average normal is meaningless — the
+# review repro showed a silently diagonal grid up to 90° off, so the honest
+# move is refusing.  20° still tolerates curved facades (cylinder segments).
+_PICK_CREASE_COS = cos(radians(20.0))
+
+
+def _face_world_area_vector(mat, f):
+    """Newell area vector of one face in WORLD space (length = 2·area)."""
+    ws = [mat @ v.co for v in f.verts]
+    n = Vector((0.0, 0.0, 0.0))
+    for i in range(1, len(ws) - 1):
+        n += (ws[i] - ws[0]).cross(ws[i + 1] - ws[0])
+    return n
+
+
+def _coplanar_normals(area_vectors, min_cos=_PICK_CREASE_COS):
+    """True when every pair of link-face normals agrees within the limit."""
+    dirs = [v.normalized() for v in area_vectors if v.length > 1e-12]
+    return all(a.dot(b) >= min_cos
+               for i, a in enumerate(dirs) for b in dirs[i + 1:])
+
+
+def _pick_single_edge(context):
+    """The ONE selected edge as (world_a, world_b, [face_area_vectors]).
+
+    Returns None unless exactly one edge is selected across the edit-mode
+    objects.  Everything is copied out immediately (no BMElem retention —
+    see _selected_edges).  The per-face WORLD area vectors of the edge's
+    link faces are the ONLY normal source the WORLD pipette can use: a
+    selected face flushes ≥3 selected edges, so a live face selection can
+    never coexist with this pick — deriving the hint from the selection
+    was an unreachable branch (and the whole-mesh mean in «Весь меш» is
+    zero on closed volumes), which the review confirmed empirically.
+    """
+    found = None
+    for obj in _edit_mesh_objects(context):
+        bm = bmesh.from_edit_mesh(obj.data)
+        mat = obj.matrix_world
+        for e in bm.edges:
+            if not e.select:
+                continue
+            if found is not None:
+                return None  # more than one selected edge
+            vecs = [_face_world_area_vector(mat, f) for f in e.link_faces]
+            found = (mat @ e.verts[0].co, mat @ e.verts[1].co, vecs)
+    return found
+
+
+def _pick_single_vert(context):
+    """The ONE selected vertex as (world_co, [(obj, bm, link_faces)],
+    [face_area_vectors]).
+
+    Returns None unless exactly one vertex is selected: an edge selects
+    both of its verts and a face all of them, so a single selected vertex
+    can only come from a direct vertex-mode click — no ambiguity.  The
+    link faces are the WORLD-source basis targets (live within THIS
+    operator call only — never store them past an undo); the area vectors
+    feed the same crease guard as the edge pick.
+    """
+    found = None
+    for obj in _edit_mesh_objects(context):
+        bm = bmesh.from_edit_mesh(obj.data)
+        mat = obj.matrix_world
+        for v in bm.verts:
+            if not v.select:
+                continue
+            if found is not None:
+                return None  # more than one selected vertex
+            link = list(v.link_faces)
+            vecs = [_face_world_area_vector(mat, f) for f in link]
+            found = (mat @ v.co, [(obj, bm, link)] if link else [], vecs)
+    return found
 
 
 def _capture_grid(op, context, settings, picked=None):
@@ -921,12 +1011,7 @@ def _resolve_basis(op, settings, targets, quiet=False):
                            "стороны) — обрабатывайте стены по отдельности")
             return None
         n = n_hint.normalized()
-        if abs(n.z) > 0.7:  # floor / ceiling
-            x_dir = Vector((1.0, 0.0, 0.0))
-            y_dir = Vector((0.0, 1.0, 0.0))
-        else:  # wall: U horizontal along the wall, V up the wall
-            x_dir = Vector((0.0, 0.0, 1.0)).cross(n).normalized()
-            y_dir = n.cross(x_dir).normalized()
+        x_dir, y_dir = _world_base_axes(n)
         if settings.world_angle != 0.0:
             rot = Matrix.Rotation(settings.world_angle, 3, n)
             x_dir = (rot @ x_dir).normalized()
@@ -2678,7 +2763,12 @@ class AGR_OT_UVGridCapture(_AGR_UVGridPollMixin, Operator):
                       "автофит: медианные длины двух перпендикулярных семейств, "
                       "диагонали и обрезки отсеиваются. Мировые координаты, "
                       "работает для всех объектов сцены")
-    bl_options = {'REGISTER', 'UNDO'}
+    # no 'UNDO': only scene properties are written, and the poll restricts
+    # this to Edit Mode, where an undo push produces a MESH step that cannot
+    # carry them — Ctrl+Z would silently do nothing and then eat the
+    # previous real edit (an empty push also costs ~50 ms on city-scale
+    # meshes).  Same reasoning as the angle/offset pipettes below.
+    bl_options = {'REGISTER'}
 
     def _execute(self, context):
         settings = _get_settings(context)
@@ -2692,7 +2782,10 @@ class AGR_OT_UVGridClear(Operator):
     bl_idname = "agr.uv_grid_clear"
     bl_label = "Сбросить сетку"
     bl_description = "Забыть запомненную опорную сетку"
-    bl_options = {'REGISTER', 'UNDO'}
+    # no 'UNDO' — same reasoning as the capture above: this button lives in
+    # the Edit-Mode grid workflow, where the pushed mesh step cannot restore
+    # the scene-level flag it flips
+    bl_options = {'REGISTER'}
 
     @classmethod
     def poll(cls, context):
@@ -2706,6 +2799,205 @@ class AGR_OT_UVGridClear(Operator):
         _get_settings(context).has_grid = False
         _tag_redraw_view3d()  # the overlay must swap to its "no grid" state
         agr_report(self, 'INFO', "Опорная сетка сброшена")
+        return {'FINISHED'}
+
+
+class AGR_OT_UVGridAngleFromEdge(_AGR_UVGridPollMixin, Operator):
+    """Set the grid rotation so U runs along the selected edge"""
+    bl_idname = "agr.uv_grid_angle_from_edge"
+    bl_label = "Поворот по ребру"
+    bl_description = ("Повернуть мировую сетку / сетку «Сверху» по выделенному "
+                      "ребру: ось U ложится вдоль ребра (в проекции на плоскость "
+                      "сетки). Выделите ровно одно ребро — лежащее в плоскости "
+                      "нужной поверхности, не на изломе")
+    # no 'UNDO': the pipette only writes scene properties, and in Edit Mode
+    # an undo push produces a MESH step that cannot carry them — the user's
+    # Ctrl+Z would silently do nothing and then eat their real edit (review
+    # finding; ~50 ms per push on city-scale meshes for an empty step)
+    bl_options = {'REGISTER'}
+
+    def _execute(self, context):
+        settings = _get_settings(context)
+        if settings is None:
+            return {'CANCELLED'}
+        if settings.grid_source == 'EDGES':
+            agr_report(self, 'ERROR',
+                       "Поворот по ребру работает для мировой сетки и «Сверху» — "
+                       "сетка по рёбрам берёт оси из «Запомнить сетку»")
+            return {'CANCELLED'}
+        picked = _pick_single_edge(context)
+        if picked is None:
+            agr_report(self, 'ERROR',
+                       "Выделите ровно одно ребро — оно задаст направление сетки")
+            return {'CANCELLED'}
+        a, b, face_vecs = picked
+
+        if settings.grid_source == 'TOPZ':
+            # plan view: the rotation plane is horizontal by definition
+            axis = Vector((0.0, 0.0, 1.0))
+            base_y = Vector((0.0, 1.0, 0.0))
+        else:
+            # WORLD: the edge's OWN surface defines the frame — the same
+            # normal the unwrap will get from the selected wall faces.  A
+            # crease edge (wall∩roof/ground) averages two unrelated planes
+            # and the stored angle would be read in a different frame later
+            # (review repro: silent 45–90° diagonal grid) — refuse instead.
+            edge_n = Vector((0.0, 0.0, 0.0))
+            for v in face_vecs:
+                edge_n += v
+            if edge_n.length < 1e-6:
+                agr_report(self, 'ERROR',
+                           "Ребро не принадлежит ни одному фейсу — нормаль "
+                           "поверхности не определить")
+                return {'CANCELLED'}
+            if not _coplanar_normals(face_vecs):
+                agr_report(self, 'ERROR',
+                           "Ребро лежит на изломе (нормали его фейсов "
+                           "расходятся) — кликните ребро в плоскости той "
+                           "поверхности, которую будете разворачивать")
+                return {'CANCELLED'}
+            axis = edge_n.normalized()
+            _base_x, base_y = _world_base_axes(axis)
+
+        edge_dir = b - a
+        proj = edge_dir - axis * edge_dir.dot(axis)
+        if edge_dir.length < 1e-9 or proj.length < edge_dir.length * 1e-3:
+            agr_report(self, 'ERROR',
+                       "Ребро перпендикулярно плоскости сетки — направление "
+                       "по нему не определить")
+            return {'CANCELLED'}
+
+        # Solve edge·y_dir(θ) = 0 — V constant along the edge, so the grid
+        # LINES follow it.  For the wall/TOPZ frames (base axes ⟂ axis)
+        # this equals the naive "rotate base_x onto the edge" mod 180°, but
+        # on the floor branch the world X/Y base is NOT ⟂ a tilted normal
+        # and the naive atan2 left U up to 19.5° off the edge (review
+        # repro: hip roof of a rotated building).  With p = proj (p·axis=0)
+        # the Rodrigues expansion gives p·R(θ)·base_y = A·cosθ + B·sinθ,
+        # A = p·base_y, B = p·(axis×base_y)  →  θ = atan2(−A, B).
+        angle = atan2(-proj.dot(base_y), proj.dot(axis.cross(base_y)))
+        # an edge has no direction: reduce mod 180° to the representative
+        # closest to zero — both solutions zero the projected edge·y_dir
+        while angle > pi / 2.0:
+            angle -= pi
+        while angle <= -pi / 2.0:
+            angle += pi
+        settings.world_angle = angle
+        _tag_redraw_view3d()
+        agr_report(self, 'INFO', f"Поворот сетки по ребру: {degrees(angle):.2f}°")
+        return {'FINISHED'}
+
+
+class AGR_OT_UVGridOffsetFromPoint(_AGR_UVGridPollMixin, Operator):
+    """Shift the grid so a lattice intersection lands at the selected vertex"""
+    bl_idname = "agr.uv_grid_offset_from_point"
+    bl_label = "Сдвиг к точке"
+    bl_description = ("Сдвинуть сетку к выделенной вершине: пересечение линий "
+                      "сетки (угол ячеек) попадает точно в неё. Работает для "
+                      "всех источников сетки. Выделите ровно одну вершину — "
+                      "в плоскости нужной поверхности, не на углу/изломе")
+    # no 'UNDO' — same reasoning as the angle pipette above
+    bl_options = {'REGISTER'}
+
+    def _execute(self, context):
+        settings = _get_settings(context)
+        if settings is None:
+            return {'CANCELLED'}
+        if settings.grid_source == 'EDGES' and not settings.has_grid:
+            agr_report(self, 'ERROR', "Сетка не задана — сначала запомните её")
+            return {'CANCELLED'}
+        picked = _pick_single_vert(context)
+        if picked is None:
+            agr_report(self, 'ERROR',
+                       "Выделите ровно одну вершину — в неё встанет "
+                       "пересечение линий сетки")
+            return {'CANCELLED'}
+        point, vert_targets, face_vecs = picked
+
+        targets = _collect_targets(context, settings)
+        basis_targets = targets
+        if settings.grid_source == 'WORLD':
+            # A selected face flushes all of its verts, so a single selected
+            # vertex NEVER comes with a face selection — the vertex's own
+            # link faces are the only reachable normal source (and the mean
+            # over «Весь меш» is zero on closed volumes).  A corner vertex
+            # (facade∩ground) averages unrelated planes and the offsets
+            # would be measured along axes the unwrap will never use
+            # (review repro: 0.3 м silently off) — refuse it.
+            if not vert_targets:
+                agr_report(self, 'ERROR',
+                           "Вершина не принадлежит ни одному фейсу — нормаль "
+                           "поверхности не определить")
+                return {'CANCELLED'}
+            if not _coplanar_normals(face_vecs):
+                agr_report(self, 'ERROR',
+                           "Вершина на углу/изломе (нормали её фейсов "
+                           "расходятся) — кликните вершину в плоскости той "
+                           "поверхности, которую будете разворачивать, или "
+                           "используйте источник «Сверху»")
+                return {'CANCELLED'}
+            basis_targets = vert_targets
+        basis = _resolve_basis(self, settings, basis_targets)
+        if basis is None:
+            return {'CANCELLED'}
+        origin, x_dir, y_dir, cell_u, cell_v = basis
+        if cell_u < 1e-9 or cell_v < 1e-9:
+            agr_report(self, 'ERROR', "Размер ячейки нулевой")
+            return {'CANCELLED'}
+
+        # fractional residual to the NEAREST lattice corner, in meters; the
+        # resolved basis already carries the current offsets, so this is a
+        # pure correction on top of them.  V is planar under every
+        # projection; U under SURFACE is the anchored arc coordinate, so
+        # its residual must come from the SAME frames the unwrap will use
+        # (U depends on offset_u with slope −1 — one step converges).
+        d = point - origin
+        du = None
+        if _surface_mode(settings):
+            frames = _make_frames(settings, targets, basis) if targets else None
+            frame = None
+            if frames:
+                for _obj, _bm, link in vert_targets:
+                    frame = next((frames[f] for f in link if f in frames), None)
+                    if frame is not None:
+                        break
+            if frame is not None:
+                fh, fanchor, fu0 = frame
+                gu = (fu0 + (point - fanchor).dot(fh)) / cell_u
+                du = (gu - round(gu)) * cell_u
+        else:
+            gu = d.dot(x_dir) / cell_u
+            du = (gu - round(gu)) * cell_u
+        gv = d.dot(y_dir) / cell_v
+        dv = (gv - round(gv)) * cell_v
+
+        if du is not None:
+            new_u = settings.offset_u + du
+            # keep the stored offsets small: the lattice repeats every cell
+            new_u -= round(new_u / cell_u) * cell_u
+            settings.offset_u = new_u
+        new_v = settings.offset_v + dv
+        new_v -= round(new_v / cell_v) * cell_v
+        settings.offset_v = new_v
+        _tag_redraw_view3d()
+
+        # one accumulated report (agr_report overwrites the status line, so
+        # separate calls could not all be shown) — numbers ALWAYS included
+        u_txt = f"{du:+.3f} м" if du is not None else "не скорректирован"
+        msg = f"Сетка сдвинута к точке: поправка U {u_txt}, V {dv:+.3f} м"
+        caveats = []
+        if du is None:
+            caveats.append("U по дуге считается по обрабатываемым фейсам — "
+                           "выделите фейсы с этой вершиной (или режим «Весь "
+                           "меш») и повторите")
+        if settings.grid_source == 'WORLD' and settings.origin_mode == 'SELECTION':
+            caveats.append("начало «Угол выделения» плывёт вместе с выделением "
+                           "— для постоянной привязки переключите начало на "
+                           "«Начало мира»")
+        if caveats:
+            agr_report(self, 'WARNING', msg + "; ВНИМАНИЕ: " + "; ".join(caveats))
+        else:
+            agr_report(self, 'INFO', msg)
         return {'FINISHED'}
 
 
@@ -3262,7 +3554,9 @@ class AGR_PT_UVPanel(Panel):
             row = col.row(align=True)
             row.prop(s, "world_cell_u", text="X" if topz_src else "U")
             row.prop(s, "world_cell_v", text="Y" if topz_src else "V")
-            col.prop(s, "world_angle", text="Поворот")
+            row = col.row(align=True)
+            row.prop(s, "world_angle", text="Поворот")
+            row.operator("agr.uv_grid_angle_from_edge", text="", icon='EYEDROPPER')
             if s.grid_source == 'TOPZ':
                 col.label(text="Вид сверху: U=+X, V=+Y, начало (0,0,0)", icon='AXIS_TOP')
             else:
@@ -3310,6 +3604,7 @@ class AGR_PT_UVPanel(Panel):
         row = col.row(align=True)
         row.prop(s, "offset_u", text="Сдвиг U")
         row.prop(s, "offset_v", text="Сдвиг V")
+        row.operator("agr.uv_grid_offset_from_point", text="", icon='EYEDROPPER')
         col.prop(s, "snap_tolerance", text="Прилипание")
 
         layout.separator()
@@ -3394,6 +3689,8 @@ classes = (
     AGR_UVGridSettings,
     AGR_OT_UVGridCapture,
     AGR_OT_UVGridClear,
+    AGR_OT_UVGridAngleFromEdge,
+    AGR_OT_UVGridOffsetFromPoint,
     AGR_OT_UVGridUnwrap,
     AGR_OT_UVGridCut,
     AGR_OT_UVGridCutUnwrap,
