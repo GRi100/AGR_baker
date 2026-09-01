@@ -37,6 +37,21 @@ HEADER_V1 = 14                   # magic(4) + ver(1) + flags(1) + len(4) + crc(4
 HEADER_V2 = 18                   # v1 + n_loops(4): carrier loop count for exact windows
 COLOR_TYPES = ('FLOAT_COLOR', 'BYTE_COLOR')   # the only types exposing color_srgb
 
+# Shared loop-identity layer (ONE per mesh, all namespaces): per loop the
+# ORIGINAL loop index + 1 as u32 LE in 4 sRGB bytes; 0 = untracked (the
+# zero-fill a plain Blender join gives foreign geometry).  The mirror blob
+# is a POSITIONAL byte stream over loops, so any exporter that re-orders or
+# duplicates loops (FBX "Triangulate Faces" turns every quad into two tris
+# whose corners repeat) scrambles it beyond CRC repair - while corner
+# VALUES ride each corner correctly.  This layer makes the permutation
+# invertible: readers scatter every surviving loop's bytes back to its
+# original offset and parse the rebuilt stream.
+LOOP_IDX_NAME = "AGR_LoopIdx"
+
+# every ColorBlobStore ever constructed - the loop-index layer is shared,
+# so it may only be dropped when NO namespace still mirrors into the mesh
+_STORE_REGISTRY = []
+
 
 def read_srgb_bytes(attr):
     """Read a color attribute as bytes on the sRGB b/255 grid — identical
@@ -84,6 +99,104 @@ def preserve_active_color(mesh):
                 pass
 
 
+def _readable_corner_layer(mesh, name, n_loops):
+    """Store-independent twin of ColorBlobStore._color_layer: the layer as
+    packed bytes or None (wrong domain/type/length, or an open edit BMesh
+    whose data arrays are empty)."""
+    attr = None if mesh is None else mesh.attributes.get(name)
+    if attr is None or attr.domain != 'CORNER':
+        return None
+    if attr.data_type not in COLOR_TYPES:
+        return None
+    if len(attr.data) != n_loops:
+        return None
+    return attr
+
+
+def write_loop_index(mesh):
+    """(Re)write the shared loop-identity layer for the CURRENT mesh:
+    loop i carries i+1.  Called by every pack, so in a healthy .blend the
+    layer is always the identity - only an exporter/importer pipeline can
+    permute it, and that permutation is exactly what the readers invert."""
+    n_loops = len(mesh.loops)
+    if n_loops == 0:
+        return False
+    with preserve_active_color(mesh):
+        old = mesh.attributes.get(LOOP_IDX_NAME)
+        if old is not None:
+            mesh.attributes.remove(old)
+        attr = mesh.color_attributes.new(name=LOOP_IDX_NAME,
+                                         type='FLOAT_COLOR', domain='CORNER')
+        idx1 = np.arange(1, n_loops + 1, dtype="<u4")
+        floats = idx1.view(np.uint8).astype(np.float32) / 255.0
+        attr.data.foreach_set("color_srgb", floats)
+    return True
+
+
+def loop_index_array(mesh):
+    """ORIGINAL 0-based loop index per CURRENT loop (-1 = untracked), or
+    None when the layer is absent or unreadable."""
+    n_loops = len(mesh.loops)
+    if n_loops == 0:
+        return None
+    attr = _readable_corner_layer(mesh, LOOP_IDX_NAME, n_loops)
+    if attr is None:
+        return None
+    raw = read_srgb_bytes(attr)
+    return raw.view("<u4").astype(np.int64) - 1
+
+
+def loop_index_is_canonical(mesh):
+    """True when the layer exists and is the pack-time identity - the only
+    healthy in-.blend state.  The save-time autosync uses a False here as
+    "repack": it upgrades pre-layer mirrors and normalises a mesh that came
+    in permuted from an FBX import."""
+    idx = loop_index_array(mesh)
+    if idx is None:
+        return False
+    return bool((idx == np.arange(len(idx), dtype=np.int64)).all())
+
+
+def drop_orphan_loop_index(mesh):
+    """Remove the shared loop-index layer once NO namespace still mirrors
+    into this mesh (each store strips only its own layers; this one belongs
+    to all of them - and to none)."""
+    if mesh is None or mesh.attributes.get(LOOP_IDX_NAME) is None:
+        return
+    for store in _STORE_REGISTRY:
+        if store.color_names(mesh):
+            return
+    attr = mesh.attributes.get(LOOP_IDX_NAME)
+    if attr is not None:
+        mesh.attributes.remove(attr)
+
+
+def _neighbors_raw_readable(mesh, exclude):
+    """True when every OTHER namespace's mirror on this mesh (if any) still
+    parses RAW from loop 0 for the current loop count.  The loop-index
+    layer is SHARED: while a neighbor's blob is permuted (triangulating
+    FBX import), rewriting the layer to identity would destroy the only
+    map that can still rescue it - reproduced on the real Salarevo file,
+    where the atlas repack ran first and beheaded the link rescue.  A
+    fresh blob never needs the map (it reads raw from loop 0), so packing
+    with a preserved permuted map is always safe.
+
+    A namespace is its PREFIX, not a store instance: dev reloads and test
+    doubles register several stores over one prefix, and any one of them
+    parsing the header proves the namespace readable."""
+    n_loops = len(mesh.loops)
+    by_prefix = {}
+    for store in _STORE_REGISTRY:
+        if store.prefix == exclude.prefix:
+            continue
+        if not store.color_names(mesh):
+            continue
+        head = store.peek_frame_header(mesh)
+        ok = head is not None and (head[2] is None or head[2] == n_loops)
+        by_prefix[store.prefix] = by_prefix.get(store.prefix, False) or ok
+    return all(by_prefix.values())
+
+
 class ColorBlobStore:
     """One namespace of "JSON record on an object".
 
@@ -107,6 +220,7 @@ class ColorBlobStore:
         # poll()/draw() cache — external code holds aliases and mutates it
         # in place (pop/clear), so this dict is NEVER reassigned.
         self.cache = {}
+        _STORE_REGISTRY.append(self)
 
     # ------------------------------------------------------------------
     # validation
@@ -284,6 +398,15 @@ class ColorBlobStore:
                                                  type=self.attr_type, domain='CORNER')
                 chunk = floats[i * n_loops * 4:(i + 1) * n_loops * 4]
                 attr.data.foreach_set("color_srgb", chunk)
+            # refresh the shared loop-identity layer alongside the blob: a
+            # triangulating exporter permutes/duplicates loops, and this is
+            # what lets the readers put the byte stream back together.  But
+            # NEVER overwrite a still-needed permuted map: while another
+            # namespace's mirror only reads through it, the identity write
+            # would kill that rescue - our own fresh blob reads raw from
+            # loop 0 and does not care what the layer holds.
+            if loop_index_array(mesh) is None or _neighbors_raw_readable(mesh, self):
+                write_loop_index(mesh)
         return True
 
     def _parse_header(self, blob):
@@ -353,10 +476,79 @@ class ColorBlobStore:
             return None
         return record
 
+    def _scramble_map(self, mesh):
+        """(idx, src_n) when the mesh carries a usable NON-identity
+        loop-index layer - i.e. an exporter/importer permuted or duplicated
+        the loops and the byte stream can be rebuilt.  None otherwise (no
+        layer, identity = the raw path is already right, or loops were
+        DROPPED - then part of the stream is simply gone and no rebuild can
+        pass the CRC, so allocating for it is pointless)."""
+        idx = loop_index_array(mesh)
+        if idx is None:
+            return None
+        n_loops = len(mesh.loops)
+        tracked = idx >= 0
+        if not tracked.any():
+            return None
+        src_n = int(idx.max()) + 1
+        # src_n > n_loops would mean original loops vanished; it also caps
+        # the rebuild allocation against a garbage layer
+        if src_n <= 0 or src_n > n_loops:
+            return None
+        if src_n == n_loops and bool(tracked.all()) \
+                and bool((idx == np.arange(n_loops, dtype=np.int64)).all()):
+            return None
+        return idx, src_n
+
+    def _descrambled_layers(self, mesh, idx, src_n):
+        """Rebuild every mirror layer's ORIGINAL byte block by scattering
+        the current per-loop bytes back to their original loop offsets.
+        Untracked loops (idx -1) stay out.  Loops sharing one original
+        offset must carry IDENTICAL bytes - true for the duplicates a
+        triangulating exporter makes, false when two joined carriers'
+        identity ranges collide (a plain Ctrl+J of two containers): there
+        the last write would win and the rebuild would quietly hand back
+        ONE window's record as the whole mesh's - so any disagreement
+        refuses the rebuild instead.  Returns (names, {name: flat uint8
+        array of src_n*4}) or None."""
+        names = self.color_names(mesh)
+        if not names:
+            return None
+        n_loops = len(mesh.loops)
+        tracked = np.flatnonzero(idx >= 0)
+        slots = idx[tracked]
+        rebuilt = {}
+        for name in names:
+            attr = self._color_layer(mesh, name, n_loops)
+            if attr is None:
+                return None
+            cur = read_srgb_bytes(attr).reshape(-1, 4)
+            buf = np.zeros((src_n, 4), dtype=np.uint8)
+            buf[slots] = cur[tracked]
+            if not bool((buf[slots] == cur[tracked]).all()):
+                return None  # colliding claims - not a pure permutation
+            rebuilt[name] = buf.ravel()
+        return names, rebuilt
+
+    def _decode_descrambled(self, mesh):
+        """The rescue half of decode_colors: rebuild the stream through the
+        loop-index layer and parse it.  CRC still guards the result."""
+        m = self._scramble_map(mesh)
+        if m is None:
+            return None
+        rebuilt = self._descrambled_layers(mesh, m[0], m[1])
+        if rebuilt is None:
+            return None
+        names, bufs = rebuilt
+        return self._decode_blob(np.concatenate([bufs[n] for n in names]).tobytes())
+
     def decode_colors(self, mesh):
         """Decode the record from ``<prefix>*`` color attributes (after an
         FBX round trip with default settings).  CRC-guarded: returns None
-        on any corruption instead of a plausible-but-wrong record."""
+        on any corruption instead of a plausible-but-wrong record.  When the
+        direct parse fails and the mesh carries a permuted loop-index layer
+        (a triangulating exporter re-ordered the loops), the stream is
+        rebuilt by original loop offsets and parsed again."""
         names = self.color_names(mesh)
         if not names:
             return None
@@ -369,7 +561,10 @@ class ColorBlobStore:
             if attr is None:
                 return None
             chunks.append(read_srgb_bytes(attr))
-        return self._decode_blob(np.concatenate(chunks).tobytes())
+        record = self._decode_blob(np.concatenate(chunks).tobytes())
+        if record is not None:
+            return record
+        return self._decode_descrambled(mesh)
 
     def _candidate_offsets(self, t0):
         m = np.frombuffer(self.magic, dtype=np.uint8)
@@ -422,9 +617,6 @@ class ColorBlobStore:
         if t0 is None:
             return []
         n_loops = len(mesh.loops)
-        cand = self._candidate_offsets(t0)
-        if not cand:
-            return []
         layers = {names[0]: t0.ravel()}
 
         def layer_bytes(name):
@@ -432,6 +624,46 @@ class ColorBlobStore:
                 attr = self._color_layer(mesh, name, n_loops)
                 layers[name] = None if attr is None else read_srgb_bytes(attr)
             return layers[name]
+
+        return self._scan_stream(names, t0, layer_bytes, n_loops)
+
+    def scan_windows_ex(self, mesh):
+        """scan_windows plus the descramble rescue: when the raw scan finds
+        NOTHING and the mesh carries a permuted loop-index layer (an FBX
+        pipeline with "Triangulate Faces" re-ordered/duplicated the loops),
+        the layers are rebuilt by original loop offsets and scanned again.
+        Returns (windows, loop_idx): loop_idx is None for the raw path
+        (window offsets are CURRENT loop offsets, as always) and the
+        original-index array for the rescue path - window offsets then
+        live in ORIGINAL loop space and callers must map current loops
+        through the array.  The rescue can only ever reconstruct ONE
+        window: after a join the per-window identity ranges collide, which
+        is fine - a container is reconciled (single canonical window)
+        before it is allowed to travel by FBX."""
+        windows = self.scan_windows(mesh)
+        if windows:
+            return windows, None
+        m = self._scramble_map(mesh)
+        if m is None:
+            return [], None
+        idx, src_n = m
+        rebuilt = self._descrambled_layers(mesh, idx, src_n)
+        if rebuilt is None:
+            return [], None
+        names, bufs = rebuilt
+        t0 = bufs[names[0]].reshape(-1, 4)
+        windows = self._scan_stream(names, t0, bufs.get, src_n)
+        if not windows:
+            return [], None
+        return windows, idx
+
+    def _scan_stream(self, names, t0, layer_bytes, n_loops):
+        """Core window scan over ONE byte space - the raw mesh layers or
+        the descrambled rebuild.  ``t0`` is the first layer as (n, 4)
+        uint8; ``layer_bytes(name)`` returns a flat uint8 array or None."""
+        cand = self._candidate_offsets(t0)
+        if not cand:
+            return []
 
         def segment_blob(s, e):
             parts = []
@@ -555,10 +787,14 @@ class ColorBlobStore:
         return record
 
     def strip(self, obj):
-        """Remove the record completely: idprop + mirror + cache entry."""
+        """Remove the record completely: idprop + mirror + cache entry.
+        The shared loop-index layer goes with the LAST namespace stripped
+        from the mesh (the delivery checker rejects service color
+        attributes, so a full strip must leave none behind)."""
         obj.pop(self.prop_key, None)
         if getattr(obj, "type", None) == 'MESH':
             self.remove_mirror(obj.data)
+            drop_orphan_loop_index(obj.data)
         self.cache.pop(obj.name, None)
 
     def invalidate(self, name=None):

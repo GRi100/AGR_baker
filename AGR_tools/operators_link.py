@@ -65,6 +65,15 @@ first touch.  UV channels are never used - the
 delivered file keeps exactly the user's single UV channel.  "Удалить
 память (сдача)" strips everything for a fully clean delivery.
 
+Triangulating exports (FBX "Triangulate Faces" - the delivery setting):
+the T*-blob is a POSITIONAL byte stream over loops, and triangulation
+re-orders/duplicates loops, which used to scramble it beyond CRC repair
+while the per-corner CO/ID VALUES survived.  Every pack therefore writes
+the shared AGR_LoopIdx layer (original loop index + 1 per loop, 0 =
+untracked; core/attr_store.py) and the readers invert the permutation
+when the raw parse fails.  Reproduced and fixed on the real Salarevo
+delivery file.
+
 Known limitations (documented, not bugs):
 - Material slot overrides with link='OBJECT' are baked into mesh data
   by Blender's join; such instances come back with the override as a
@@ -80,17 +89,23 @@ modifiers (modifier support is a possible future step).
 import base64
 import hashlib
 import json
+import os
+import re
+import time
 
 import bpy
 import bmesh
 import numpy as np
-from bpy.props import BoolProperty, EnumProperty, IntProperty
-from bpy.types import Operator, Panel
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
+                       IntProperty, PointerProperty, StringProperty)
+from bpy.types import Operator, Panel, PropertyGroup, UIList
 from mathutils import Matrix
 
 from .log import agr_report
 from .core.attr_store import (ColorBlobStore, preserve_active_color,
-                              read_srgb_bytes, HEADER_V1, HEADER_V2)
+                              read_srgb_bytes, loop_index_array,
+                              loop_index_is_canonical, drop_orphan_loop_index,
+                              HEADER_V1, HEADER_V2)
 from .core.atlas_store import ATLAS_STORE
 from .core.udim_store import UDIM_STORE
 
@@ -266,11 +281,14 @@ def _stamp_fill(mesh, iid):
     attr.data.foreach_set("value", np.full(len(mesh.polygons), iid, dtype=np.intc))
 
 
-def _stamp_remap(mesh, id_map, loop_range=None):
+def _stamp_remap(mesh, id_map, loop_range=None, face_pos=None):
     """Remap existing attribute values old->new; unknown values become 0.
     With ``loop_range=(lo, hi)`` only faces whose loop_start falls in the
     range are touched — used to remap ONE absorbed window of a plain
-    Ctrl+J while the ids of the other blocks stay intact."""
+    Ctrl+J while the ids of the other blocks stay intact.  ``face_pos``
+    overrides the per-face position tested against the range: the rescue
+    path of a permuted mirror hands original loop offsets here, because
+    the windows live in original loop space."""
     attr = _ensure_attr(mesh)
     n = len(mesh.polygons)
     arr = np.zeros(n, dtype=np.intc)
@@ -284,9 +302,10 @@ def _stamp_remap(mesh, id_map, loop_range=None):
     remapped = lut[clipped]
     if loop_range is not None:
         lo, hi = loop_range
-        starts = np.zeros(n, dtype=np.intc)
-        mesh.polygons.foreach_get("loop_start", starts)
-        seg = (starts >= lo) & (starts < hi)
+        if face_pos is None:
+            face_pos = np.zeros(n, dtype=np.intc)
+            mesh.polygons.foreach_get("loop_start", face_pos)
+        seg = (face_pos >= lo) & (face_pos < hi)
         remapped = np.where(seg, remapped, arr)
     attr.data.foreach_set("value", remapped)
 
@@ -325,6 +344,9 @@ def _remove_tracking_attrs(mesh):
         attr = mesh.attributes.get(name)
         if attr is not None:
             mesh.attributes.remove(attr)
+    # the shared loop-index layer goes when no namespace mirrors remain
+    # (delivery files must carry no AGR service color attributes at all)
+    drop_orphan_loop_index(mesh)
 
 
 def _read_face_ids(mesh):
@@ -955,6 +977,15 @@ def _untracked_faces(mesh, windows=None):
     ids = _read_face_ids(mesh)
     if ids is not None:
         return int((ids == 0).sum())
+    # loop-index layer: exact even when an exporter re-ordered/duplicated
+    # the loops (a triangulated mesh has MORE polygons than the table
+    # promises, and the subtraction below would invent phantom untracked
+    # faces).  idx -1 = the zero-fill a plain join gave foreign loops.
+    idx = loop_index_array(mesh)
+    if idx is not None:
+        loop_start = np.zeros(len(mesh.polygons), dtype=np.intc)
+        mesh.polygons.foreach_get("loop_start", loop_start)
+        return int((idx[loop_start] < 0).sum())
     if windows is None:
         windows = _LINK_STORE.scan_windows(mesh)
     total = sum(int(i.get("faces", 0) or 0)
@@ -980,7 +1011,9 @@ def _merged_view(obj):
     # to absorb".
     if idp is not None and _LINK_STORE.count_window_candidates(data) <= 1:
         return idp, 0
-    windows = _LINK_STORE.scan_windows(data)
+    # _ex: the descramble rescue reads a mirror whose loops an FBX
+    # "Triangulate Faces" export permuted (raw scan finds nothing there)
+    windows, _rescue_idx = _LINK_STORE.scan_windows_ex(data)
     if not windows:
         return idp, 0
     if idp is not None:
@@ -1189,7 +1222,7 @@ def _has_foreign_windows(mesh):
     return not (len(windows) == 1 and windows[0][0] == 0)
 
 
-def _unpack_tracking_windows(mesh, windows, merged):
+def _unpack_tracking_windows(mesh, windows, merged, loop_idx=None):
     """FBX path of the plain-Ctrl+J absorb: rebuild the internal tracking
     attributes when the color mirror holds SEVERAL table windows.  Each
     window's vertices are denormalised with ITS OWN co_min/co_size and
@@ -1197,7 +1230,12 @@ def _unpack_tracking_windows(mesh, windows, merged):
     merged without memory) keep their CURRENT coords with orig=False —
     the zero-instance step stamps them afterwards.  Updates
     merged["co_quant"] with the worst window quantum.  Returns True when
-    the mirror was usable."""
+    the mirror was usable.
+
+    loop_idx (from scan_windows_ex's rescue path) maps CURRENT loops to
+    ORIGINAL loop offsets: the windows then live in original space and a
+    plain [s:s+cnt] slice of the current mesh would pick an arbitrary
+    subset (a triangulating exporter re-ordered the loops)."""
     col_co = mesh.attributes.get(COL_CO)
     col_id = mesh.attributes.get(COL_ID)
     if col_co is None or col_id is None:
@@ -1244,7 +1282,11 @@ def _unpack_tracking_windows(mesh, windows, merged):
     quant_worst = float(merged.get("co_quant", 0.0) or 0.0)
 
     for s, cnt, wtbl in windows:
-        w_verts = np.unique(vidx[s:s + cnt])
+        if loop_idx is None:
+            w_loops = vidx[s:s + cnt]
+        else:
+            w_loops = vidx[(loop_idx >= s) & (loop_idx < s + cnt)]
+        w_verts = np.unique(w_loops)
         if len(w_verts) == 0:
             continue
         co_min = np.asarray(wtbl.get("co_min", [0.0, 0.0, 0.0]), dtype=np.float64)
@@ -1307,7 +1349,10 @@ def _reconcile_container(context, obj):
     if mesh.attributes.get(TABLE_COL_PREFIX + "0") is None:
         return None
     idp = _parse_table(obj.get(PROP_KEY))
-    windows = _LINK_STORE.scan_windows(mesh)
+    # rescue path: loop_idx maps current loops to ORIGINAL offsets when an
+    # FBX triangulation permuted the mirror (windows then live in original
+    # loop space and every loop-range test below must go through the map)
+    windows, loop_idx = _LINK_STORE.scan_windows_ex(mesh)
     if not windows:
         return None
     if idp is not None:
@@ -1343,7 +1388,7 @@ def _reconcile_container(context, obj):
         # next reconcile no longer matched its own window and re-absorbed
         # every window under fresh ids - instances duplicated on every run.
         stub = {"co_quant": float((idp or {}).get("co_quant", 0.0) or 0.0)}
-        if not _unpack_tracking_windows(mesh, windows, stub):
+        if not _unpack_tracking_windows(mesh, windows, stub, loop_idx):
             return None  # attrs missing and no usable mirror - cannot absorb
         quant_unpacked = stub["co_quant"]
 
@@ -1358,8 +1403,14 @@ def _reconcile_container(context, obj):
     if quant_unpacked is not None and quant_unpacked > float(merged.get("co_quant", 0.0) or 0.0):
         merged["co_quant"] = quant_unpacked
 
+    if extras and loop_idx is not None:
+        starts = np.zeros(len(mesh.polygons), dtype=np.intc)
+        mesh.polygons.foreach_get("loop_start", starts)
+        remap_pos = loop_idx[starts]
+    else:
+        remap_pos = None
     for s, cnt, id_map in extras:
-        _stamp_remap(mesh, id_map, loop_range=(s, s + cnt))
+        _stamp_remap(mesh, id_map, loop_range=(s, s + cnt), face_pos=remap_pos)
 
     n_loops = len(mesh.loops)
     n_polys = len(mesh.polygons)
@@ -1380,9 +1431,14 @@ def _reconcile_container(context, obj):
         # folded into the zero-instance instead of scrambling extraction
         loop_start_arr = np.zeros(n_polys, dtype=np.intc)
         mesh.polygons.foreach_get("loop_start", loop_start_arr)
+        # a face lives in a window when its first loop does; on the rescue
+        # path that test runs in ORIGINAL loop space (idx -1 = untracked,
+        # matching no window - exactly the foreign zero-fill semantics)
+        face_pos = (loop_start_arr if loop_idx is None
+                    else loop_idx[loop_start_arr])
         in_win = np.zeros(n_polys, dtype=bool)
         for w_s, w_cnt, _wt in windows:
-            in_win |= (loop_start_arr >= w_s) & (loop_start_arr < w_s + w_cnt)
+            in_win |= (face_pos >= w_s) & (face_pos < w_s + w_cnt)
         stray = (~in_win) & (face_ids != 0)
         if stray.any():
             face_ids = np.where(stray, 0, face_ids).astype(np.intc)
@@ -2698,8 +2754,8 @@ class AGR_OT_link_extract_group(Operator):
 
 
 class AGR_OT_link_separate_all(Operator):
-    """Разобрать контейнер полностью: восстановить ВСЕ исходные объекты
-с их именами, позициями, коллекциями и линкованностью"""
+    """Разобрать контейнер: при выборе в списке — только выбранные группы,
+без выбора — восстановить ВСЕ исходные объекты"""
     bl_idname = "agr.link_separate_all"
     bl_label = "Разобрать всё"
     bl_options = {'REGISTER', 'UNDO'}
@@ -2714,7 +2770,16 @@ class AGR_OT_link_separate_all(Operator):
         if table is None:
             agr_report(self, 'ERROR', "❌ AGR Link: таблица контейнера не читается (данные повреждены)")
             return {'CANCELLED'}
-        ids = [int(iid) for iid in table["instances"].keys()]
+        sel = set(_selected_group_ids(context))
+        if sel:
+            ids = [int(iid) for iid, inst in table["instances"].items()
+                   if inst.get("group", 0) in sel]
+            if not ids:
+                agr_report(self, 'ERROR',
+                           "❌ AGR Link: выбранные группы не найдены в контейнере")
+                return {'CANCELLED'}
+        else:
+            ids = [int(iid) for iid in table["instances"].keys()]
         result = _extract_instances(self, context, container, ids)
         return {'FINISHED'} if result is not None else {'CANCELLED'}
 
@@ -2787,7 +2852,17 @@ class AGR_OT_link_restore(Operator):
                        "обычную разборку")
             return {'CANCELLED'}
         if self.group_id < 0:
-            ids = [int(iid) for iid in table["instances"].keys()]
+            # panel buttons: honour the list selection, else the whole container
+            sel = set(_selected_group_ids(context))
+            if sel:
+                ids = [int(iid) for iid, inst in table["instances"].items()
+                       if inst.get("group", 0) in sel]
+                if not ids:
+                    agr_report(self, 'ERROR',
+                               "❌ AGR Link: выбранные группы не найдены в контейнере")
+                    return {'CANCELLED'}
+            else:
+                ids = [int(iid) for iid in table["instances"].keys()]
         else:
             ids = [int(iid) for iid, inst in table["instances"].items()
                    if inst.get("group", 0) == self.group_id]
@@ -2851,6 +2926,615 @@ class AGR_OT_link_strip(Operator):
                 count += 1
         agr_report(self, 'INFO', f"✅ AGR Link: память удалена у {count} объектов — разборка невозможна")
         return {'FINISHED'}
+
+
+# ----------------------------------------------------------------------------
+# Panel list mirror (Scene.agr_link_groups)
+# ----------------------------------------------------------------------------
+# The panel list is a real CollectionProperty synced from the ACTIVE
+# container's merged table: editable rows (rename on double click) and
+# texture-sets-style selection dots need ID properties, which draw() may
+# not create.  A throttled depsgraph handler keeps the mirror fresh;
+# operators resync explicitly before trusting the selection.
+
+_LIST_SYNCING = False    # suppress the name-update callback during rebuilds
+
+
+def _strip_copy_suffix(name):
+    """Drop Blender's ``.NNN`` copy suffix and our ``_NNN`` numbering."""
+    base = re.sub(r"\.\d+$", "", name)
+    base = re.sub(r"_\d+$", "", base)
+    return base
+
+
+def _group_base_name(table, gid, members):
+    """Display/base name of one link group - from OBJECT names, not the
+    datablock (user decision): an explicit stored name wins, then the
+    common base of the member names, then the data name as last resort."""
+    ginfo = table.get("groups", {}).get(str(gid), {})
+    explicit = ginfo.get("name")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    names = sorted(str(m.get("name", "")) for m in members if m.get("name"))
+    if not names:
+        return ginfo.get("data_name") or "?"
+    if len(names) == 1:
+        return names[0]
+    bases = [_strip_copy_suffix(n) for n in names]
+    if bases[0] and all(b == bases[0] for b in bases):
+        return bases[0]
+    prefix = os.path.commonprefix(bases).rstrip("._- ")
+    if len(prefix) >= 2:
+        return prefix
+    return ginfo.get("data_name") or names[0]
+
+
+def _group_rows(obj):
+    """[(gid, base_name, member_count)] of the active container (sorted),
+    or [] when the object is not a container.  Reads the cached merged
+    view - cheap enough for the depsgraph tick."""
+    if obj is None or getattr(obj, "type", None) != 'MESH':
+        return []
+    table, _extras = _peek_merged(obj)
+    if table is None:
+        return []
+    by_group = {}
+    for inst in table.get("instances", {}).values():
+        by_group.setdefault(inst.get("group", 0), []).append(inst)
+    rows = [(gid, _group_base_name(table, gid, members), len(members))
+            for gid, members in by_group.items()]
+    rows.sort(key=lambda r: (r[1].lower(), r[0]))
+    return rows
+
+
+def _sync_group_list(scene, obj):
+    """Rebuild Scene.agr_link_groups when it no longer matches the active
+    container.  Selection survives by gid - but only within the SAME
+    container (gids of different containers are unrelated)."""
+    global _LIST_SYNCING
+    rows = _group_rows(obj)
+    owner = obj.name if (obj is not None and rows) else ""
+    coll = scene.agr_link_groups
+    if (scene.agr_link_groups_owner == owner and len(coll) == len(rows)
+            and all(it.gid == g and it.name == b and it.count == c
+                    for it, (g, b, c) in zip(coll, rows))):
+        return False
+    keep = ({it.gid: it.is_selected for it in coll}
+            if scene.agr_link_groups_owner == owner else {})
+    _LIST_SYNCING = True
+    try:
+        coll.clear()
+        for g, b, c in rows:
+            it = coll.add()
+            it.gid = g
+            it.name = b
+            it.count = c
+            it.is_selected = keep.get(g, False)
+        scene.agr_link_groups_owner = owner
+        if scene.agr_link_groups_index >= len(rows):
+            scene.agr_link_groups_index = max(0, len(rows) - 1)
+    finally:
+        _LIST_SYNCING = False
+    return True
+
+
+def _selected_group_ids(context):
+    """gids ticked in the panel list, resynced first so a stale list can
+    never aim an operator at the wrong container's groups."""
+    scene = context.scene
+    _sync_group_list(scene, context.active_object)
+    return [it.gid for it in scene.agr_link_groups if it.is_selected]
+
+
+def _on_group_item_renamed(self, context):
+    """Editing the name in the list renames the whole group - through an
+    operator, so the change lands in the undo stack."""
+    if _LIST_SYNCING:
+        return
+    try:
+        bpy.ops.agr.link_rename_group('EXEC_DEFAULT', True,
+                                      group_id=self.gid, new_name=self.name)
+    except Exception:
+        # the operator reverts the field via resync on its own failures;
+        # this guard only covers a broken context
+        pass
+
+
+class AGR_LinkGroupItem(PropertyGroup):
+    gid: IntProperty()
+    name: StringProperty(name="Имя", update=_on_group_item_renamed)
+    count: IntProperty()
+    is_selected: BoolProperty(name="Выбрано", default=False)
+
+
+class AGR_UL_LinkGroupsList(UIList):
+    """Groups of the active container: the dot toggles selection (click or
+    drag across rows), double click on the name renames the group."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "is_selected", text="", emboss=False,
+                 icon='RADIOBUT_ON' if item.is_selected else 'RADIOBUT_OFF')
+        row.prop(item, "name", text="", emboss=False,
+                 icon='LINKED' if item.count > 1 else 'OBJECT_DATA')
+        if item.count > 1:
+            sub = row.row(align=True)
+            sub.alignment = 'RIGHT'
+            sub.label(text=f"{item.count} шт.")
+
+
+class AGR_OT_link_rename_group(Operator):
+    """Переименовать группу инстансов контейнера: участники получают имена
+Имя_001, Имя_002…, одиночный объект — просто Имя"""
+    bl_idname = "agr.link_rename_group"
+    bl_label = "Переименовать группу"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    group_id: IntProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    new_name: StringProperty(name="Имя")
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and is_container(context.active_object)
+
+    def execute(self, context):
+        obj = context.active_object
+        scene = context.scene
+
+        def bail(msg):
+            agr_report(self, 'ERROR', msg)
+            _sync_group_list(scene, obj)   # revert the edited field
+            return {'CANCELLED'}
+
+        base = self.new_name.strip()
+        if not base:
+            return bail("❌ AGR Link: пустое имя группы")
+        _tbl, extras = _peek_merged(obj)
+        if extras:
+            return bail("❌ AGR Link: в контейнер влиты чужие таблицы — сначала "
+                        "нажмите «Закрепить память»")
+        table = read_table(obj)
+        if table is None:
+            return bail("❌ AGR Link: таблица контейнера не читается")
+        members = sorted(((int(iid), inst)
+                          for iid, inst in table["instances"].items()
+                          if inst.get("group", 0) == self.group_id),
+                         key=lambda p: str(p[1].get("name", "")))
+        if not members:
+            return bail("❌ AGR Link: группа не найдена в контейнере")
+        if len(members) == 1:
+            members[0][1]["name"] = base
+        else:
+            for i, (_iid, inst) in enumerate(members, 1):
+                inst["name"] = f"{base}_{i:03d}"
+        if str(self.group_id) in table.get("groups", {}):
+            table["groups"][str(self.group_id)]["name"] = base
+
+        write_table(obj, table)
+        mirror_ok = False
+        try:
+            mirror_ok = _pack_tracking_to_colors(obj.data, table)
+        except Exception:
+            _remove_color_mirror(obj.data)
+        if mirror_ok:
+            write_table(obj, table)
+        _invalidate_caches(obj.name)
+        _sync_group_list(scene, obj)
+        msg = f"✅ AGR Link: группа переименована — «{base}» ({len(members)} шт.)"
+        if mirror_ok:
+            agr_report(self, 'INFO', msg)
+        else:
+            agr_report(self, 'WARNING',
+                       msg + " | ⚠️ зеркало не обновлено (FBX уедет со старыми именами)")
+        return {'FINISHED'}
+
+
+class AGR_OT_link_groups_select_all(Operator):
+    """Выбрать все группы в списке (или снять выбор, если что-то выбрано)"""
+    bl_idname = "agr.link_groups_select_all"
+    bl_label = "Все / ничего"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return len(context.scene.agr_link_groups) > 0
+
+    def execute(self, context):
+        items = context.scene.agr_link_groups
+        value = not any(it.is_selected for it in items)
+        for it in items:
+            it.is_selected = value
+        return {'FINISHED'}
+
+
+class AGR_OT_link_select_by_faces(Operator):
+    """Выбрать в списке группы, которым принадлежат выделенные фейсы
+контейнера (Edit Mode)"""
+    bl_idname = "agr.link_select_by_faces"
+    bl_label = "Выбрать группы по фейсам"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'EDIT_MESH'
+                and is_container(context.edit_object))
+
+    def execute(self, context):
+        obj = context.edit_object
+        table = _peek_table(obj)
+        if table is None:
+            agr_report(self, 'ERROR', "❌ AGR Link: таблица контейнера не читается")
+            return {'CANCELLED'}
+        bm = bmesh.from_edit_mesh(obj.data)
+        layer = bm.faces.layers.int.get(ATTR_NAME)
+        if layer is None:
+            agr_report(self, 'ERROR',
+                       f"❌ AGR Link: на контейнере нет атрибута {ATTR_NAME} "
+                       "(свежий импорт? выйдите в Object Mode и зайдите снова)")
+            return {'CANCELLED'}
+        ids = {f[layer] for f in bm.faces if f.select}
+        ids.discard(0)
+        if not ids:
+            agr_report(self, 'WARNING',
+                       "⚠️ AGR Link: среди выделенных фейсов нет размеченных")
+            return {'CANCELLED'}
+        gids = {inst.get("group", 0)
+                for iid, inst in table.get("instances", {}).items()
+                if int(iid) in ids}
+        scene = context.scene
+        _sync_group_list(scene, obj)
+        for it in scene.agr_link_groups:
+            it.is_selected = it.gid in gids
+        agr_report(self, 'INFO',
+                   f"✅ AGR Link: по фейсам выбрано групп: {len(gids)}")
+        return {'FINISHED'}
+
+
+# ----------------------------------------------------------------------------
+# Instance watcher: auto-name linked duplicates in chosen collections
+# ----------------------------------------------------------------------------
+# Live-scene counterpart of the container list: the user picks collections,
+# and every group of objects sharing one mesh datablock inside them is kept
+# named ``Base_001..N`` (its own numbering per group).  The base comes from
+# the object names (or the editable override stored on the MESH - shared by
+# all instances for free); existing valid numbers are kept, newcomers take
+# the lowest free ones, so adding a copy never renumbers the whole group.
+
+WATCH_BASE_KEY = "agr_instance_base"   # per-mesh idprop: user-chosen base
+
+_WATCH_LAST_FP = None
+
+
+def _watch_members(scene):
+    """{mesh: [objects]} across the watched collections - local mesh
+    objects whose datablock is genuinely shared (users >= 2)."""
+    seen_names = set()
+    groups = {}
+    for item in scene.agr_link_watch_colls:
+        coll = item.collection
+        if coll is None:
+            continue
+        for o in coll.all_objects:
+            if (o.type != 'MESH' or o.data is None or o.library is not None
+                    or o.data.library is not None or o.name in seen_names):
+                continue
+            seen_names.add(o.name)
+            me = o.data
+            if me.users - (1 if me.use_fake_user else 0) < 2:
+                continue
+            groups.setdefault(me, []).append(o)
+    return groups
+
+
+def _watch_base(mesh, members):
+    """Base name for one instance group: the stored override, else the
+    common base of the member OBJECT names, else the first name cleaned."""
+    explicit = mesh.get(WATCH_BASE_KEY)
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    names = sorted(o.name for o in members)
+    bases = [_strip_copy_suffix(n) for n in names]
+    if bases and bases[0] and all(b == bases[0] for b in bases):
+        return bases[0]
+    prefix = os.path.commonprefix(bases).rstrip("._- ")
+    if len(prefix) >= 2:
+        return prefix
+    return _strip_copy_suffix(names[0]) or names[0]
+
+
+def _watch_apply(scene):
+    """Enforce ``Base_###`` on every watched group.  Returns
+    (renamed_count, conflict_names).  Objects already carrying a valid
+    unique number keep it; the rest get the lowest free numbers in name
+    order.  Renames go through a temp pass so in-group swaps cannot
+    collide; a name held by a FOREIGN object is reported, Blender's own
+    dedup suffix stays on that member."""
+    renamed, conflicts = 0, []
+    for mesh, members in _watch_members(scene).items():
+        base = _watch_base(mesh, members)
+        pat = re.compile(re.escape(base) + r"_(\d{3,})$")
+        by_num = {}
+        rest = []
+        for o in sorted(members, key=lambda ob: ob.name):
+            m = pat.fullmatch(o.name)
+            num = int(m.group(1)) if m else 0
+            if num > 0 and num not in by_num:
+                by_num[num] = o
+            else:
+                rest.append(o)
+        desired = {o: f"{base}_{n:03d}" for n, o in by_num.items()}
+        free = 1
+        for o in rest:
+            while free in by_num:
+                free += 1
+            desired[o] = f"{base}_{free:03d}"
+            by_num[free] = o
+        pending = [(o, want) for o, want in desired.items() if o.name != want]
+        if not pending:
+            continue
+        for o, _want in pending:
+            o.name = o.name + ".__agr_wtmp"   # free the targets first
+        for o, want in pending:
+            o.name = want
+            if o.name != want:
+                conflicts.append(want)
+            renamed += 1
+    return renamed, conflicts
+
+
+def _watch_fp(scene):
+    """Cheap fingerprint of the watched state - names, bases, membership."""
+    parts = []
+    for mesh, members in _watch_members(scene).items():
+        parts.append((mesh.name, str(mesh.get(WATCH_BASE_KEY, "")),
+                      tuple(sorted(o.name for o in members))))
+    return tuple(sorted(parts))
+
+
+def _watch_tick(scene):
+    """Depsgraph-side auto-apply: only when the watched state changed."""
+    global _WATCH_LAST_FP
+    fp = _watch_fp(scene)
+    if fp == _WATCH_LAST_FP:
+        return
+    renamed, conflicts = _watch_apply(scene)
+    _WATCH_LAST_FP = _watch_fp(scene)
+    if conflicts:
+        agr_report(None, 'WARNING',
+                   "⚠️ AGR Link: имена заняты другими объектами: "
+                   + ", ".join(conflicts[:5]) + ("…" if len(conflicts) > 5 else ""))
+
+
+def _sync_watch_groups(scene):
+    """Mirror the watched instance groups into Scene.agr_link_watch_groups
+    (editable base name + count)."""
+    global _LIST_SYNCING
+    rows = [(mesh.name, _watch_base(mesh, members), len(members))
+            for mesh, members in _watch_members(scene).items()]
+    rows.sort(key=lambda r: (r[1].lower(), r[0]))
+    coll = scene.agr_link_watch_groups
+    if (len(coll) == len(rows)
+            and all(it.key == k and it.name == b and it.count == c
+                    for it, (k, b, c) in zip(coll, rows))):
+        return False
+    _LIST_SYNCING = True
+    try:
+        coll.clear()
+        for k, b, c in rows:
+            it = coll.add()
+            it.key = k
+            it.name = b
+            it.count = c
+        if scene.agr_link_watch_groups_index >= len(rows):
+            scene.agr_link_watch_groups_index = max(0, len(rows) - 1)
+    finally:
+        _LIST_SYNCING = False
+    return True
+
+
+def _on_watch_group_renamed(self, context):
+    if _LIST_SYNCING:
+        return
+    try:
+        bpy.ops.agr.link_watch_rename('EXEC_DEFAULT', True,
+                                      mesh_name=self.key, new_name=self.name)
+    except Exception:
+        pass
+
+
+class AGR_LinkWatchColl(PropertyGroup):
+    collection: PointerProperty(type=bpy.types.Collection, name="Коллекция")
+
+
+class AGR_LinkWatchGroup(PropertyGroup):
+    key: StringProperty()      # mesh datablock name (group identity)
+    name: StringProperty(name="Имя группы", update=_on_watch_group_renamed)
+    count: IntProperty()
+
+
+class AGR_UL_LinkWatchColls(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index):
+        coll = item.collection
+        layout.label(text=coll.name if coll else "(коллекция удалена)",
+                     icon='OUTLINER_COLLECTION')
+
+
+class AGR_UL_LinkWatchGroups(UIList):
+    """Watched instance groups: double click the name to rename the whole
+    group (members become Имя_001, Имя_002, …)."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "name", text="", emboss=False, icon='LINKED')
+        sub = row.row(align=True)
+        sub.alignment = 'RIGHT'
+        sub.label(text=f"{item.count} шт.")
+
+
+_WATCH_ENUM_ITEMS = []   # EnumProperty items must outlive the callback
+
+
+def _watch_enum_items(self, context):
+    global _WATCH_ENUM_ITEMS
+    scene = context.scene
+    watched = {it.collection for it in scene.agr_link_watch_colls if it.collection}
+    items = [(c.name, c.name, "") for c in bpy.data.collections
+             if c.library is None and c not in watched]
+    if not items:
+        items = [("__none__", "(нет коллекций)", "")]
+    _WATCH_ENUM_ITEMS = items
+    return items
+
+
+class AGR_OT_link_watch_add(Operator):
+    """Добавить коллекцию под слежку за инстансами"""
+    bl_idname = "agr.link_watch_add"
+    bl_label = "Добавить коллекцию"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_property = "collection"
+
+    collection: EnumProperty(name="Коллекция", items=_watch_enum_items)
+
+    def invoke(self, context, event):
+        context.window_manager.invoke_search_popup(self)
+        return {'FINISHED'}
+
+    def execute(self, context):
+        global _WATCH_LAST_FP
+        if self.collection == "__none__":
+            return {'CANCELLED'}
+        coll = bpy.data.collections.get(self.collection)
+        if coll is None:
+            return {'CANCELLED'}
+        scene = context.scene
+        if any(it.collection == coll for it in scene.agr_link_watch_colls):
+            return {'CANCELLED'}
+        item = scene.agr_link_watch_colls.add()
+        item.collection = coll
+        _WATCH_LAST_FP = None      # let the next tick re-apply
+        _sync_watch_groups(scene)
+        return {'FINISHED'}
+
+
+class AGR_OT_link_watch_remove(Operator):
+    """Убрать активную коллекцию из-под слежки"""
+    bl_idname = "agr.link_watch_remove"
+    bl_label = "Убрать коллекцию"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return len(context.scene.agr_link_watch_colls) > 0
+
+    def execute(self, context):
+        global _WATCH_LAST_FP
+        scene = context.scene
+        idx = scene.agr_link_watch_colls_index
+        if not (0 <= idx < len(scene.agr_link_watch_colls)):
+            return {'CANCELLED'}
+        scene.agr_link_watch_colls.remove(idx)
+        scene.agr_link_watch_colls_index = min(
+            idx, len(scene.agr_link_watch_colls) - 1)
+        _WATCH_LAST_FP = None
+        _sync_watch_groups(scene)
+        return {'FINISHED'}
+
+
+class AGR_OT_link_watch_apply(Operator):
+    """Прогнать схему имён по наблюдаемым коллекциям прямо сейчас:
+каждая группа инстансов получает имена Имя_001, Имя_002, …"""
+    bl_idname = "agr.link_watch_apply"
+    bl_label = "Применить схему имён"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(it.collection is not None
+                   for it in context.scene.agr_link_watch_colls)
+
+    def execute(self, context):
+        global _WATCH_LAST_FP
+        scene = context.scene
+        renamed, conflicts = _watch_apply(scene)
+        _WATCH_LAST_FP = _watch_fp(scene)
+        _sync_watch_groups(scene)
+        msg = (f"✅ AGR Link: переименовано объектов: {renamed}" if renamed
+               else "✅ AGR Link: все инстансы уже названы по схеме")
+        if conflicts:
+            agr_report(self, 'WARNING', msg + " | ⚠️ имена заняты: "
+                       + ", ".join(conflicts[:5])
+                       + ("…" if len(conflicts) > 5 else ""))
+        else:
+            agr_report(self, 'INFO', msg)
+        return {'FINISHED'}
+
+
+class AGR_OT_link_watch_rename(Operator):
+    """Переименовать группу инстансов: имя запоминается на датаблоке меша
+и применяется ко всем участникам как Имя_001, Имя_002, …"""
+    bl_idname = "agr.link_watch_rename"
+    bl_label = "Переименовать группу инстансов"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mesh_name: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    new_name: StringProperty(name="Имя")
+
+    def execute(self, context):
+        global _WATCH_LAST_FP
+        scene = context.scene
+        mesh = bpy.data.meshes.get(self.mesh_name)
+        base = self.new_name.strip()
+        if mesh is None or not base:
+            _sync_watch_groups(scene)   # revert the edited field
+            return {'CANCELLED'}
+        mesh[WATCH_BASE_KEY] = base
+        renamed, conflicts = _watch_apply(scene)
+        _WATCH_LAST_FP = _watch_fp(scene)
+        _sync_watch_groups(scene)
+        msg = f"✅ AGR Link: группа инстансов → «{base}» (переименовано: {renamed})"
+        if conflicts:
+            agr_report(self, 'WARNING', msg + " | ⚠️ имена заняты: "
+                       + ", ".join(conflicts[:5]))
+        else:
+            agr_report(self, 'INFO', msg)
+        return {'FINISHED'}
+
+
+# ----------------------------------------------------------------------------
+# UI sync handler (panel list + watcher)
+# ----------------------------------------------------------------------------
+
+_UI_SYNC_LAST = 0.0
+
+
+@bpy.app.handlers.persistent
+def _link_ui_sync(scene, depsgraph=None):
+    """Throttled depsgraph tick: keep the panel list mirroring the active
+    container and (when enabled) enforce the instance naming scheme.
+    Writes only on actual change, so the tick it triggers itself finds
+    nothing to do and the loop stops."""
+    global _UI_SYNC_LAST
+    now = time.monotonic()
+    if now - _UI_SYNC_LAST < 0.2:
+        return
+    _UI_SYNC_LAST = now
+    try:
+        ctx = bpy.context
+        scn = getattr(ctx, "scene", None)
+        if scn is None or not hasattr(scn, "agr_link_groups"):
+            return
+        view_layer = getattr(ctx, "view_layer", None)
+        active = view_layer.objects.active if view_layer else None
+        _sync_group_list(scn, active)
+        if len(scn.agr_link_watch_colls):
+            if scn.agr_link_watch_enabled:
+                _watch_tick(scn)
+            _sync_watch_groups(scn)
+    except Exception:
+        pass   # a broken tick must never take the depsgraph down
 
 
 # ----------------------------------------------------------------------------
@@ -3005,36 +3689,31 @@ class AGR_PT_LinkPanel(Panel):
                              icon='INFO')
                 layout.label(text="Память объединится при разборке или джойне")
 
-            def group_label(gid, members):
-                if len(members) > 1:
-                    data_name = table.get("groups", {}).get(str(gid), {}).get("data_name", "?")
-                    return f"{data_name} · {len(members)} шт.", 'LINKED'
-                return members[0].get("name", "?"), 'OBJECT_DATA'
+            # the list itself is a Scene mirror kept fresh by the depsgraph
+            # handler: dot = selection (click/drag), double click = rename
+            scn = context.scene
+            items = scn.agr_link_groups
+            n_sel = sum(1 for it in items if it.is_selected)
+            toolbar = layout.row(align=True)
+            toolbar.operator("agr.link_groups_select_all", text="",
+                             icon='CHECKBOX_DEHLT' if n_sel else 'CHECKBOX_HLT')
+            toolbar.operator("agr.link_select_by_faces", text="", icon='FACESEL')
+            toolbar.label(text=(f"Выбрано групп: {n_sel}" if n_sel
+                                else "Клик по точке — выбор, двойной по имени — переименовать"))
+            layout.template_list("AGR_UL_LinkGroupsList", "", scn, "agr_link_groups",
+                                 scn, "agr_link_groups_index",
+                                 rows=min(max(len(items), 3), 8))
 
-            box = layout.column(align=True)
-            for gid in sorted(by_group.keys(), key=lambda g: group_label(g, by_group[g])[0]):
-                members = by_group[gid]
-                text, icon = group_label(gid, members)
-                row = box.row(align=True)
-                row.row().label(text=text, icon=icon)  # expandable, buttons keep their size
-                btns = row.row(align=True)
-                op = btns.operator("agr.link_extract_group", text="", icon='EXPORT')
-                op.group_id = gid
-                op = btns.operator("agr.link_restore", text="", icon='LOOP_BACK')
-                op.mode = 'SOFT'
-                op.group_id = gid
-                op = btns.operator("agr.link_restore", text="", icon='FILE_REFRESH')
-                op.mode = 'HARD'
-                op.group_id = gid
-
-            layout.operator("agr.link_separate_all", icon='OUTLINER_OB_GROUP_INSTANCE')
+            suffix = f"выбранное ({n_sel})" if n_sel else "всё"
+            layout.operator("agr.link_separate_all", text=f"Разобрать {suffix}",
+                            icon='OUTLINER_OB_GROUP_INSTANCE')
             col = layout.column(align=True)
-            op = col.operator("agr.link_restore", text="Восстановить всё (мягко)",
-                              icon='LOOP_BACK')
+            op = col.operator("agr.link_restore",
+                              text=f"Восстановить {suffix} (мягко)", icon='LOOP_BACK')
             op.mode = 'SOFT'
             op.group_id = -1
-            op = col.operator("agr.link_restore", text="Восстановить всё (жёстко)",
-                              icon='FILE_REFRESH')
+            op = col.operator("agr.link_restore",
+                              text=f"Восстановить {suffix} (жёстко)", icon='FILE_REFRESH')
             op.mode = 'HARD'
             op.group_id = -1
             layout.operator("agr.link_strip", icon='TRASH')
@@ -3069,14 +3748,54 @@ class AGR_PT_LinkPanel(Panel):
             row.alert = True
             row.label(text="Память устарела — меш правился после сборки", icon='ERROR')
         elif state == MIRROR_WINDOWS:
-            # NOT an alert: the memory rides in the merged windows and a
-            # default FBX carries them — the container is simply not
+            # NOT an alert: the memory is still readable (merged windows of
+            # a plain Ctrl+J, or a mirror an FBX triangulation permuted -
+            # the loop-index rescue reads it) — the container is simply not
             # canonical yet, and the button below makes it one
-            row.label(text="Память лежит окнами после обычного Ctrl+J", icon='INFO')
+            row.label(text="Память не закреплена (Ctrl+J / пересборка FBX)", icon='INFO')
         else:
             row.label(text="Зеркала нет — FBX не перенесёт память", icon='INFO')
         op = col.operator("agr.link_refresh", text="Закрепить память", icon='FILE_REFRESH')
         op.scope = 'ACTIVE'
+
+
+class AGR_PT_LinkWatchPanel(Panel):
+    """Слежка за инстансами: выбранные коллекции сканируются, и каждая
+    группа линкованных копий держится в именах Имя_001, Имя_002, …"""
+    bl_label = "Слежка за инстансами"
+    bl_idname = "AGR_PT_link_watch_panel"
+    bl_parent_id = "AGR_PT_link_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'AGR Tools'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        scn = context.scene
+
+        layout.prop(scn, "agr_link_watch_enabled")
+
+        row = layout.row()
+        row.template_list("AGR_UL_LinkWatchColls", "", scn, "agr_link_watch_colls",
+                          scn, "agr_link_watch_colls_index",
+                          rows=min(max(len(scn.agr_link_watch_colls), 2), 4))
+        side = row.column(align=True)
+        side.operator("agr.link_watch_add", text="", icon='ADD')
+        side.operator("agr.link_watch_remove", text="", icon='REMOVE')
+
+        if scn.agr_link_watch_colls:
+            if scn.agr_link_watch_groups:
+                layout.label(text="Группы инстансов (двойной клик — переименовать):")
+                layout.template_list("AGR_UL_LinkWatchGroups", "", scn,
+                                     "agr_link_watch_groups",
+                                     scn, "agr_link_watch_groups_index",
+                                     rows=min(max(len(scn.agr_link_watch_groups), 3), 8))
+            else:
+                layout.label(text="Инстансов в коллекциях не найдено", icon='INFO')
+            layout.operator("agr.link_watch_apply", icon='SORTALPHA')
+        else:
+            layout.label(text="Добавьте коллекции для слежки", icon='INFO')
 
 
 # ----------------------------------------------------------------------------
@@ -3132,10 +3851,25 @@ def _sync_aux_records(obj):
         if raw is None and mesh.attributes.get(store.prefix + "0") is None:
             continue
         state = _store_mirror_state(obj, store)
-        if state == MIRROR_OK and store.verify_frame(mesh) is not False:
+        if (state == MIRROR_OK and store.verify_frame(mesh) is not False
+                and loop_index_is_canonical(mesh)):
+            # same loop-index gate as the link autosync: upgrade pre-layer
+            # records and re-canonicalise a permuted import on save
             continue
         if state == MIRROR_WINDOWS:
-            continue   # buried window(s) - see the docstring
+            # buried windows of a merged-in carrier stay untouched (one
+            # full-mesh repack would overwrite them, scan_windows reads
+            # them as they are) - but a single window that only reads
+            # through the loop-index rescue is this mesh's OWN record
+            # permuted by a triangulating FBX pipeline: repack THAT one.
+            wins, ridx = store.scan_windows_ex(mesh)
+            if ridx is None or len(wins) != 1 or wins[0][0] != 0:
+                continue
+            if store.write(obj, wins[0][2]):
+                fixed.append(f"{obj.name} ({label})")
+            else:
+                failed.append(f"{obj.name} ({label})")
+            continue
         record = store.parse_idprop(raw)
         if record is None:
             if store.count_window_candidates(mesh) > 1:
@@ -3189,12 +3923,16 @@ def _link_save_pre(_dummy):
         state = _mirror_state(obj)
         if state == MIRROR_UNKNOWN:
             continue
-        if state == MIRROR_OK and _LINK_STORE.verify_frame(mesh) is not False:
+        if (state == MIRROR_OK and _LINK_STORE.verify_frame(mesh) is not False
+                and loop_index_is_canonical(mesh)):
             # the header probe cannot see payload corruption that keeps the
             # loop count intact (Sort Elements, delete a quad + build
             # another used to sail through as OK over a CRC-dead mirror),
             # and a legacy v1 frame carries no loop count at all - the deep
-            # byte check runs HERE, once per save, never in poll()/draw()
+            # byte check runs HERE, once per save, never in poll()/draw().
+            # The loop-index gate upgrades pre-2.8 mirrors (no layer yet -
+            # they would not survive a triangulating FBX export) and
+            # re-canonicalises a mesh that came in permuted from an import.
             continue
         if state == MIRROR_NONE and mesh.attributes.get(ATTR_NAME) is None:
             continue   # legacy container: idprop only, nothing to pack FROM
@@ -3249,19 +3987,36 @@ def _clear_caches():
     as unregister(): a dev reload keeps these dicts alive across the module
     swap while the datablocks they describe may already be gone, and
     enumerating them inline is exactly what let one be forgotten before."""
+    global _WATCH_LAST_FP, _UI_SYNC_LAST
     _NO_AUTOSYNC.clear()
     _TABLE_CACHE.clear()
     _MERGED_CACHE.clear()
+    _WATCH_LAST_FP = None
+    _UI_SYNC_LAST = 0.0
 
 
 classes = (
+    AGR_LinkGroupItem,
+    AGR_LinkWatchColl,
+    AGR_LinkWatchGroup,
+    AGR_UL_LinkGroupsList,
+    AGR_UL_LinkWatchColls,
+    AGR_UL_LinkWatchGroups,
     AGR_OT_link_join,
     AGR_OT_link_extract_group,
     AGR_OT_link_separate_all,
     AGR_OT_link_restore,
+    AGR_OT_link_rename_group,
+    AGR_OT_link_groups_select_all,
+    AGR_OT_link_select_by_faces,
+    AGR_OT_link_watch_add,
+    AGR_OT_link_watch_remove,
+    AGR_OT_link_watch_apply,
+    AGR_OT_link_watch_rename,
     AGR_OT_link_refresh,
     AGR_OT_link_strip,
     AGR_PT_LinkPanel,
+    AGR_PT_LinkWatchPanel,
 )
 
 
@@ -3275,12 +4030,27 @@ def register():
                     "иначе экспорт в FBX унесёт устаревшую или разрушенную память, "
                     "хотя сам .blend продолжит работать",
         default=True)
+    bpy.types.Scene.agr_link_groups = CollectionProperty(type=AGR_LinkGroupItem)
+    bpy.types.Scene.agr_link_groups_index = IntProperty(default=0)
+    bpy.types.Scene.agr_link_groups_owner = StringProperty(default="")
+    bpy.types.Scene.agr_link_watch_colls = CollectionProperty(type=AGR_LinkWatchColl)
+    bpy.types.Scene.agr_link_watch_colls_index = IntProperty(default=0)
+    bpy.types.Scene.agr_link_watch_groups = CollectionProperty(type=AGR_LinkWatchGroup)
+    bpy.types.Scene.agr_link_watch_groups_index = IntProperty(default=0)
+    bpy.types.Scene.agr_link_watch_enabled = BoolProperty(
+        name="Следить и именовать автоматически",
+        description="Держать имена линкованных копий в наблюдаемых коллекциях "
+                    "по схеме Имя_001, Имя_002, … (у каждой группы своя нумерация); "
+                    "без галки схему можно прогонять кнопкой",
+        default=False)
 
     _clear_caches()
     # the depsgraph handler is GONE: with the verdict read from the mesh
     # there is nothing to mark, and a per-tick handler that only bookkeeps
     # is exactly what went stale behind undo and dev reloads
     _drop_stale_handlers(bpy.app.handlers.depsgraph_update_post, "_link_depsgraph_post")
+    _drop_stale_handlers(bpy.app.handlers.depsgraph_update_post, "_link_ui_sync")
+    bpy.app.handlers.depsgraph_update_post.append(_link_ui_sync)
     _drop_stale_handlers(bpy.app.handlers.save_pre, "_link_save_pre")
     bpy.app.handlers.save_pre.append(_link_save_pre)
     print("✅ AGR Link operators registered")
@@ -3288,9 +4058,14 @@ def register():
 
 def unregister():
     _drop_stale_handlers(bpy.app.handlers.save_pre, "_link_save_pre")
+    _drop_stale_handlers(bpy.app.handlers.depsgraph_update_post, "_link_ui_sync")
     _drop_stale_handlers(bpy.app.handlers.depsgraph_update_post, "_link_depsgraph_post")
     _clear_caches()
-    if hasattr(bpy.types.Scene, "agr_link_autosync"):
-        del bpy.types.Scene.agr_link_autosync
+    for prop in ("agr_link_autosync", "agr_link_groups", "agr_link_groups_index",
+                 "agr_link_groups_owner", "agr_link_watch_colls",
+                 "agr_link_watch_colls_index", "agr_link_watch_groups",
+                 "agr_link_watch_groups_index", "agr_link_watch_enabled"):
+        if hasattr(bpy.types.Scene, prop):
+            delattr(bpy.types.Scene, prop)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

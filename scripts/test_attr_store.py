@@ -12,7 +12,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from AGR_tools.core.attr_store import (ColorBlobStore, preserve_active_color,
-                                       read_srgb_bytes)
+                                       read_srgb_bytes, loop_index_array,
+                                       loop_index_is_canonical, LOOP_IDX_NAME)
 
 FAILS = []
 
@@ -273,6 +274,126 @@ check("cleanmesh: active color stays unset",
 check("cleanmesh: default/render color stays unset",
       o_clean.data.color_attributes.render_color_index == -1,
       str(o_clean.data.color_attributes.render_color_index))
+
+print("== 11. loop-index rescue: records survive TRIANGULATION ==")
+# The mirror is a positional byte stream over loops; "Triangulate Faces"
+# in the FBX exporter (the delivery pipeline's setting) re-orders and
+# duplicates loops, which used to scramble the stream beyond CRC repair.
+# The shared AGR_LoopIdx layer written by every pack makes the permutation
+# invertible.  Reproduced on the real Salarevo delivery file.
+import bmesh
+
+
+def triangulate_mesh(mesh):
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bmesh.ops.triangulate(bm, faces=bm.faces[:])
+    bm.to_mesh(mesh)
+    bm.free()
+
+
+reset_scene()
+o_tri = make_obj("TriCarrier")   # cube = 6 quads, all of them get split
+STORE_A.write(o_tri, RECORD)
+check("tri: pack writes the loop-index layer",
+      o_tri.data.attributes.get(LOOP_IDX_NAME) is not None)
+check("tri: layer is the identity in a healthy .blend",
+      loop_index_is_canonical(o_tri.data))
+o_tri.pop("agr_test_a", None)    # colors-only, like a fresh FBX import
+triangulate_mesh(o_tri.data)
+check("tri: loops actually grew (24 -> 36)", len(o_tri.data.loops) == 36,
+      str(len(o_tri.data.loops)))
+idx = loop_index_array(o_tri.data)
+check("tri: index layer survived and is NOT identity",
+      idx is not None and not loop_index_is_canonical(o_tri.data))
+check("tri: read() rescues the FULL record", STORE_A.read(o_tri) == RECORD)
+check("tri: peek() rescues too", STORE_A.peek(o_tri) == RECORD)
+wins, ridx = STORE_A.scan_windows_ex(o_tri.data)
+check("tri: scan_windows_ex finds ONE window at original loop 0",
+      len(wins) == 1 and wins[0][0] == 0 and wins[0][1] == 24,
+      str([(s, c) for s, c, _r in wins]))
+check("tri: rescue path reports the loop map", ridx is not None)
+check("tri: raw scan_windows honestly finds nothing",
+      STORE_A.scan_windows(o_tri.data) == [])
+
+print("== 11b. legacy mirror (no index layer) refuses honestly ==")
+reset_scene()
+o_leg = make_obj("TriLegacy")
+STORE_A.write(o_leg, RECORD)
+o_leg.pop("agr_test_a", None)
+attr = o_leg.data.attributes.get(LOOP_IDX_NAME)
+o_leg.data.attributes.remove(attr)          # simulate a pre-layer container
+triangulate_mesh(o_leg.data)
+check("legacy: read is None (no map, no guessing)", STORE_A.read(o_leg) is None)
+
+print("== 11c. colliding identity ranges refuse the rescue ==")
+# plain join of TWO carriers concatenates two identity maps [1..n, 1..n]:
+# a scatter would let the last writer win and hand back ONE record as the
+# whole mesh's - the byte-agreement guard must refuse instead
+reset_scene()
+c1 = make_obj("Coll1")
+c2 = make_obj("Coll2")
+rec_c1 = {"marker": 1, "who": "first"}
+rec_c2 = {"marker": 1, "who": "second"}
+STORE_A.write(c1, rec_c1)
+STORE_A.write(c2, rec_c2)
+for obj in bpy.data.objects:
+    obj.select_set(True)
+bpy.context.view_layer.objects.active = c1
+bpy.ops.object.join()
+triangulate_mesh(c1.data)                   # raw windows die too
+c1.pop("agr_test_a", None)
+check("collision: decode refuses (no plausible-but-wrong record)",
+      STORE_A.decode_colors(c1.data) is None)
+check("collision: read is None (honest loss)", STORE_A.read(c1) is None)
+
+print("== 11d. shared map survives a NEIGHBOR's repack ==")
+# the real Salarevo bug: the atlas record repacked first and rewrote the
+# shared layer to identity, killing the link rescue that still needed it
+reset_scene()
+o_two = make_obj("TwoNamespaces")
+rec_a = {"marker": 1, "ns": "a", "pad": "y" * 200}
+rec_b = {"ns": "b"}
+STORE_A.write(o_two, rec_a)
+STORE_B.write(o_two, rec_b)
+o_two.pop("agr_test_a", None)
+o_two.pop("agr_test_b", None)
+triangulate_mesh(o_two.data)
+check("two-ns: B rescues before any repack", STORE_B.read(o_two) == rec_b)
+check("two-ns: B repack succeeds", STORE_B.write(o_two, rec_b) is True)
+check("two-ns: map PRESERVED while A still needs it",
+      not loop_index_is_canonical(o_two.data))
+check("two-ns: A still rescues after B's repack", STORE_A.read(o_two) == rec_a)
+check("two-ns: B's fresh blob reads raw", STORE_B.decode_colors(o_two.data) == rec_b)
+check("two-ns: A repack succeeds", STORE_A.write(o_two, rec_a) is True)
+check("two-ns: map canonicalised once every neighbor reads raw",
+      loop_index_is_canonical(o_two.data))
+check("two-ns: A reads raw after its repack", STORE_A.decode_colors(o_two.data) == rec_a)
+
+print("== 11e. strip drops the shared layer with the LAST namespace ==")
+STORE_A.strip(o_two)
+check("strip A: layer stays while B lives",
+      o_two.data.attributes.get(LOOP_IDX_NAME) is not None)
+STORE_B.strip(o_two)
+check("strip B: layer gone with the last namespace",
+      o_two.data.attributes.get(LOOP_IDX_NAME) is None)
+
+print("== 11f. FBX roundtrip with use_triangles=True (delivery setting) ==")
+reset_scene()
+o_fbx = make_obj("TriFbx")
+STORE_A.write(o_fbx, RECORD)
+fbx_tri = os.path.join(bpy.app.tempdir, "attr_store_tri.fbx")
+bpy.ops.object.select_all(action='DESELECT')
+o_fbx.select_set(True)
+bpy.ops.export_scene.fbx(filepath=fbx_tri, use_selection=True, use_triangles=True)
+reset_scene()
+bpy.ops.import_scene.fbx(filepath=fbx_tri)
+o_imp = bpy.data.objects.get("TriFbx")
+check("fbx-tri: imported", o_imp is not None)
+if o_imp is not None:
+    check("fbx-tri: triangulated by the exporter", len(o_imp.data.polygons) == 12)
+    check("fbx-tri: FULL record rescued after the roundtrip",
+          STORE_A.read(o_imp) == RECORD)
 
 print("=" * 60)
 if FAILS:

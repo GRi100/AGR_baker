@@ -2506,6 +2506,251 @@ check("phantom: «Закрепить память» materialises a STAMPED table
       str(len((tbl or {}).get("instances", {}))))
 
 # ---------------------------------------------------------------------------
+print("\n=== 80. FBX «Triangulate Faces»: память выживает через AGR_LoopIdx ===")
+# The delivery pipeline exports with use_triangles=True: every quad becomes
+# two tris whose corners REPEAT, so the positional T*-byte stream used to
+# scramble beyond CRC repair - while CO/ID (per-corner VALUES) survived.
+# Reproduced on the real Salarevo file (Flora 14904 -> 16200 loops, the
+# AGRL magic shifted off loop 0).  The shared AGR_LoopIdx layer written by
+# every pack inverts the permutation at read time.
+from AGR_tools.core.attr_store import LOOP_IDX_NAME, loop_index_is_canonical  # noqa: E402
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0), rot=(0, 0, 10)))
+a2 = add_obj("A2", mesh_a, TRS((4, 0, 0), rot=(0, 0, 30)))
+a3 = add_obj("A3", mesh_a, TRS((8, 1, 2), scale=(1, 2, 1)))
+orig = {o.name: o.matrix_world.copy() for o in (a1, a2, a3)}
+select_only([a1, a2, a3], a1)
+bpy.ops.agr.link_join()
+cont = bpy.data.objects[0]
+check("tri: loop-index layer written by the join",
+      cont.data.attributes.get(LOOP_IDX_NAME) is not None)
+# an atlas record on the SAME mesh: the shared map must survive the
+# NEIGHBOR's repack order (the real Salarevo failure mode)
+atlas_rec80 = {"version": 1,
+               "atlases": [{"atlas_name": "A_Tri", "atlas_type": "HIGH",
+                            "atlas_size": 512, "material_name": "M_X_1",
+                            "bin": 0, "folder": "//AGR_BAKE/A_Tri",
+                            "created_atlases": {}, "layout": []}]}
+check("tri: atlas record on the container too",
+      ATLAS_STORE.write(cont, atlas_rec80) is True)
+fbx80 = os.path.join(bpy.app.tempdir, "agr_link_triangles.fbx")
+select_only([cont], cont)
+bpy.ops.export_scene.fbx(filepath=fbx80, use_selection=True, use_triangles=True)
+
+# --- flow A: read + disassemble straight off the import
+reset_scene()
+bpy.ops.import_scene.fbx(filepath=fbx80)
+cont2 = next((o for o in bpy.data.objects
+              if o.type == 'MESH' and linkmod.is_container(o)), None)
+check("tri: container recognised after the triangulated import", cont2 is not None)
+check("tri: the mesh really is triangulated",
+      cont2 is not None and len(cont2.data.polygons) == 3 * 12,
+      str(None if cont2 is None else len(cont2.data.polygons)))
+table80 = linkmod.read_table(cont2)
+check("tri: table decoded through the rescue",
+      table80 is not None and len(table80["instances"]) == 3
+      and len(table80["groups"]) == 1,
+      str(None if table80 is None else len(table80["instances"])))
+check("tri: no phantom zero-instance (idx-aware untracked count)",
+      table80 is not None and len(table80["instances"]) == 3)
+check("tri: raw window scan honestly finds nothing (the stream IS permuted)",
+      linkmod._LINK_STORE.scan_windows(cont2.data) == [])
+check("tri: atlas record rescued on the same mesh",
+      ATLAS_STORE.read(cont2) == atlas_rec80)
+select_only([cont2], cont2)
+check("tri: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+restored = {o.name: o for o in bpy.data.objects if o.type == 'MESH'}
+check("tri: all three restored", set(restored) == {"A1", "A2", "A3"},
+      str(set(restored)))
+for name in ("A1", "A2", "A3"):
+    check(f"tri: {name} matrix restored",
+          name in restored and mat_close(restored[name].matrix_world, orig[name], tol=1e-3))
+check("tri: linked again",
+      len({o.data for o in restored.values()}) == 1 if len(restored) == 3 else False)
+check("tri: restored faces are triangulated (honest geometry)",
+      all(len(o.data.polygons) == 12 for o in restored.values()))
+
+# --- flow B: «Закрепить память» canonicalises the permuted import
+reset_scene()
+bpy.ops.import_scene.fbx(filepath=fbx80)
+cont3 = next((o for o in bpy.data.objects
+              if o.type == 'MESH' and linkmod.is_container(o)), None)
+check("tri-B: state before is WINDOWS (not canonical, still readable)",
+      cont3 is not None and linkmod._mirror_state(cont3) == linkmod.MIRROR_WINDOWS,
+      str(None if cont3 is None else linkmod._mirror_state(cont3)))
+select_only([cont3], cont3)
+check("tri-B: refresh FINISHED",
+      bpy.ops.agr.link_refresh(scope='ACTIVE') == {'FINISHED'})
+check("tri-B: mirror OK after refresh",
+      linkmod._mirror_state(cont3) == linkmod.MIRROR_OK,
+      linkmod._mirror_state(cont3))
+check("tri-B: shared map canonical once BOTH namespaces repacked",
+      loop_index_is_canonical(cont3.data))
+check("tri-B: both namespaces read RAW from loop 0 now (CRC-verified)",
+      linkmod._LINK_STORE.verify_frame(cont3.data) is True
+      and ATLAS_STORE.verify_frame(cont3.data) is True)
+select_only([cont3], cont3)
+check("tri-B: strip FINISHED", bpy.ops.agr.link_strip() == {'FINISHED'})
+check("tri-B: strip removed the loop-index layer too",
+      cont3.data.attributes.get(LOOP_IDX_NAME) is None)
+
+# ---------------------------------------------------------------------------
+print("\n=== 81. Panel list mirror: имена по объектам + переименование группы ===")
+reset_scene()
+scene = bpy.context.scene
+mesh_t = make_cube_mesh("MeshTree")
+t1 = add_obj("Tree.001", mesh_t, T(0, 0, 0))
+t2 = add_obj("Tree.002", mesh_t, T(3, 0, 0))
+solo = add_obj("Камень", make_cube_mesh("MeshRock"), T(0, 5, 0))
+select_only([t1, t2, solo], t1)
+bpy.ops.agr.link_join()
+cont = bpy.context.view_layer.objects.active
+linkmod._sync_group_list(scene, cont)
+rows = {it.name: (it.gid, it.count) for it in scene.agr_link_groups}
+check("list: two rows", len(scene.agr_link_groups) == 2, str(list(rows)))
+check("list: group named by OBJECT base, not data",
+      "Tree" in rows and rows["Tree"][1] == 2, str(list(rows)))
+check("list: standalone row by object name",
+      "Камень" in rows and rows["Камень"][1] == 1)
+check("list: owner recorded", scene.agr_link_groups_owner == cont.name)
+
+tree_gid = rows["Tree"][0]
+select_only([cont], cont)
+check("rename: op FINISHED",
+      bpy.ops.agr.link_rename_group(group_id=tree_gid, new_name="Дерево") == {'FINISHED'})
+tbl = linkmod.read_table(cont)
+tree_names = sorted(inst["name"] for inst in tbl["instances"].values()
+                    if inst.get("group", 0) == tree_gid)
+check("rename: instances numbered Имя_###",
+      tree_names == ["Дерево_001", "Дерево_002"], str(tree_names))
+check("rename: group keeps explicit name",
+      tbl["groups"][str(tree_gid)].get("name") == "Дерево")
+check("rename: mirror repacked (CRC ok)",
+      linkmod._LINK_STORE.verify_frame(cont.data) is True)
+linkmod._sync_group_list(scene, cont)
+check("rename: list row follows",
+      any(it.name == "Дерево" and it.count == 2 for it in scene.agr_link_groups))
+# renaming through the list property fires the same operator
+for it in scene.agr_link_groups:
+    if it.gid == tree_gid:
+        it.name = "Ель"
+        break
+tbl = linkmod.read_table(cont)
+tree_names = sorted(inst["name"] for inst in tbl["instances"].values()
+                    if inst.get("group", 0) == tree_gid)
+check("rename via list edit: instances renamed",
+      tree_names == ["Ель_001", "Ель_002"], str(tree_names))
+
+print("\n=== 82. Кнопки работают по выбору в списке ===")
+linkmod._sync_group_list(scene, cont)
+for it in scene.agr_link_groups:
+    it.is_selected = (it.gid == tree_gid)
+select_only([cont], cont)
+check("sel-extract: FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+names_now = {o.name for o in bpy.data.objects}
+check("sel-extract: selected group extracted",
+      {"Ель_001", "Ель_002"} <= names_now, str(sorted(names_now)))
+cont_after = next((o for o in bpy.data.objects if linkmod.is_container(o)), None)
+check("sel-extract: container kept the UNselected group", cont_after is not None)
+if cont_after is not None:
+    tbl_after = linkmod.read_table(cont_after)
+    left = sorted(inst["name"] for inst in tbl_after["instances"].values())
+    check("sel-extract: only Камень left inside", left == ["Камень"], str(left))
+    linkmod._sync_group_list(scene, cont_after)
+    check("sel-extract: list resynced to 1 row",
+          len(scene.agr_link_groups) == 1)
+    # no selection -> the same button disassembles the rest
+    select_only([cont_after], cont_after)
+    check("no-sel extract: FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+    check("no-sel extract: Камень restored", "Камень" in {o.name for o in bpy.data.objects})
+
+print("\n=== 83. Выбор групп по выделенным фейсам (Edit Mode) ===")
+import bmesh  # noqa: E402
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, T(0, 0, 0))
+a2 = add_obj("A2", mesh_a, T(3, 0, 0))
+b1 = add_obj("B1", make_cube_mesh("MeshB"), T(0, 5, 0))
+select_only([a1, a2, b1], a1)
+bpy.ops.agr.link_join()
+cont = bpy.context.view_layer.objects.active
+table = linkmod.read_table(cont)
+a_gid = next(inst.get("group", 0) for inst in table["instances"].values()
+             if inst["name"] == "A1")
+a1_iid = next(int(iid) for iid, inst in table["instances"].items()
+              if inst["name"] == "A1")
+select_only([cont], cont)
+bpy.ops.object.mode_set(mode='EDIT')
+bm = bmesh.from_edit_mesh(cont.data)
+layer = bm.faces.layers.int.get(linkmod.ATTR_NAME)
+check("byfaces: id layer visible in edit bmesh", layer is not None)
+for f in bm.faces:
+    f.select_set(f[layer] == a1_iid)
+bmesh.update_edit_mesh(cont.data)
+check("byfaces: op FINISHED", bpy.ops.agr.link_select_by_faces() == {'FINISHED'})
+bpy.ops.object.mode_set(mode='OBJECT')
+sel_gids = {it.gid for it in scene.agr_link_groups if it.is_selected}
+check("byfaces: exactly the A-group selected", sel_gids == {a_gid},
+      f"{sel_gids} vs {{{a_gid}}}")
+
+print("\n=== 84. Слежка за коллекциями: Имя_### у каждой группы ===")
+reset_scene()
+coll = bpy.data.collections.new("WatchMe")
+bpy.context.scene.collection.children.link(coll)
+mesh_b = make_cube_mesh("MeshBush")
+bush = [bpy.data.objects.new(n, mesh_b) for n in ("Bush", "Bush.001", "Bush.002")]
+mesh_r = make_cube_mesh("MeshRock2")
+rocks = [bpy.data.objects.new(n, mesh_r) for n in ("Rock_01", "Rock_02")]
+solo = bpy.data.objects.new("Одиночка", make_cube_mesh("MeshSolo"))
+for o in bush + rocks + [solo]:
+    coll.objects.link(o)
+witem = scene.agr_link_watch_colls.add()
+witem.collection = coll
+renamed, conflicts = linkmod._watch_apply(scene)
+check("watch: renamed instances only", renamed == 5 and not conflicts,
+      f"renamed={renamed} conflicts={conflicts}")
+check("watch: bush group numbered",
+      sorted(o.name for o in bush) == ["Bush_001", "Bush_002", "Bush_003"],
+      str(sorted(o.name for o in bush)))
+check("watch: rock group has its OWN numbering",
+      sorted(o.name for o in rocks) == ["Rock_001", "Rock_002"])
+check("watch: unique object untouched", solo.name == "Одиночка")
+# idempotent
+renamed2, _c = linkmod._watch_apply(scene)
+check("watch: second pass is a no-op", renamed2 == 0)
+# existing valid number is KEPT, newcomers take the lowest free slots
+bush[0].name = "Bush_010"
+extra = bpy.data.objects.new("BushX", mesh_b)
+coll.objects.link(extra)
+linkmod._watch_apply(scene)
+names = sorted(o.name for o in bush + [extra])
+check("watch: kept number survives, newcomer fills the gap",
+      "Bush_010" in names and len(set(names)) == 4
+      and all(n.startswith("Bush_") for n in names), str(names))
+# group rename through the operator (stored on the mesh, shared by twins)
+check("watch-rename: FINISHED",
+      bpy.ops.agr.link_watch_rename(mesh_name=mesh_b.name, new_name="Куст") == {'FINISHED'})
+check("watch-rename: members follow",
+      all(o.name.startswith("Куст_") for o in bush + [extra]),
+      str(sorted(o.name for o in bush + [extra])))
+check("watch-rename: base stored on the mesh",
+      mesh_b.get(linkmod.WATCH_BASE_KEY) == "Куст")
+# a name held by a FOREIGN object is a reported conflict, not a crash
+foreign = bpy.data.objects.new("Ели_001", make_cube_mesh("MeshForeign"))
+bpy.context.scene.collection.objects.link(foreign)
+mesh_b[linkmod.WATCH_BASE_KEY] = "Ели"
+renamed3, conflicts3 = linkmod._watch_apply(scene)
+check("watch: foreign name -> conflict reported", len(conflicts3) == 1,
+      str(conflicts3))
+check("watch: foreign object itself untouched", foreign.name == "Ели_001")
+group_names = sorted(o.name for o in bush + [extra])
+check("watch: group still fully renamed (one got Blender's suffix)",
+      sum(1 for n in group_names if n.startswith("Ели_")) == 4, str(group_names))
+scene.agr_link_watch_colls.clear()
+scene.agr_link_groups.clear()
+
+# ---------------------------------------------------------------------------
 print("\n" + "=" * 60)
 if FAILS:
     print(f"❌ {len(FAILS)} FAILED:")
