@@ -22,6 +22,9 @@ import traceback
 import bpy
 import blf
 import gpu
+import numpy as np
+
+from .log import agr_report, drop_stale_handlers, unregister_classes
 from bpy.props import (
     BoolProperty,
     EnumProperty,
@@ -73,6 +76,20 @@ def _build_unit_rings():
 
 
 _UNIT_RINGS = _build_unit_rings()
+
+# The rings as a flat LINES array in UNIT scale, built ONCE: every sphere is
+# this array scaled by the light's radius and shifted to its position, which
+# turns a 384k-tuple Python loop (2000 lights) into one numpy broadcast.
+_UNIT_SEGMENTS = np.array(
+    [p for ring in _UNIT_RINGS for k in range(len(ring) - 1) for p in (ring[k], ring[k + 1])],
+    dtype='f4',
+)
+
+# Bumped by depsgraph_update_post.  The overlay cache keys on this counter
+# instead of hashing every light position: the old fingerprint cost 6.2 ms
+# per draw callback at 2000 lights (×2 callbacks × every viewport), which
+# alone made a simple view rotation stutter.
+_geo_version = 0
 
 
 def _tag_redraw_view3d(_self=None, _context=None):
@@ -222,15 +239,34 @@ class AGR_OT_replace_with_light(Operator):
     @classmethod
     def poll(cls, context):
         # Removing the object being edited is unsupported - Object Mode only
-        return context.mode == 'OBJECT'
+        if context.mode != 'OBJECT':
+            cls.poll_message_set("Работает только в Object Mode")
+            return False
+        return True
 
     def execute(self, context):
         selected_objects = context.selected_objects.copy()
         if not selected_objects:
-            self.report({'WARNING'}, "Нет выбранных объектов")
+            agr_report(self, 'WARNING', "Нет выбранных объектов")
             return {'CANCELLED'}
 
         s = context.scene.agr_light_settings
+        reparented = 0   # placeholders that hung under a parent (usually _Root)
+        readopted = 0    # children of a placeholder moved onto the light
+
+        # ONE pass over bpy.data.objects for every placeholder's children:
+        # Object.children is a pure-Python generator over the whole file, so
+        # calling it per placeholder was O(placeholders × objects) — 1.05 s
+        # for 300 placeholders in a 22 000-object city file.
+        # Names, not references: a placeholder parented under another
+        # placeholder is deleted while the map is still alive, and a dead
+        # bpy reference raises ReferenceError on the next attribute access.
+        targets = {obj.name for obj in selected_objects}
+        children_of = {}
+        for other in bpy.data.objects:
+            parent = other.parent
+            if parent is not None and parent.name in targets:
+                children_of.setdefault(parent.name, []).append(other.name)
 
         for obj in selected_objects:
             light_data = bpy.data.lights.new(name=f"{obj.name}_Light", type=s.light_type)
@@ -255,11 +291,72 @@ class AGR_OT_replace_with_light(Operator):
             for coll in collections:
                 coll.objects.link(light_object)
 
-            light_object.matrix_world = obj.matrix_world.copy()
+            # Parent FIRST, world matrix after: assigning matrix_world makes
+            # Blender solve matrix_basis against the parent, so the reverse
+            # order would leave the light at the wrong place.  Inheriting the
+            # parent is what keeps "Переименовать Root свет" (it looks for
+            # LIGHT children of the Root empty) working after a replace.
+            vertex_parented = False
+            if obj.parent is not None:
+                light_object.parent = obj.parent
+                light_object.parent_type = obj.parent_type
+                if obj.parent_type == 'BONE':
+                    light_object.parent_bone = obj.parent_bone
+                elif obj.parent_type in {'VERTEX', 'VERTEX_3'}:
+                    # Without this the light hangs off vertex 0 of the parent
+                    # mesh instead of the vertices the placeholder used
+                    light_object.parent_vertices = obj.parent_vertices
+                    vertex_parented = True
+                light_object.matrix_parent_inverse = obj.matrix_parent_inverse.copy()
+                reparented += 1
+                # The precomputed map was built before this light existed:
+                # when the PARENT is a placeholder too and gets processed
+                # later, its own light must adopt this one instead of letting
+                # it be orphaned by the parent's deletion
+                children_of.setdefault(obj.parent.name, []).append(light_object.name)
+
+            if vertex_parented:
+                # A brand-new object's vertex-parent frame is not evaluated
+                # yet, so solving matrix_world against it drops the light in
+                # the wrong place (measured 1.5 m off on a VERTEX_3 parent).
+                # Same parent + same parent_vertices + same parent inverse
+                # means the local basis reproduces the world transform
+                # exactly, with no depsgraph round-trip.
+                light_object.matrix_basis = obj.matrix_basis.copy()
+            else:
+                light_object.matrix_world = obj.matrix_world.copy()
+
+            # Custom properties travel with the object (address markers,
+            # pipeline tags); the RNA-owned "_RNA_UI" bookkeeping does not
+            for key in obj.keys():
+                if key.startswith("_"):
+                    continue
+                try:
+                    light_object[key] = obj[key]
+                except (TypeError, ValueError):
+                    pass  # non-copyable idprop (pointer/ID) — skip silently
+
+            # Re-adopt the placeholder's own children, keeping them in place:
+            # they would otherwise be orphaned AND jump, because the parent
+            # inverse dies with the placeholder
+            for child_name in children_of.get(obj.name, ()):
+                child = bpy.data.objects.get(child_name)
+                if child is None or child.parent is not obj:
+                    continue  # already replaced itself, or re-parented since
+                keep = child.matrix_world.copy()
+                child.parent = light_object
+                child.matrix_parent_inverse = light_object.matrix_world.inverted_safe()
+                child.matrix_world = keep
+                readopted += 1
 
             bpy.data.objects.remove(obj, do_unlink=True)
 
-        self.report({'INFO'}, f"Заменено {len(selected_objects)} объектов на источники света")
+        agr_report(self, 'INFO',
+                   f"Заменено {len(selected_objects)} объектов на источники света")
+        if reparented or readopted:
+            agr_report(self, 'WARNING',
+                       f"Иерархия перенесена: родитель у {reparented}, "
+                       f"дочерних объектов перепривязано: {readopted}")
         print(f"✅ AGR Lights: replaced {len(selected_objects)} objects with {s.light_type} lights")
         return {'FINISHED'}
 
@@ -289,15 +386,18 @@ def _collect_lights(settings):
     return lights, bad_types
 
 
-def _fingerprint(lights, settings):
+def _fingerprint(settings):
+    """Cheap cache key: the settings that shape the overlay plus the
+    depsgraph counter.  Anything that MOVES a light fires
+    depsgraph_update_post, so the counter covers positions without touching
+    a single coordinate here (this runs on every redraw)."""
     return (
         settings.dist_collection.name if settings.dist_collection else "",
         round(settings.dist_omni_radius, 3),
         round(settings.dist_spot_radius, 3),
         settings.dist_show_spheres,
         settings.dist_show_nearest,
-        tuple((name, light_type, round(pos.x, 4), round(pos.y, 4), round(pos.z, 4))
-              for name, pos, light_type, _radius in lights),
+        _geo_version,
     )
 
 
@@ -431,19 +531,23 @@ def _build_overlay_data(lights, settings):
 
     red_spheres = []
     green_spheres = []
-    if settings.dist_show_spheres:
-        for idx in range(n):
-            pos, radius = positions[idx], radii[idx]
-            target = red_spheres if violating[idx] else green_spheres
-            for ring in _UNIT_RINGS:
-                for k in range(len(ring) - 1):
-                    a, b = ring[k], ring[k + 1]
-                    target.append((pos.x + a[0] * radius,
-                                   pos.y + a[1] * radius,
-                                   pos.z + a[2] * radius))
-                    target.append((pos.x + b[0] * radius,
-                                   pos.y + b[1] * radius,
-                                   pos.z + b[2] * radius))
+    if settings.dist_show_spheres and n:
+        # unit segments × radius + position, vectorised per colour group
+        pos_arr = np.array([tuple(p) for p in positions], dtype='f4')
+        rad_arr = np.array(radii, dtype='f4')
+        mask = np.array(violating, dtype=bool)
+        for target_mask, out in ((mask, "red"), (~mask, "green")):
+            if not target_mask.any():
+                continue
+            sub_pos = pos_arr[target_mask]
+            sub_rad = rad_arr[target_mask]
+            pts = (_UNIT_SEGMENTS[None, :, :] * sub_rad[:, None, None]
+                   + sub_pos[:, None, :])
+            coords = pts.reshape(-1, 3).tolist()
+            if out == "red":
+                red_spheres = coords
+            else:
+                green_spheres = coords
 
     return {
         "red_lines": red_lines,
@@ -459,23 +563,27 @@ def _build_overlay_data(lights, settings):
 
 
 def _get_overlay_data(scene):
-    """Cached overlay data; recomputed only when the fingerprint changes."""
+    """Cached overlay data; recomputed only when the fingerprint changes.
+
+    Both draw callbacks (POST_VIEW and POST_PIXEL) call this on every redraw
+    of every viewport, so the cache-hit path must not walk the lights at all:
+    `_collect_lights` only runs on a genuine miss."""
     global _last_stats
     settings = getattr(scene, "agr_light_settings", None)
     if settings is None or settings.dist_collection is None:
         _last_stats = None
         return None
 
-    lights, bad_types = _collect_lights(settings)
-    fp = _fingerprint(lights, settings)
-    if _overlay_cache["fp"] != fp:
+    fp = _fingerprint(settings)
+    if _overlay_cache["fp"] != fp or _overlay_cache["data"] is None:
+        lights, bad_types = _collect_lights(settings)
         _overlay_cache["fp"] = fp
         _overlay_cache["data"] = _build_overlay_data(lights, settings)
+        # SUN/AREA lights carry no exclusion zone and take no part in the
+        # geometry, but their counter is shown in the panel
+        _overlay_cache["data"]["bad_types"] = bad_types
 
     data = _overlay_cache["data"]
-    # SUN/AREA lights are not part of the fingerprint (they carry no
-    # exclusion zone) — refresh their counter even on a cache hit
-    data["bad_types"] = bad_types
     _last_stats = {
         "lights": data["light_count"],
         "violations": data["violation_count"],
@@ -664,6 +772,32 @@ def _distance_toggle(_self, context):
 
 
 @bpy.app.handlers.persistent
+def _bump_geo_version(_scene, depsgraph=None):
+    """Cheap change counter for the overlay cache — anything that moves,
+    adds or removes a light goes through the depsgraph.
+
+    Filtered on purpose: the counter fires on EVERY depsgraph update, and an
+    unfiltered bump made a modal transform of any unrelated building rebuild
+    the whole overlay every tick (57-65 ms at 2000 Omni, against 0.03 ms on a
+    cache hit).  Lights show up in `depsgraph.updates` as Object(type=LIGHT)
+    and/or their Light data; entering, leaving, adding or removing a
+    collection shows up as Collection — which covers the watched-collection
+    membership changes the overlay also depends on.  Without a depsgraph
+    (manual call from tests / a Blender build that omits the argument) the
+    conservative bump is kept."""
+    global _geo_version
+    if depsgraph is None:
+        _geo_version += 1
+        return
+    for update in depsgraph.updates:
+        idblock = update.id
+        if isinstance(idblock, (bpy.types.Collection, bpy.types.Light)) or (
+                isinstance(idblock, bpy.types.Object) and idblock.type == 'LIGHT'):
+            _geo_version += 1
+            return
+
+
+@bpy.app.handlers.persistent
 def _sync_handlers_on_load(_dummy):
     """A file load replaces the WindowManager (the toggle value resets)
     while SpaceView3D draw handlers survive it — re-align handler state
@@ -691,12 +825,12 @@ class AGR_OT_light_distance_select_violations(Operator):
     def execute(self, context):
         data = _get_overlay_data(context.scene)
         if data is None:
-            self.report({'WARNING'}, "Нет данных для проверки — выберите коллекцию")
+            agr_report(self, 'WARNING', "Нет данных для проверки — выберите коллекцию")
             return {'CANCELLED'}
 
         names = data["violating_names"]
         if not names:
-            self.report({'INFO'}, "Нарушений минимальных расстояний нет ✅")
+            agr_report(self, 'INFO', "Нарушений минимальных расстояний нет ✅")
             return {'FINISHED'}
 
         bpy.ops.object.select_all(action='DESELECT')
@@ -712,9 +846,9 @@ class AGR_OT_light_distance_select_violations(Operator):
             except RuntimeError:
                 pass  # hidden from the viewport — selection unsupported
 
-        self.report({'WARNING'},
-                    f"Выделено нарушителей: {selected} из {len(names)} "
-                    f"(пар с нарушением: {data['violation_count']})")
+        agr_report(self, 'WARNING',
+                   f"Выделено нарушителей: {selected} из {len(names)} "
+                   f"(пар с нарушением: {data['violation_count']})")
         return {'FINISHED'}
 
 
@@ -843,8 +977,14 @@ def register():
         update=_distance_toggle,
     )
 
-    if _sync_handlers_on_load not in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.append(_sync_handlers_on_load)
+    # Dedup by NAME, not identity: a dev reload leaves handlers owned by the
+    # previous module object in the list, and those keep driving THEIR draw
+    # handlers, which the live module can never remove (see log.drop_stale_handlers)
+    drop_stale_handlers(bpy.app.handlers.load_post, "_sync_handlers_on_load")
+    bpy.app.handlers.load_post.append(_sync_handlers_on_load)
+
+    drop_stale_handlers(bpy.app.handlers.depsgraph_update_post, "_bump_geo_version")
+    bpy.app.handlers.depsgraph_update_post.append(_bump_geo_version)
 
     # reloadOnSave: the WindowManager value survives re-registration while
     # the draw handlers do not — re-add them if the overlay was left on
@@ -859,15 +999,17 @@ def register():
 
 
 def unregister():
-    if _sync_handlers_on_load in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.remove(_sync_handlers_on_load)
+    drop_stale_handlers(bpy.app.handlers.load_post, "_sync_handlers_on_load")
+    drop_stale_handlers(bpy.app.handlers.depsgraph_update_post, "_bump_geo_version")
 
     _remove_handlers()
 
     if hasattr(bpy.types.WindowManager, "agr_light_distance_show"):
         del bpy.types.WindowManager.agr_light_distance_show
 
-    del bpy.types.Scene.agr_light_settings
+    if hasattr(bpy.types.Scene, "agr_light_settings"):
+        del bpy.types.Scene.agr_light_settings
 
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    # Idempotent: a rollback may run on a module whose register() died
+    # part-way, leaving only some of these classes live
+    unregister_classes(classes)

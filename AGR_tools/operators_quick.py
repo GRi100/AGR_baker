@@ -6,9 +6,12 @@ Activated via Alt+2 in Object or Edit mode.
 
 import bpy
 from bpy.types import Operator
+from bpy.app.handlers import persistent
 import gpu
 import blf
 from gpu_extras.batch import batch_for_shader
+
+from .log import drop_stale_handlers, unregister_classes
 
 
 # Singleton instance to prevent multiple quick mode overlays
@@ -40,6 +43,35 @@ def _draw_viewport_hints_callback(operator, context):
     operator.draw_viewport_hints(context)
 
 
+def _drop_active_instance():
+    """Tear down a live Quick Mode HUD without going through its modal()."""
+    global _active_quick_mode_instance
+    prev = _active_quick_mode_instance
+    if prev is None:
+        return
+    prev._is_finished = True
+    if getattr(prev, '_handle', None):
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(prev._handle, 'WINDOW')
+        except Exception:
+            pass
+        prev._handle = None
+    if getattr(prev, '_timer', None):
+        try:
+            bpy.context.window_manager.event_timer_remove(prev._timer)
+        except Exception:
+            pass
+        prev._timer = None
+    _active_quick_mode_instance = None
+
+
+@persistent
+def _quick_on_load_pre(_dummy):
+    # The HUD reads settings of the OLD scene; a file switch must drop it
+    # (same protection operators_library already has)
+    _drop_active_instance()
+
+
 class AGR_OT_QuickMode(Operator):
     """AGR Tools Quick Mode — keyboard-driven baking and conversion"""
     bl_idname = "agr.quick_mode"
@@ -49,24 +81,9 @@ class AGR_OT_QuickMode(Operator):
     def invoke(self, context, event):
         global _active_quick_mode_instance
 
-        # Close previous instance if any
-        if _active_quick_mode_instance is not None:
-            prev = _active_quick_mode_instance
-            prev._is_finished = True
-            # Clean up draw handler and timer even if finish_modal fails partially
-            if prev._handle:
-                try:
-                    bpy.types.SpaceView3D.draw_handler_remove(prev._handle, 'WINDOW')
-                except Exception:
-                    pass
-                prev._handle = None
-            if prev._timer:
-                try:
-                    context.window_manager.event_timer_remove(prev._timer)
-                except Exception:
-                    pass
-                prev._timer = None
-            _active_quick_mode_instance = None
+        # Close previous instance if any (handler + timer, even if its
+        # finish_modal never ran)
+        _drop_active_instance()
 
         # Only works in 3D Viewport
         if context.area.type != 'VIEW_3D':
@@ -167,14 +184,26 @@ class AGR_OT_QuickMode(Operator):
         self._is_finished = True
 
         if self._handle:
-            bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+            except Exception:
+                pass  # handler already gone (area closed / addon reloaded)
             self._handle = None
         if self._timer:
-            context.window_manager.event_timer_remove(self._timer)
+            try:
+                context.window_manager.event_timer_remove(self._timer)
+            except Exception:
+                pass
             self._timer = None
 
         if _active_quick_mode_instance == self:
             _active_quick_mode_instance = None
+
+    def cancel(self, context):
+        """Blender cancels a modal without calling modal() — File→Open or a
+        closing area.  Without this the HUD draw handler survived forever
+        and kept painting over the newly opened file."""
+        self.finish_modal(context)
 
     # ── Helper methods ──────────────────────────────────────────
 
@@ -372,6 +401,10 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
+    # Dedup by NAME: identity checks miss copies left by a dev reload
+    drop_stale_handlers(bpy.app.handlers.load_pre, "_quick_on_load_pre")
+    bpy.app.handlers.load_pre.append(_quick_on_load_pre)
+
     # Register keymaps
     wm = bpy.context.window_manager
     kc = wm.keyconfigs.addon
@@ -388,26 +421,22 @@ def register():
 
 
 def unregister():
-    global _active_quick_mode_instance, _cached_shader
+    global _cached_shader
 
     # Close active instance if running
-    if _active_quick_mode_instance is not None:
-        prev = _active_quick_mode_instance
-        prev._is_finished = True
-        if prev._handle:
-            try:
-                bpy.types.SpaceView3D.draw_handler_remove(prev._handle, 'WINDOW')
-            except Exception:
-                pass
-            prev._handle = None
-        _active_quick_mode_instance = None
+    _drop_active_instance()
+
+    drop_stale_handlers(bpy.app.handlers.load_pre, "_quick_on_load_pre")
 
     _cached_shader = None
 
-    # Remove keymaps
+    # Remove keymaps; a stale item (keyconfig rebuilt by Blender) must not
+    # abort the class unregistration below
     for km, kmi in addon_keymaps:
-        km.keymap_items.remove(kmi)
+        try:
+            km.keymap_items.remove(kmi)
+        except Exception:
+            pass
     addon_keymaps.clear()
 
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)

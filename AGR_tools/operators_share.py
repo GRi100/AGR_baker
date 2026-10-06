@@ -15,6 +15,8 @@ import json
 import subprocess
 import threading
 import tempfile
+import shutil
+import time
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -27,6 +29,7 @@ from bpy.props import (
     CollectionProperty,
 )
 
+from .log import unregister_classes
 from .operators_bake import sanitize_material_name
 
 
@@ -42,6 +45,14 @@ def _utcnow_naive():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _entry_path(entry) -> str:
+    """Yandex.Disk path of an index entry.  Old builds wrote the key `url`,
+    new ones `disk_path` — readers accepted both while the delete path only
+    filtered by `disk_path`, so a legacy entry could never be removed from
+    the shared index.  ONE accessor for every consumer."""
+    return entry.get("disk_path") or entry.get("url", "")
+
+
 def _apply_project_filter(scene):
     active = scene.agr_share_active_project
     show_all = (active == _ALL_PROJECTS)
@@ -52,7 +63,7 @@ def _apply_project_filter(scene):
         item = scene.agr_share_items.add()
         item.sender = entry.get("sender", "?")
         item.timestamp = entry.get("timestamp", "")
-        item.url = entry.get("disk_path", entry.get("url", ""))
+        item.url = _entry_path(entry)
         item.description = entry.get("description", "")
         item.objects_count = entry.get("objects_count", 0)
         item.project = entry.get("project", "")
@@ -92,9 +103,35 @@ def _load_config() -> dict:
 
 
 def _save_config(data: dict):
+    """Write the config atomically: a crash (or a second Blender writing at
+    the same moment) must never leave a truncated JSON that costs the user
+    their OAuth token."""
     global _config_cache
-    with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp_path = f"{_CONFIG_PATH}.tmp{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        # Windows refuses MoveFileEx onto a file another handle holds open
+        # without FILE_SHARE_DELETE — a second Blender reading the config or
+        # an antivirus scan used to blow the Settings dialog up with a
+        # PermissionError traceback and strand the .tmp file forever.  Retry
+        # once, then fall back to a plain copy: not atomic, but the old code
+        # was not atomic either and the user keeps their token.
+        try:
+            os.replace(tmp_path, _CONFIG_PATH)
+        except PermissionError:
+            time.sleep(0.1)
+            try:
+                os.replace(tmp_path, _CONFIG_PATH)
+            except PermissionError:
+                shutil.copyfile(tmp_path, _CONFIG_PATH)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass  # already renamed into place, or never created
     _config_cache = dict(data)
 
 
@@ -245,23 +282,52 @@ def _write_index(ya_token: str, index_data: dict):
     urllib.request.urlopen(put_req, timeout=_TIMEOUT)
 
 
+_LIST_PAGE = 100
+_LIST_MAX_PAGES = 50  # 5000 folders — beyond that we refuse to guess
+
+
 def _yadisk_list_folders(ya_token: str):
     """List subfolder names inside AGR_Share on Yandex.Disk.
-    Returns None when the listing FAILED (e.g. 429/503) — callers must not
-    treat a transient error as "no projects" or they would wipe the shared
-    index for the whole team."""
+
+    Returns None when the listing FAILED (e.g. 429/503) OR came back
+    INCOMPLETE — callers treat None as "no verdict" and never reconcile the
+    shared index from it.  A truncated page used to be taken as the whole
+    truth and dropped every item of every project past the first 100."""
     encoded = urllib.parse.quote(_YADISK_FOLDER)
-    req = urllib.request.Request(
-        f"{_YADISK_API}?path={encoded}&fields=_embedded.items.name,_embedded.items.type&limit=100",
-    )
-    req.add_header("Authorization", f"OAuth {ya_token}")
+    names = []
+    offset = 0
     try:
-        resp = urllib.request.urlopen(req, timeout=_TIMEOUT)
-        data = json.loads(resp.read().decode("utf-8"))
-        items = data.get("_embedded", {}).get("items", [])
-        return [i["name"] for i in items if i.get("type") == "dir"]
+        for _page in range(_LIST_MAX_PAGES):
+            req = urllib.request.Request(
+                f"{_YADISK_API}?path={encoded}"
+                f"&fields=_embedded.items.name,_embedded.items.type,_embedded.total"
+                f"&limit={_LIST_PAGE}&offset={offset}",
+            )
+            req.add_header("Authorization", f"OAuth {ya_token}")
+            resp = urllib.request.urlopen(req, timeout=_TIMEOUT)
+            data = json.loads(resp.read().decode("utf-8"))
+            embedded = data.get("_embedded", {})
+            items = embedded.get("items", [])
+            names.extend(i["name"] for i in items if i.get("type") == "dir")
+            offset += len(items)
+            total = embedded.get("total")
+            if not items:
+                break
+            if total is None:
+                # No total reported: a full page might be a truncation, so
+                # only a SHORT page proves we reached the end
+                if len(items) < _LIST_PAGE:
+                    break
+                continue
+            if offset >= int(total):
+                break
+        else:
+            return None  # page budget exhausted — listing is not complete
     except urllib.error.HTTPError:
         return None
+    except (urllib.error.URLError, ValueError, KeyError):
+        return None
+    return names
 
 
 def _read_items(ya_token: str) -> list:
@@ -338,8 +404,13 @@ def _format_relative_time(iso_str: str) -> str:
 # Notification helpers — Windows toast via PowerShell + WinRT (no pip deps)
 # ---------------------------------------------------------------------------
 
-def _show_windows_toast(title: str, body: str):
+def _show_windows_toast(title: str, body: str) -> bool:
     """Fire a Windows 10/11 toast via PowerShell + WinRT.
+
+    Returns True when the toast was actually launched.  The watcher advances
+    its `last_seen_ts` baseline only for notifications the user really saw,
+    so a missing return value (None) froze the baseline forever and replayed
+    every toast on every poll.
 
     No-op on non-Windows. Uses CREATE_NO_WINDOW so no console flashes.
     Title/body are wrapped in single-quoted PowerShell strings; ' is escaped
@@ -347,7 +418,7 @@ def _show_windows_toast(title: str, body: str):
     single-quoted strings, so this is safe against PS injection.
     """
     if sys.platform != "win32":
-        return
+        return False
 
     title_esc = title.replace("'", "''")
     body_esc = body.replace("'", "''")
@@ -374,8 +445,10 @@ def _show_windows_toast(title: str, body: str):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        return True
     except Exception as e:
         print(f"⚠️ AGR Share toast: {e}")
+        return False
 
 
 def _diff_new_items(items, last_seen_iso, my_sender):
@@ -475,6 +548,12 @@ class _ShareWatcher:
 
     @classmethod
     def start(cls):
+        # Headless Blender (render farm, our own scripts/test_*.py, any
+        # batch job) must not poll Yandex.Disk with the user's token, fire
+        # toasts, or move `last_seen_ts` — that baseline shift makes the
+        # INTERACTIVE Blender miss the very notifications it exists for.
+        if bpy.app.background:
+            return
         with cls._lock:
             if cls._thread is not None and cls._thread.is_alive():
                 return
@@ -515,39 +594,60 @@ class _ShareWatcher:
         cls.start()
 
     @staticmethod
+    def _poll_once(cfg):
+        """One watcher turn on an already-read config.
+
+        Extracted from `_loop` so the toast/baseline bookkeeping can be driven
+        headlessly: the bug where the baseline never advanced was invisible to
+        tests that only covered `_diff_new_items`.
+        Returns False when the watcher should stop for good.
+        """
+        token = cfg.get("yandex_token", "")
+        if not token or not cfg.get("notifications_enabled", True):
+            return False
+        my_sender = cfg.get("sender_name", "")
+        last_seen = cfg.get("last_seen_ts")
+
+        items = _read_items(token)
+        new_items, latest_ts = _diff_new_items(items, last_seen, my_sender)
+
+        if last_seen is None and latest_ts:
+            # Baseline on first run - record, but don't notify.
+            _persist_last_seen(latest_ts)
+        elif new_items:
+            shown = 0
+            for entry in new_items:
+                title = f"AGR Share: {entry.get('sender', '?')}"
+                desc = entry.get("description") or ""
+                body = desc if desc and desc != "No description" \
+                    else f"{entry.get('objects_count', 0)} objects shared"
+                if _show_windows_toast(title, body):
+                    shown += 1
+            # Advance the baseline only for items the user actually saw: a
+            # failed toast used to be recorded as "seen" and that notification
+            # was lost for good
+            if shown == len(new_items):
+                _persist_last_seen(latest_ts)
+            else:
+                print("⚠️ AGR Share: "
+                      f"{len(new_items) - shown} уведомлений не показано — "
+                      "отметка last_seen не сдвинута")
+            bpy.app.timers.register(
+                lambda items=items: _on_new_items_main_thread(items),
+                first_interval=0.1,
+            )
+        return True
+
+    @staticmethod
     def _loop(stop_event):
         while not stop_event.is_set():
-            # cfg is read after the try for the poll interval — keep it bound
+            # cfg is read after the try for the poll interval - keep it bound
             # even when an exception fires before _load_config() returns
             cfg = None
             try:
                 cfg = _load_config()
-                token = cfg.get("yandex_token", "")
-                if not token:
+                if not _ShareWatcher._poll_once(cfg):
                     break
-                if not cfg.get("notifications_enabled", True):
-                    break
-                my_sender = cfg.get("sender_name", "")
-                last_seen = cfg.get("last_seen_ts")
-
-                items = _read_items(token)
-                new_items, latest_ts = _diff_new_items(items, last_seen, my_sender)
-
-                if last_seen is None and latest_ts:
-                    # Baseline on first run — record, but don't notify.
-                    _persist_last_seen(latest_ts)
-                elif new_items:
-                    _persist_last_seen(latest_ts)
-                    for entry in new_items:
-                        title = f"AGR Share: {entry.get('sender', '?')}"
-                        desc = entry.get("description") or ""
-                        body = desc if desc and desc != "No description" \
-                            else f"{entry.get('objects_count', 0)} objects shared"
-                        _show_windows_toast(title, body)
-                    bpy.app.timers.register(
-                        lambda items=items: _on_new_items_main_thread(items),
-                        first_interval=0.1,
-                    )
             except Exception as e:
                 print(f"⚠️ AGR Share watcher: {e}")
 
@@ -612,6 +712,30 @@ class AGR_UL_ShareItemsList(UIList):
 # ---------------------------------------------------------------------------
 # Operators
 # ---------------------------------------------------------------------------
+
+def _share_modal_cancel(op, context):
+    """Shared cancel() body for the threaded Share operators.
+
+    Blender drops a modal without ever calling modal() again (File->Open,
+    the area closing, another modal grabbing the input).  Without this the
+    0.2 s timer kept ticking in every window and `agr_share_is_busy` stayed
+    True, which greys out every Share button by poll() until Blender
+    restarts.  The worker thread is a daemon and finishes on its own; only
+    its result is discarded.
+    """
+    timer = getattr(op, "_timer", None)
+    if timer is not None:
+        try:
+            context.window_manager.event_timer_remove(timer)
+        except Exception:
+            pass
+        op._timer = None
+    try:
+        context.scene.agr_share_is_busy = False
+        context.scene.agr_share_status = "Cancelled"
+    except Exception:
+        pass
+
 
 class AGR_OT_SaveShareConfig(Operator):
     """Open settings dialog for the shared clipboard"""
@@ -691,7 +815,10 @@ class AGR_OT_CreateShareProject(Operator):
 
     @classmethod
     def poll(cls, context):
-        return not context.scene.agr_share_is_busy
+        if context.scene.agr_share_is_busy:
+            cls.poll_message_set("AGR Share занят предыдущей операцией")
+            return False
+        return True
 
     def invoke(self, context, event):
         self.project_name = ""
@@ -726,6 +853,9 @@ class AGR_OT_CreateShareProject(Operator):
         self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        _share_modal_cancel(self, context)
 
     def modal(self, context, event):
         if event.type != 'TIMER':
@@ -795,7 +925,10 @@ class AGR_OT_ShareClipboard(Operator):
 
     @classmethod
     def poll(cls, context):
-        return not context.scene.agr_share_is_busy
+        if context.scene.agr_share_is_busy:
+            cls.poll_message_set("AGR Share занят предыдущей операцией")
+            return False
+        return True
 
     def invoke(self, context, event):
         self._clipboard_contents = self._read_clipboard_contents()
@@ -907,6 +1040,9 @@ class AGR_OT_ShareClipboard(Operator):
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
+    def cancel(self, context):
+        _share_modal_cancel(self, context)
+
     def modal(self, context, event):
         if event.type != 'TIMER':
             return {'PASS_THROUGH'}
@@ -973,7 +1109,10 @@ class AGR_OT_RefreshShareList(Operator):
 
     @classmethod
     def poll(cls, context):
-        return not context.scene.agr_share_is_busy
+        if context.scene.agr_share_is_busy:
+            cls.poll_message_set("AGR Share занят предыдущей операцией")
+            return False
+        return True
 
     def execute(self, context):
         cfg = _load_config()
@@ -995,6 +1134,9 @@ class AGR_OT_RefreshShareList(Operator):
         self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        _share_modal_cancel(self, context)
 
     def modal(self, context, event):
         if event.type != 'TIMER':
@@ -1058,10 +1200,18 @@ class AGR_OT_RefreshShareList(Operator):
             if set(disk_folders) != set(idx_projects):
                 index_data["projects"] = disk_folders
                 valid = set(disk_folders)
-                index_data["items"] = [
-                    i for i in index_data.get("items", [])
+                before = index_data.get("items", [])
+                kept = [
+                    i for i in before
                     if i.get("project", "") in valid or not i.get("project")
                 ]
+                # _yadisk_list_folders now returns None for an INCOMPLETE
+                # listing, so reaching this line means the folder set is the
+                # real one; still say out loud what is being dropped
+                if len(kept) != len(before):
+                    print(f"⚠️ AGR Share: {len(before) - len(kept)} записей ссылались "
+                          f"на удалённые проекты и убраны из индекса")
+                index_data["items"] = kept
                 _write_index(ya_token, index_data)
 
             state["items"] = index_data.get("items", [])
@@ -1094,11 +1244,16 @@ class AGR_OT_ReceiveShared(Operator):
     def poll(cls, context):
         scene = context.scene
         if scene.agr_share_is_busy:
+            cls.poll_message_set("AGR Share занят предыдущей операцией")
             return False
         if len(scene.agr_share_items) == 0:
+            cls.poll_message_set("Список пуст — нажмите Refresh")
             return False
         idx = scene.agr_share_items_index
-        return 0 <= idx < len(scene.agr_share_items)
+        if not (0 <= idx < len(scene.agr_share_items)):
+            cls.poll_message_set("Выберите запись в списке")
+            return False
+        return True
 
     def execute(self, context):
         scene = context.scene
@@ -1130,6 +1285,9 @@ class AGR_OT_ReceiveShared(Operator):
         self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        _share_modal_cancel(self, context)
 
     def modal(self, context, event):
         if event.type != 'TIMER':
@@ -1214,9 +1372,13 @@ class AGR_OT_DeleteShareProject(Operator):
     def poll(cls, context):
         scene = context.scene
         if scene.agr_share_is_busy:
+            cls.poll_message_set("AGR Share занят предыдущей операцией")
             return False
         proj = scene.agr_share_active_project
-        return proj and proj != _ALL_PROJECTS
+        if not proj or proj == _ALL_PROJECTS:
+            cls.poll_message_set("Выберите конкретный проект")
+            return False
+        return True
 
     def invoke(self, context, event):
         return context.window_manager.invoke_confirm(self, event)
@@ -1244,6 +1406,9 @@ class AGR_OT_DeleteShareProject(Operator):
         self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        _share_modal_cancel(self, context)
 
     def modal(self, context, event):
         if event.type != 'TIMER':
@@ -1303,11 +1468,16 @@ class AGR_OT_DeleteShared(Operator):
     def poll(cls, context):
         scene = context.scene
         if scene.agr_share_is_busy:
+            cls.poll_message_set("AGR Share занят предыдущей операцией")
             return False
         if len(scene.agr_share_items) == 0:
+            cls.poll_message_set("Список пуст — нажмите Refresh")
             return False
         idx = scene.agr_share_items_index
-        return 0 <= idx < len(scene.agr_share_items)
+        if not (0 <= idx < len(scene.agr_share_items)):
+            cls.poll_message_set("Выберите запись в списке")
+            return False
+        return True
 
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self, width=420)
@@ -1385,6 +1555,9 @@ class AGR_OT_DeleteShared(Operator):
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
+    def cancel(self, context):
+        _share_modal_cancel(self, context)
+
     def modal(self, context, event):
         if event.type != 'TIMER':
             return {'PASS_THROUGH'}
@@ -1408,15 +1581,22 @@ class AGR_OT_DeleteShared(Operator):
     @staticmethod
     def _do_delete(state, ya_token, disk_path):
         try:
-            if disk_path:
+            # Only a disk path may be handed to the delete API: legacy
+            # entries can carry an HTTP link in the same field, and asking
+            # Yandex.Disk to delete a URL just fails silently
+            if disk_path and disk_path.startswith("app:/"):
                 try:
                     _yadisk_delete(ya_token, disk_path)
                 except urllib.error.HTTPError as e:
                     if e.code != 404:
                         print(f"⚠️ AGR Share: delete file failed: HTTP {e.code}")
+            elif disk_path:
+                print(f"⚠️ AGR Share: entry has no app:/ path ({disk_path}) — "
+                      f"removing the index record only")
 
             items = _read_items(ya_token)
-            items = [i for i in items if i.get("disk_path") != disk_path]
+            # compare through _entry_path so legacy `url`-keyed records go too
+            items = [i for i in items if _entry_path(i) != disk_path]
             _write_items(ya_token, items)
         except urllib.error.HTTPError as e:
             state["error"] = f"HTTP error {e.code}: {e.reason}"
@@ -1570,7 +1750,8 @@ def unregister():
         if hasattr(bpy.types.Scene, p):
             delattr(bpy.types.Scene, p)
 
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    # Idempotent: a rollback may run on a module whose register() died
+    # part-way, leaving only some of these classes live
+    unregister_classes(classes)
 
     print("AGR Share unregistered")

@@ -10,11 +10,20 @@ Esc/RMB/Enter closes.
 """
 
 import bpy
+import numpy as np
 import os
 from bpy.types import Operator
 from bpy.app.handlers import persistent
 
+from .log import drop_stale_handlers, unregister_classes
 from .operators_udim import AGR_UDIMGridHUD
+
+# path → (mtime, size) of the datablock the preview was built from.  Loading
+# a full-size PNG per set cost 58.8 ms per 4K texture (≈6 s for 100 sets on
+# EVERY open); the images now live in bpy.data between opens and are reused
+# when the file on disk has not changed.
+_PREVIEW_IMAGE_NAME = "__agr_library_preview"
+_preview_cache = {}
 
 # Singleton bookkeeping so load_pre/unregister can clean up a live library
 _active_library = None
@@ -41,9 +50,92 @@ def _cleanup_active():
 
 
 @persistent
-def _on_load_pre(_dummy):
+def _library_on_load_pre(_dummy):
     # Draw handlers and temp datablocks must not survive a file switch
     _cleanup_active()
+    drop_preview_cache()
+
+
+def _preview_path(tex_set):
+    """Representative PNG of the set, or None. Pure filesystem lookup —
+    kept separate from the loading so it can be tested headlessly."""
+    for name in (f"T_{tex_set.material_name}_DiffuseOpacity.png",
+                 f"T_{tex_set.material_name}_Diffuse.png"):
+        candidate = os.path.join(tex_set.folder_path, name)
+        if os.path.exists(candidate):
+            return candidate
+    try:
+        for fname in sorted(os.listdir(tex_set.folder_path)):
+            if fname.lower().endswith('.png'):
+                return os.path.join(tex_set.folder_path, fname)
+    except OSError:
+        pass
+    return None
+
+
+def _preview_image(path):
+    """128px preview datablock for `path`, loaded at most once per session.
+    The mtime is part of the key so a re-baked texture still refreshes.
+
+    The datablock is GENERATED and packed — never a loaded FILE image.  A
+    loaded one keeps `filepath` pointing at the real 4K texture, and
+    `img.scale()` marks it dirty; because these previews now outlive the HUD
+    (the whole point of the cache), a single Image → Save All Images, or the
+    Save button of "Save changes before closing?", rewrote every browsed
+    texture on disk as a 128×128 file.  A generated image has no filepath,
+    so those paths skip it entirely.
+    """
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        stamp = 0.0
+
+    cached = _preview_cache.get(path)
+    if cached is not None:
+        name, cached_stamp = cached
+        img = bpy.data.images.get(name)
+        # The source stamp must match too: undo can free a datablock and the
+        # next load may take its exact ".NNN" name for a DIFFERENT set, which
+        # would show someone else's thumbnail
+        if (img is not None and cached_stamp == stamp
+                and img.get('agr_preview_src') == path):
+            return img
+        _preview_cache.pop(path, None)
+        if img is not None:
+            try:
+                bpy.data.images.remove(img)
+            except Exception:
+                pass
+
+    src = bpy.data.images.load(path, check_existing=False)
+    try:
+        src.scale(128, 128)   # full-size pixels are dropped right here
+        buf = np.empty(128 * 128 * 4, dtype=np.float32)
+        src.pixels.foreach_get(buf)
+    finally:
+        bpy.data.images.remove(src)
+
+    img = bpy.data.images.new(_PREVIEW_IMAGE_NAME, 128, 128, alpha=True)
+    img.pixels.foreach_set(buf)
+    img['agr_preview_src'] = path
+    try:
+        img.pack()   # keeps the buffer alive across a depsgraph flush
+    except Exception:
+        pass
+    _preview_cache[path] = (img.name, stamp)
+    return img
+
+
+def drop_preview_cache():
+    """Release every cached preview datablock (file switch / unregister)."""
+    for name, _stamp in list(_preview_cache.values()):
+        img = bpy.data.images.get(name)
+        if img is not None:
+            try:
+                bpy.data.images.remove(img)
+            except Exception:
+                pass
+    _preview_cache.clear()
 
 
 def _resolution_badge(resolution):
@@ -112,37 +204,47 @@ class AGR_OT_LibraryToggle(Operator, AGR_UDIMGridHUD):
         return {'RUNNING_MODAL'}
 
     def _load_set_previews(self, context):
-        """Previews of each set's DO/Diffuse as private temp datablocks —
-        same attrs (_gpu_textures/_preview_images) the mixin cleans up."""
+        """GPU textures for every set, taken from the session preview cache.
+
+        `self._preview_images` stays EMPTY on purpose: the mixin's
+        `_hud_finish` deletes whatever is listed there, and these datablocks
+        must outlive one open — re-decoding a 4K PNG per set is what made the
+        library freeze Blender for seconds on every press."""
         import gpu
         self._gpu_textures = {}
         self._preview_images = []
-        for i, tex_set in enumerate(context.scene.agr_texture_sets):
-            path = None
-            for name in (f"T_{tex_set.material_name}_DiffuseOpacity.png",
-                         f"T_{tex_set.material_name}_Diffuse.png"):
-                candidate = os.path.join(tex_set.folder_path, name)
-                if os.path.exists(candidate):
-                    path = candidate
-                    break
-            if not path:
-                try:
-                    for fname in sorted(os.listdir(tex_set.folder_path)):
-                        if fname.lower().endswith('.png'):
-                            path = os.path.join(tex_set.folder_path, fname)
-                            break
-                except OSError:
-                    pass
-            if not path:
-                continue
+
+        sets = context.scene.agr_texture_sets
+        wm = context.window_manager
+        show_progress = len(sets) > 8
+        if show_progress:
             try:
-                img = bpy.data.images.load(path, check_existing=False)
-                img.name = f"__agr_library_preview_{i}"
-                img.scale(128, 128)
-                self._gpu_textures[i] = gpu.texture.from_image(img)
-                self._preview_images.append(img.name)
-            except Exception as e:
-                print(f"⚠️ Library: preview failed for {tex_set.name}: {e}")
+                wm.progress_begin(0, len(sets))
+            except Exception:
+                show_progress = False
+
+        try:
+            for i, tex_set in enumerate(sets):
+                if show_progress:
+                    try:
+                        wm.progress_update(i)
+                    except Exception:
+                        pass
+                path = _preview_path(tex_set)
+                if not path:
+                    continue
+                try:
+                    img = _preview_image(path)
+                    if img is not None:
+                        self._gpu_textures[i] = gpu.texture.from_image(img)
+                except Exception as e:
+                    print(f"⚠️ Library: preview failed for {tex_set.name}: {e}")
+        finally:
+            if show_progress:
+                try:
+                    wm.progress_end()
+                except Exception:
+                    pass
 
     def _close(self, context):
         global _active_library
@@ -266,18 +368,21 @@ def register():
         name="AGR Library Open", default=False)
     bpy.types.WindowManager.agr_library_token = bpy.props.IntProperty(
         name="AGR Library Token", default=0)
-    if _on_load_pre not in bpy.app.handlers.load_pre:
-        bpy.app.handlers.load_pre.append(_on_load_pre)
+    # Dedup by NAME: a dev reload leaves the previous module's handler in
+    # the list, and only the previous module could remove it by identity
+    drop_stale_handlers(bpy.app.handlers.load_pre, "_library_on_load_pre")
+    bpy.app.handlers.load_pre.append(_library_on_load_pre)
     print("✅ Library operator registered")
 
 
 def unregister():
     _cleanup_active()
-    if _on_load_pre in bpy.app.handlers.load_pre:
-        bpy.app.handlers.load_pre.remove(_on_load_pre)
+    drop_preview_cache()
+    drop_stale_handlers(bpy.app.handlers.load_pre, "_library_on_load_pre")
     if hasattr(bpy.types.WindowManager, 'agr_library_open'):
         del bpy.types.WindowManager.agr_library_open
     if hasattr(bpy.types.WindowManager, 'agr_library_token'):
         del bpy.types.WindowManager.agr_library_token
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    # Idempotent: a rollback may run on a module whose register() died
+    # part-way, leaving only some of these classes live
+    unregister_classes(classes)

@@ -7,6 +7,8 @@ from bpy.types import Operator
 import sys
 import subprocess
 
+from .log import set_pillow_available, unregister_classes
+
 
 class AGR_OT_InstallPillow(Operator):
     """Install PIL/Pillow library for texture resizing"""
@@ -26,12 +28,13 @@ class AGR_OT_InstallPillow(Operator):
             # Install Pillow using pip
             subprocess.check_call([python_exe, "-m", "pip", "install", "Pillow"])
 
-            # Refresh the UI flag so the warning disappears without a
-            # restart when the fresh install is importable right away
+            # Refresh THE flag (log.pillow_available) so the panel warning and
+            # every Pillow branch in the addon agree without a restart — the
+            # old code only patched ui.PILLOW_AVAILABLE, so atlas/frame code
+            # silently kept the degraded no-Pillow path
             try:
                 from PIL import Image  # noqa: F401
-                from . import ui
-                ui.PILLOW_AVAILABLE = True
+                set_pillow_available(True)
                 self.report({'INFO'}, "Pillow installed successfully!")
             except ImportError:
                 self.report({'INFO'}, "Pillow installed successfully! Please restart Blender")
@@ -74,6 +77,5 @@ def register():
 
 def unregister():
     """Unregister utility operators"""
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)
     print("Utility operators unregistered")

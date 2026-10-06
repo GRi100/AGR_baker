@@ -22,6 +22,7 @@ vector Katya asked about is the P popup, and that one is guarded.
 import random
 
 import bpy
+from .log import unregister_classes
 from bpy.types import Menu, Operator
 
 # Vertex count above which the dialog switches to full panic mode
@@ -165,5 +166,4 @@ def unregister():
             pass  # keymap already gone (e.g. Blender shutdown order)
     _addon_keymaps.clear()
 
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)

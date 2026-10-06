@@ -21,42 +21,59 @@ from . import operators_easteregg
 from . import operators_library
 from . import operators_share
 
+# Registration order; unregistration walks it backwards (keep mirrored)
+_MODULES = (
+    operators_bake,
+    operators_sets,
+    operators_utils,
+    operators_udim,
+    operators_uv,
+    operators_link,
+    operators_convert,
+    operators_atlas,
+    operators_frame,
+    operators_rename,
+    operators_rename_project,
+    operators_quick,
+    operators_json,
+    operators_lights,
+    operators_sync,
+    operators_easteregg,
+    operators_library,
+    operators_share,
+)
+
+
 def register():
-    operators_bake.register()
-    operators_sets.register()
-    operators_utils.register()
-    operators_udim.register()
-    operators_uv.register()
-    operators_link.register()
-    operators_convert.register()
-    operators_atlas.register()
-    operators_frame.register()
-    operators_rename.register()
-    operators_rename_project.register()
-    operators_quick.register()
-    operators_json.register()
-    operators_lights.register()
-    operators_sync.register()
-    operators_easteregg.register()
-    operators_library.register()
-    operators_share.register()
+    """Register every operator module, rolling back on failure so a broken
+    module never leaves the addon half-enabled (see __init__.register).
+
+    The failing module is unwound as well — it is the one most likely to hold
+    half of its classes registered."""
+    done = []
+    try:
+        for module in _MODULES:
+            module.register()
+            done.append(module)
+    except Exception:
+        failed = list(_MODULES[len(done):len(done) + 1])
+        for module in reversed(done + failed):
+            try:
+                module.unregister()
+            except Exception as rollback_error:
+                print(f"⚠️ AGR operators: rollback of {module.__name__} failed: {rollback_error}")
+        raise
 
 def unregister():
-    operators_share.unregister()
-    operators_library.unregister()
-    operators_easteregg.unregister()
-    operators_sync.unregister()
-    operators_lights.unregister()
-    operators_json.unregister()
-    operators_quick.unregister()
-    operators_rename_project.unregister()
-    operators_rename.unregister()
-    operators_frame.unregister()
-    operators_atlas.unregister()
-    operators_convert.unregister()
-    operators_link.unregister()
-    operators_uv.unregister()
-    operators_udim.unregister()
-    operators_utils.unregister()
-    operators_sets.unregister()
-    operators_bake.unregister()
+    """Unregister in reverse.  Each module is isolated: an exception in one
+    (a property already gone, a keymap Blender freed) must not strand every
+    module below it registered until Blender restarts."""
+    errors = []
+    for module in reversed(_MODULES):
+        try:
+            module.unregister()
+        except Exception as e:
+            errors.append(f"{module.__name__}: {e}")
+
+    if errors:
+        print("⚠️ AGR operators unregistered with errors:\n  " + "\n  ".join(errors))

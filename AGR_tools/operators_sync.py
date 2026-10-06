@@ -10,15 +10,28 @@ with agr_ to avoid clashing with the old standalone addon if both are
 installed.
 """
 
+import sys
+
 import bpy
 from bpy.props import BoolProperty, FloatProperty
 from bpy.types import Operator, Panel
 from math import cos, radians, sin
 from mathutils import Vector
 
+from .log import drop_stale_handlers, unregister_classes
+
 _last_active_name = None
 _in_handler = False
-_MSGBUS_OWNER = object()
+# Owner is a STRING, not object(): a module-level object() is recreated by
+# every dev reload, so the fresh module could not clear the subscription of
+# the previous one and the old callback kept firing forever.
+# sys.intern: CPython only auto-interns IDENTIFIER-like literals, and a
+# dotted literal is a FRESH object after every module reload, while
+# bpy.msgbus compares owners BY IDENTITY.  The intern table is process-wide,
+# so this returns the very same object no matter which module instance ran —
+# which is what makes clear_by_owner able to drop a dead module's
+# subscription.
+_MSGBUS_OWNER = sys.intern("agr_tools.sync")
 
 
 def _find_view3d_context():
@@ -446,8 +459,9 @@ def register():
     if hasattr(bpy.types, "OUTLINER_HT_header"):
         bpy.types.OUTLINER_HT_header.append(_draw_outliner_header)
 
-    if _resubscribe_on_load not in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.append(_resubscribe_on_load)
+    # Dedup by NAME: identity checks miss zombie copies left by dev reloads
+    drop_stale_handlers(bpy.app.handlers.load_post, "_resubscribe_on_load")
+    bpy.app.handlers.load_post.append(_resubscribe_on_load)
 
     if bpy.context.window_manager and getattr(bpy.context.window_manager, "agr_sync_outliner_view", False):
         _ensure_handlers()
@@ -456,8 +470,7 @@ def register():
 
 
 def unregister():
-    if _resubscribe_on_load in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.remove(_resubscribe_on_load)
+    drop_stale_handlers(bpy.app.handlers.load_post, "_resubscribe_on_load")
 
     _remove_handlers()
 
@@ -477,5 +490,6 @@ def unregister():
     if hasattr(bpy.types.WindowManager, "agr_sync_avoid_occlusion"):
         del bpy.types.WindowManager.agr_sync_avoid_occlusion
 
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    # Idempotent: a rollback may run on a module whose register() died
+    # part-way, leaving only some of these classes live
+    unregister_classes(classes)

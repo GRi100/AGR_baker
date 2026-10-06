@@ -3,6 +3,7 @@ Property definitions for AGR Tools
 """
 
 import bpy
+from .log import unregister_classes
 from bpy.props import (
     StringProperty, 
     BoolProperty, 
@@ -253,11 +254,14 @@ def register():
 
 def unregister():
     """Unregister property classes"""
-    # Remove collections and pointers
-    del bpy.types.Scene.agr_texture_sets
-    del bpy.types.Scene.agr_baker_settings
-    
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    # Remove collections and pointers.  hasattr-guarded: after a failed
+    # register (rollback path) the property may never have been created, and
+    # a bare `del` would abort the rest of the chain with AttributeError
+    for prop in ("agr_texture_sets", "agr_baker_settings"):
+        if hasattr(bpy.types.Scene, prop):
+            delattr(bpy.types.Scene, prop)
+
+
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)
     
     print("Properties unregistered")
