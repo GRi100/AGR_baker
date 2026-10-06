@@ -17,6 +17,8 @@ from bpy.props import (
     IntProperty, CollectionProperty, PointerProperty,
 )
 
+from .log import agr_report, unregister_classes
+
 
 # ────────────────────────────────────────────
 # PropertyGroups
@@ -159,9 +161,41 @@ def _get_template_path(is_ground):
 
 
 def _load_geojson(filepath):
-    """Load and parse a GeoJSON file"""
-    with open(filepath, 'r', encoding='utf-8') as f:
+    """Load and parse a GeoJSON file.
+
+    utf-8-sig, not utf-8: a geojson round-tripped through Notepad/Excel carries
+    a BOM, json.load() choked on it, the error went to the console only and the
+    file was then silently skipped by "Сохранить" (JSON-4)."""
+    with open(filepath, 'r', encoding='utf-8-sig') as f:
         return json.load(f)
+
+
+def _feature(data):
+    """features[0] of a GeoJSON, or None when the file is not shaped like one.
+
+    Every operator used to index data['features'][0] straight away, so a single
+    file with `features: []` (or without the key) aborted the WHOLE batch with a
+    traceback — after part of it had already been rewritten (JSON-1)."""
+    if not isinstance(data, dict):
+        return None
+    features = data.get('features')
+    if not isinstance(features, list) or not features:
+        return None
+    feature = features[0]
+    if not isinstance(feature, dict):
+        return None
+    return feature
+
+
+def _feature_props(data):
+    """features[0]['properties'] as a dict, or None."""
+    feature = _feature(data)
+    if feature is None:
+        return None
+    props = feature.get('properties')
+    if not isinstance(props, dict):
+        return None
+    return props
 
 
 _JFLOAT_RE = re.compile(r'"##JF:([^"#]+)##"')
@@ -186,12 +220,45 @@ def _jf_to_float(value, default=0.0):
 
 
 def _save_geojson(filepath, data):
-    """Save GeoJSON data to file, restoring formatted floats from sentinels."""
+    """Save GeoJSON data to file, restoring formatted floats from sentinels.
+
+    Written to a temp file IN THE SAME FOLDER and moved into place with
+    os.replace: open('w') truncates the delivery file at once, so a full disk
+    or a crash mid-write left an unparseable stub with no way back (JSON-5)."""
     json_str = json.dumps(data, ensure_ascii=False, indent=2)
     # Replace sentinel strings with raw numbers: "##JF:215.20##" -> 215.20
     json_str = _JFLOAT_RE.sub(r'\1', json_str)
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(json_str)
+
+    folder = os.path.dirname(os.path.abspath(filepath)) or '.'
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix='.agr_geojson_', suffix='.tmp', dir=folder)
+    try:
+        with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+            f.write(json_str)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass    # network shares may refuse fsync; the write still lands
+        # mkstemp creates the temp file 0o600 and os.replace carries that mode
+        # onto the delivery file — on POSIX a team-shared geojson would become
+        # owner-readable only after one "Save JSON".
+        try:
+            if os.path.exists(filepath):
+                shutil.copymode(filepath, tmp_path)
+            else:
+                os.chmod(tmp_path, 0o644)
+        except OSError:
+            pass
+        # os.replace is atomic within one volume — the temp file lives next to
+        # the target exactly for that reason.
+        os.replace(tmp_path, filepath)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _get_active_folder(context):
@@ -425,71 +492,82 @@ class AGR_OT_load_all_geojson(Operator):
         count = len(folders)
         print(f"📁 GeoJSON scan: found {count} SM_* folders in {blend_dir}")
 
-        # ── Step 2: Load shared fields from first Main geojson ──
-        source_item = None
+        # ── Step 2: Load shared fields from the first readable geojson ──
+        parsed_cache = {}
+        unreadable = []
+
+        def read(folder):
+            """Parse once per folder; a broken file is recorded, not raised."""
+            if folder.name in parsed_cache:
+                return parsed_cache[folder.name]
+            data = None
+            filepath = _get_geojson_path(folder)
+            if filepath:
+                try:
+                    data = _load_geojson(filepath)
+                except Exception as e:
+                    print(f"⚠️ Error reading {filepath}: {e}")
+                    unreadable.append(folder.name)
+            parsed_cache[folder.name] = data
+            return data
+
+        readable = []
         ground_item = None
         for folder in folders:
             if not folder.has_geojson:
                 continue
-            if folder.is_ground:
-                if not ground_item:
-                    ground_item = folder
-            else:
-                if not source_item:
-                    source_item = folder
+            data = read(folder)
+            if data is None or _feature_props(data) is None:
+                if data is not None:
+                    unreadable.append(folder.name)
+                continue
+            readable.append(folder)
+            if folder.is_ground and ground_item is None:
+                ground_item = folder
 
-        load_item = source_item or ground_item
-        if load_item:
-            filepath = _get_geojson_path(load_item)
-            if filepath:
-                try:
-                    data = _load_geojson(filepath)
-                    feature_props = data.get('features', [{}])[0].get('properties', {})
-
-                    for field in SHARED_FIELDS:
-                        val = feature_props.get(field, "")
-                        if field in SHARED_FLOAT_FIELDS:
-                            if isinstance(val, str):
-                                setattr(props, field, 0.0)
-                            else:
-                                setattr(props, field, float(val) if val else 0.0)
+        load_item = next((f for f in readable if not f.is_ground), None) or ground_item
+        if load_item is not None:
+            feature_props = _feature_props(read(load_item)) or {}
+            try:
+                for field in SHARED_FIELDS:
+                    val = feature_props.get(field, "")
+                    if field in SHARED_FLOAT_FIELDS:
+                        if isinstance(val, str):
+                            setattr(props, field, 0.0)
                         else:
-                            setattr(props, field, str(val) if val is not None else "")
+                            setattr(props, field, float(val) if val else 0.0)
+                    else:
+                        setattr(props, field, str(val) if val is not None else "")
+                props.name = str(feature_props.get('name', ''))
+            except Exception as e:
+                print(f"⚠️ Error loading shared props: {e}")
 
-                    props.name = str(feature_props.get('name', ''))
-
-                    # Load imageBase64
-                    img_b64 = feature_props.get('imageBase64', '')
-                    props.imageBase64 = str(img_b64) if img_b64 else ""
-                    props.has_image = bool(props.imageBase64)
-                    if props.has_image:
-                        _update_image_preview(props.imageBase64)
-
-                    print(f"📄 Loaded shared props from {filepath}")
-                except (json.JSONDecodeError, OSError) as e:
-                    print(f"⚠️ Error loading shared props: {e}")
+        # imageBase64 is a SHARED field written into every file, so it is read
+        # from the first file that actually HAS one — reading it from the
+        # "source" file alone let an image-less newcomer wipe the picture out
+        # of the whole project on the next save (JSON-2).
+        props.imageBase64 = ""
+        for folder in readable:
+            candidate = str((_feature_props(read(folder)) or {}).get('imageBase64', '') or "")
+            if candidate:
+                props.imageBase64 = candidate
+                print(f"🖼️ imageBase64 взято из {folder.name}")
+                break
+        props.has_image = bool(props.imageBase64)
+        if props.has_image:
+            _update_image_preview(props.imageBase64)
 
         # Load Ground name separately
-        if ground_item:
-            ground_path = _get_geojson_path(ground_item)
-            if ground_path:
-                try:
-                    ground_data = _load_geojson(ground_path)
-                    ground_fprops = ground_data.get('features', [{}])[0].get('properties', {})
-                    props.name_ground = str(ground_fprops.get('name', ''))
-                except (json.JSONDecodeError, OSError):
-                    pass
+        if ground_item is not None:
+            ground_fprops = _feature_props(read(ground_item)) or {}
+            props.name_ground = str(ground_fprops.get('name', ''))
 
         # ── Step 3: Load individual fields, coordinates, glasses per folder ──
-        for folder in folders:
-            if not folder.has_geojson:
-                continue
-            filepath = _get_geojson_path(folder)
-            if not filepath:
-                continue
+        loaded = 0
+        for folder in readable:
+            data = read(folder)
             try:
-                data = _load_geojson(filepath)
-                feature = data.get('features', [{}])[0]
+                feature = _feature(data) or {}
                 feature_props = feature.get('properties', {})
 
                 # Individual fields
@@ -501,23 +579,31 @@ class AGR_OT_load_all_geojson(Operator):
 
                 # Coordinates
                 geometry = feature.get('geometry', {})
-                coords = geometry.get('coordinates', [0, 0])
+                coords = geometry.get('coordinates', [0, 0]) if isinstance(geometry, dict) else [0, 0]
                 if isinstance(coords, list) and len(coords) >= 2:
-                    folder.coord_x = float(coords[0]) if coords[0] else 0.0
-                    folder.coord_y = float(coords[1]) if coords[1] else 0.0
+                    folder.coord_x = _jf_to_float(coords[0], 0.0)
+                    folder.coord_y = _jf_to_float(coords[1], 0.0)
 
                 # Glasses
                 glasses_list = feature.get('Glasses', [])
-                _load_glasses_into_folder(folder, glasses_list)
+                _load_glasses_into_folder(folder, glasses_list if isinstance(glasses_list, list) else [])
+                loaded += 1
 
                 print(f"📄 Loaded props from {folder.name}: "
                       f"coords=[{folder.coord_x}, {folder.coord_y}], "
                       f"glasses={len(folder.glasses)}")
-            except (json.JSONDecodeError, OSError) as e:
+            except Exception as e:
                 print(f"⚠️ Error loading props for {folder.name}: {e}")
+                unreadable.append(folder.name)
 
-        has_geojson = sum(1 for f in folders if f.has_geojson)
-        self.report({'INFO'}, f"Найдено {count} папок, загружено {has_geojson} JSON")
+        # Count what was really PARSED — the old report counted files found on
+        # disk, so a BOM'ed or malformed geojson looked loaded (JSON-4).
+        agr_report(self, 'INFO', f"Найдено {count} папок, загружено {loaded} JSON")
+        if unreadable:
+            agr_report(self, 'WARNING',
+                       "Не прочитаны (битый или нестандартный geojson): "
+                       + ", ".join(sorted(set(unreadable))))
+
         return {'FINISHED'}
 
 
@@ -535,74 +621,92 @@ class AGR_OT_save_all_geojson(Operator):
         scene = context.scene
         props = scene.agr_geojson_props
         saved_count = 0
+        skipped = []
 
         for folder in scene.agr_geojson_folders:
             # Create geojson from template if missing
             if not folder.has_geojson:
                 if not _create_geojson_for_folder(folder):
+                    skipped.append(folder.name)
                     continue
 
             filepath = _get_geojson_path(folder)
             if not filepath:
+                skipped.append(folder.name)
                 continue
 
+            # One broken file must not abort the batch halfway through: the
+            # files already written would carry the new address and the rest
+            # the old one (JSON-1).
             try:
                 data = _load_geojson(filepath)
-            except (json.JSONDecodeError, OSError) as e:
-                print(f"⚠️ Error reading {filepath}: {e}")
-                continue
-
-            feature_props = data['features'][0]['properties']
-            is_ground = folder.is_ground
-
-            # Write shared fields
-            for field in SHARED_FIELDS:
-                if is_ground and field in GROUND_EMPTY_FIELDS:
-                    feature_props[field] = ""
+                feature = _feature(data)
+                feature_props = _feature_props(data)
+                if feature is None or feature_props is None:
+                    skipped.append(folder.name)
+                    print(f"⚠️ {filepath}: нет features[0].properties — пропущен")
                     continue
 
-                val = getattr(props, field)
-                if field in SHARED_FLOAT_FIELDS:
-                    feature_props[field] = _fmt(field, val)
+                is_ground = folder.is_ground
+
+                # Write shared fields
+                for field in SHARED_FIELDS:
+                    if is_ground and field in GROUND_EMPTY_FIELDS:
+                        feature_props[field] = ""
+                        continue
+
+                    val = getattr(props, field)
+                    if field in SHARED_FLOAT_FIELDS:
+                        feature_props[field] = _fmt(field, val)
+                    else:
+                        feature_props[field] = val
+
+                # Write name field
+                if is_ground:
+                    feature_props['name'] = props.name_ground
                 else:
-                    feature_props[field] = val
+                    feature_props['name'] = props.name
 
-            # Write name field
-            if is_ground:
-                feature_props['name'] = props.name_ground
-            else:
-                feature_props['name'] = props.name
+                # Write individual fields
+                if is_ground:
+                    feature_props['FNO_code'] = ""
+                else:
+                    feature_props['FNO_code'] = folder.FNO_code
 
-            # Write individual fields
-            if is_ground:
-                feature_props['FNO_code'] = ""
-            else:
-                feature_props['FNO_code'] = folder.FNO_code
+                feature_props['FNO_name'] = folder.FNO_name
+                feature_props['h_relief'] = _fmt('h_relief', folder.h_relief)
 
-            feature_props['FNO_name'] = folder.FNO_name
-            feature_props['h_relief'] = _fmt('h_relief', folder.h_relief)
+                # imageBase64: an EMPTY shared value never overwrites a picture
+                # that is already in the file. Deliberate removal goes through
+                # agr.remove_image_from_geojson (JSON-2).
+                if props.imageBase64 or not feature_props.get('imageBase64'):
+                    feature_props['imageBase64'] = props.imageBase64
 
-            # Write imageBase64
-            feature_props['imageBase64'] = props.imageBase64
+                # Write coordinates
+                geometry = feature.get('geometry')
+                if not isinstance(geometry, dict):
+                    geometry = {}
+                    feature['geometry'] = geometry
+                geometry['coordinates'] = [
+                    _fmt('coord', folder.coord_x),
+                    _fmt('coord', folder.coord_y),
+                ]
 
-            # Write coordinates
-            data['features'][0]['geometry']['coordinates'] = [
-                _fmt('coord', folder.coord_x),
-                _fmt('coord', folder.coord_y),
-            ]
+                # Write glasses
+                feature['Glasses'] = _build_glasses_list(folder)
 
-            # Write glasses
-            data['features'][0]['Glasses'] = _build_glasses_list(folder)
-
-            try:
                 _save_geojson(filepath, data)
                 saved_count += 1
-            except OSError as e:
+            except Exception as e:
+                skipped.append(folder.name)
                 print(f"⚠️ Error writing {filepath}: {e}")
 
-        self.report({'INFO'}, f"Сохранено {saved_count} файлов JSON")
-        print(f"💾 Saved all props to {saved_count} GeoJSON files")
+        agr_report(self, 'INFO', f"Сохранено {saved_count} файлов JSON")
+        if skipped:
+            agr_report(self, 'WARNING',
+                       "Не сохранены: " + ", ".join(sorted(set(skipped))))
         return {'FINISHED'}
+
 
 
 class AGR_OT_create_geojson(Operator):
@@ -774,10 +878,14 @@ class AGR_OT_add_glass_to_geojson(Operator):
 
             try:
                 data = _load_geojson(info['path'])
-                data['features'][0]['Glasses'] = glasses_json
-                _save_geojson(info['path'], data)
-                written += 1
-            except (json.JSONDecodeError, OSError) as e:
+                feature = _feature(data)
+                if feature is None:
+                    print(f"⚠️ {info['path']}: нет features[0] — стёкла не записаны")
+                else:
+                    feature['Glasses'] = glasses_json
+                    _save_geojson(info['path'], data)
+                    written += 1
+            except Exception as e:
                 print(f"⚠️ Error writing glasses to {info['path']}: {e}")
 
             # Sync to folder's glasses CollectionProperty
@@ -851,11 +959,19 @@ class AGR_OT_add_coords_to_geojson(Operator):
 
             try:
                 data = _load_geojson(filepath)
-                data['features'][0]['geometry']['coordinates'] = [cx, cy]
-                _save_geojson(filepath, data)
-                updated += 1
-                print(f"📍 Coords [{cx}, {cy}] -> {folder_name}")
-            except (json.JSONDecodeError, OSError, KeyError) as e:
+                feature = _feature(data)
+                if feature is None:
+                    print(f"⚠️ {filepath}: нет features[0] — координаты не записаны")
+                else:
+                    geometry = feature.get('geometry')
+                    if not isinstance(geometry, dict):
+                        geometry = {}
+                        feature['geometry'] = geometry
+                    geometry['coordinates'] = [cx, cy]
+                    _save_geojson(filepath, data)
+                    updated += 1
+                    print(f"📍 Coords [{cx}, {cy}] -> {folder_name}")
+            except Exception as e:
                 print(f"⚠️ Error writing coords to {filepath}: {e}")
 
             # Sync to folder CollectionProperty
@@ -967,10 +1083,14 @@ class AGR_OT_add_image_to_geojson(Operator):
 
                 try:
                     data = _load_geojson(filepath)
-                    data['features'][0]['properties']['imageBase64'] = b64_string
-                    _save_geojson(filepath, data)
-                    written += 1
-                except (json.JSONDecodeError, OSError) as e:
+                    feature_props = _feature_props(data)
+                    if feature_props is None:
+                        print(f"⚠️ {filepath}: нет features[0].properties — картинка не записана")
+                    else:
+                        feature_props['imageBase64'] = b64_string
+                        _save_geojson(filepath, data)
+                        written += 1
+                except Exception as e:
                     print(f"⚠️ Error writing image to {filepath}: {e}")
 
             self.report({'INFO'}, f"Изображение записано в {written} файлов")
@@ -984,6 +1104,56 @@ class AGR_OT_add_image_to_geojson(Operator):
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
+        return {'FINISHED'}
+
+
+class AGR_OT_remove_image_from_geojson(Operator):
+    """Удалить изображение из ВСЕХ GeoJSON проекта"""
+    bl_idname = "agr.remove_image_from_geojson"
+    bl_label = "Удалить изображение"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        folders = context.scene.agr_geojson_folders
+        return any(f.has_geojson for f in folders)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        # "Сохранить" no longer clears imageBase64 with an empty value, so
+        # deliberate removal needs its own button (JSON-2).
+        props = context.scene.agr_geojson_props
+        cleared = 0
+        skipped = []
+
+        for folder in context.scene.agr_geojson_folders:
+            if not folder.has_geojson:
+                continue
+            filepath = _get_geojson_path(folder)
+            if not filepath:
+                continue
+            try:
+                data = _load_geojson(filepath)
+                feature_props = _feature_props(data)
+                if feature_props is None:
+                    skipped.append(folder.name)
+                    continue
+                feature_props['imageBase64'] = ""
+                _save_geojson(filepath, data)
+                cleared += 1
+            except Exception as e:
+                skipped.append(folder.name)
+                print(f"⚠️ Error clearing image in {filepath}: {e}")
+
+        props.imageBase64 = ""
+        props.has_image = False
+        _update_image_preview("")
+
+        agr_report(self, 'INFO', f"Изображение удалено из {cleared} файлов")
+        if skipped:
+            agr_report(self, 'WARNING', "Не обработаны: " + ", ".join(sorted(set(skipped))))
         return {'FINISHED'}
 
 
@@ -1079,6 +1249,7 @@ classes = (
     AGR_OT_add_glass_to_geojson,
     AGR_OT_add_coords_to_geojson,
     AGR_OT_add_image_to_geojson,
+    AGR_OT_remove_image_from_geojson,
     AGR_OT_add_glass_entry,
     AGR_OT_remove_glass_entry,
     AGR_OT_refresh_image_preview,
@@ -1097,11 +1268,12 @@ def register():
 
 
 def unregister():
-    del bpy.types.Scene.agr_geojson_props
-    del bpy.types.Scene.agr_geojson_folders_index
-    del bpy.types.Scene.agr_geojson_folders
+    # guarded: after a partially failed register() an unguarded del would
+    # abort the whole operators.py unregister chain (GLUE-2)
+    for _name in ("agr_geojson_props", "agr_geojson_folders_index", "agr_geojson_folders"):
+        if hasattr(bpy.types.Scene, _name):
+            delattr(bpy.types.Scene, _name)
 
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)
 
     print("GeoJSON operators unregistered")

@@ -11,34 +11,24 @@ import random
 from bpy.types import Operator
 from bpy.props import StringProperty, IntProperty, EnumProperty
 
-
-# ============= Helper Functions =============
-
-# Longest alternatives first so backtracking never settles on a short type
-SM_NAME_RE = re.compile(
-    r'^SM_(?P<address>.+?)(?:_(?P<number>\d{3}))?_'
-    r'(?P<type>GroundElGlass|GroundGlass|MainGlass|GroundEl|Ground|Main|Flora)'
-    r'(?:\.\d{3})?$'
+from .log import agr_report, unregister_classes
+from . import rename_shared
+from .rename_shared import (  # noqa: F401 — re-exported for ui.py and the twin
+    SM_NAME_RE,
+    RENAME_ALLOWED_TYPES,
+    parse_sm_name,
+    get_texture_type_from_filename,
+    get_color_space_for_texture_type,
+    find_lowpoly_collections,
+    udim_aware_material_name,
 )
 
-# Which object types each rename operation accepts — the single source of
-# truth shared by ui.py draw() and the operators (lists used to diverge
-# between 6 regex copies in the panel)
-RENAME_ALLOWED_TYPES = {
-    'materials': {'Main', 'MainGlass', 'Ground', 'GroundGlass', 'GroundEl', 'GroundElGlass', 'Flora'},
-    'glass_materials': {'MainGlass', 'GroundGlass', 'GroundElGlass'},
-    'textures': {'Main', 'Ground', 'GroundEl', 'Flora'},
-    'geojson': {'Main', 'Ground'},
-}
 
-
-def parse_sm_name(name):
-    """Parse 'SM_Address[_NNN]_Type[.001]' → (address, number|None, obj_type),
-    or None when the name does not follow the SM_ convention."""
-    match = SM_NAME_RE.match(name)
-    if not match:
-        return None
-    return match.group('address'), match.group('number'), match.group('type')
+# ============= Helper Functions =============
+#
+# SM_NAME_RE / RENAME_ALLOWED_TYPES / parse_sm_name / find_lowpoly_collections
+# now live in rename_shared.py (one copy for both rename operators) and are
+# re-exported above — ui.py keeps importing them from here.
 
 
 def _get_new_address(scene):
@@ -182,15 +172,16 @@ class AGR_OT_rename_materials(Operator):
         renamed_count = 0
         if obj.data.materials:
             for idx, mat_slot in enumerate(obj.data.materials, 1):
-                if mat_slot:
-                    if re.match(r'^M_Glass_\d{2}$', mat_slot.name):
-                        continue
-                    
-                    if number:
-                        mat_slot.name = f"M_{address}_{number}_{obj_type}_{idx}"
-                    else:
-                        mat_slot.name = f"M_{address}_{obj_type}_{idx}"
-                    renamed_count += 1
+                # udim_aware_material_name keeps the shared Ground material of
+                # GroundEl/Flora siblings on its documented Ground name and
+                # skips glass materials.
+                mat_name = udim_aware_material_name(mat_slot, address, number,
+                                                    obj_type, idx)
+                if not mat_name:
+                    continue
+                if mat_slot.name != mat_name:
+                    mat_slot.name = mat_name
+                renamed_count += 1
         
         self.report({'INFO'}, f"Переименовано материалов: {renamed_count}")
         return {'FINISHED'}
@@ -639,58 +630,39 @@ class AGR_OT_rename_textures(Operator):
     def process_udim_textures(self, obj, address, number, obj_type):
         texture_folder = self.get_udim_texture_folder(obj)
         if not texture_folder or not os.path.exists(texture_folder):
-            self.report({'ERROR'}, "Не найдена папка с UDIM текстурами")
+            agr_report(self, 'ERROR', "Не найдена папка с UDIM текстурами")
             return {'CANCELLED'}
-        
-        renamed_count = self.rename_udim_textures(texture_folder, address, number, obj_type)
+
+        renamed_count, _folder_renamed = rename_shared.process_udim_textures(
+            self, obj, texture_folder, address, number, obj_type)
         if renamed_count == 0:
-            self.report({'WARNING'}, "Не найдены текстуры для переименования")
+            agr_report(self, 'WARNING', "Не найдены текстуры для переименования")
             return {'CANCELLED'}
-        
-        new_folder_name = self.get_new_folder_name(address, number, obj_type)
-        if new_folder_name:
-            parent_folder = os.path.dirname(texture_folder)
-            new_folder_path = os.path.join(parent_folder, new_folder_name)
-            try:
-                if texture_folder != new_folder_path and os.path.exists(texture_folder):
-                    os.rename(texture_folder, new_folder_path)
-                    self.update_material_paths(obj, texture_folder, new_folder_path)
-            except Exception as e:
-                self.report({'WARNING'}, f"Текстуры переименованы, но папка не переименована: {e}")
-        
-        self.report({'INFO'}, f"Переименовано UDIM текстур: {renamed_count}")
+
+        agr_report(self, 'INFO', f"Переименовано UDIM текстур: {renamed_count}")
         return {'FINISHED'}
-    
+
     def process_regular_textures(self, obj, address, number, obj_type):
-        textures = self.get_regular_textures(obj)
-        if not textures:
-            self.report({'ERROR'}, "Не найдены обычные текстуры")
-            return {'CANCELLED'}
-        
         blend_filepath = bpy.data.filepath
         if not blend_filepath:
-            self.report({'ERROR'}, "Сохраните файл перед переименованием текстур")
+            agr_report(self, 'ERROR', "Сохраните файл перед переименованием текстур")
             return {'CANCELLED'}
-        
+
         target_root = os.path.dirname(blend_filepath)
         low_texture_folder = os.path.join(target_root, "low_texture")
-        
         if not os.path.exists(low_texture_folder):
             os.makedirs(low_texture_folder)
-        
-        renamed_count, new_texture_paths, loaded_images = self.process_textures_batch(
-            obj, textures, low_texture_folder, address, number, obj_type
-        )
-        
-        if renamed_count > 0 and new_texture_paths:
-            self._pack_textures_and_cleanup(low_texture_folder, loaded_images,
-                                            new_texture_paths.values())
-            self.report({'INFO'}, f"Обработано текстур: {renamed_count}")
+
+        renamed_count, _warnings = rename_shared.process_object_textures(
+            self, obj, low_texture_folder, address, number, obj_type)
+
+        if renamed_count > 0:
+            agr_report(self, 'INFO', f"Обработано текстур: {renamed_count}")
             return {'FINISHED'}
-        
-        self.report({'WARNING'}, "Не удалось обработать текстуры")
+
+        agr_report(self, 'WARNING', "Не удалось обработать текстуры")
         return {'CANCELLED'}
-    
+
     def get_udim_texture_folder(self, obj):
         for mat_slot in obj.data.materials:
             if mat_slot and mat_slot.use_nodes:
@@ -700,11 +672,11 @@ class AGR_OT_rename_textures(Operator):
                             abs_path = bpy.path.abspath(node.image.filepath)
                             return os.path.dirname(abs_path)
         return None
-    
+
     def get_regular_textures(self, obj):
         textures = []
         processed_images = set()
-        
+
         for mat_slot in obj.data.materials:
             if mat_slot and mat_slot.use_nodes:
                 for node in mat_slot.node_tree.nodes:
@@ -712,404 +684,12 @@ class AGR_OT_rename_textures(Operator):
                         if node.image.source != 'TILED' and node.image.name not in processed_images:
                             textures.append(node.image)
                             processed_images.add(node.image.name)
-        
+
         return textures if textures else None
-    
+
     def get_texture_type_from_filename(self, filename):
-        # Regular (non-UDIM) lowpoly textures use short suffix codes —
-        # the SAME codes go into output filenames and into the keys that
-        # reconnect_textures expects (project convention: lowpoly = short
-        # codes, UDIM highpoly = full names). Mirrors operators_rename_project.
-        # Anchor to end of filename to avoid false match on address parts
-        # like Volkhonka_D_5; check longer codes first (erm before r/m/e,
-        # do before d/o).
-        for tex_type in ('erm', 'do', 'd', 'o', 'm', 'n', 'r', 'e'):
-            if re.search(rf'_{tex_type}_\d+\.png$', filename) or filename.endswith(f'_{tex_type}.png'):
-                return tex_type
-        return None
-    
-    def rename_udim_textures(self, folder_path, new_address, number, obj_type):
-        renamed_count = 0
-        for filename in os.listdir(folder_path):
-            if not filename.endswith('.png'):
-                continue
-            
-            udim_match = re.search(r'\.(\d{4})\.png$', filename)
-            if not udim_match:
-                continue
-            
-            udim_number = udim_match.group(1)
-            texture_type = self.get_texture_type(filename)
-            if not texture_type:
-                continue
-            
-            should_rename = False
-            material_num = None
-            
-            if obj_type == 'Main' and number:
-                pattern = r'^T_.+?_' + re.escape(number) + r'_' + re.escape(texture_type) + r'_(\d+)\.\d{4}\.png$'
-                match = re.match(pattern, filename)
-                if match:
-                    should_rename = True
-                    material_num = match.group(1)
-            elif obj_type == 'Main' and not number:
-                if not any(tag in filename for tag in ['_Ground_', '_GroundEl', '_Flora_']):
-                    pattern = r'^T_.+?_' + re.escape(texture_type) + r'_(\d+)\.\d{4}\.png$'
-                    match = re.match(pattern, filename)
-                    if match:
-                        should_rename = True
-                        material_num = match.group(1)
-            elif obj_type == 'Ground':
-                pattern = r'^T_.+?_Ground_' + re.escape(texture_type) + r'_(\d+)\.\d{4}\.png$'
-                match = re.match(pattern, filename)
-                if match:
-                    should_rename = True
-                    material_num = match.group(1)
-            
-            if not should_rename:
-                continue
-            
-            if obj_type == 'Main' and number:
-                new_filename = f"T_{new_address}_{number}_{texture_type}_{material_num}.{udim_number}.png"
-            elif obj_type == 'Main' and not number:
-                new_filename = f"T_{new_address}_{texture_type}_{material_num}.{udim_number}.png"
-            elif obj_type == 'Ground':
-                new_filename = f"T_{new_address}_Ground_{texture_type}_{material_num}.{udim_number}.png"
-            else:
-                continue
-            
-            old_path = os.path.join(folder_path, filename)
-            new_path = os.path.join(folder_path, new_filename)
-            try:
-                if old_path != new_path:
-                    os.rename(old_path, new_path)
-                    renamed_count += 1
-            except Exception as e:
-                print(f"Error renaming {filename}: {e}")
-        
-        return renamed_count
-    
-    def get_texture_type(self, filename):
-        if 'Diffuse' in filename:
-            return 'Diffuse'
-        if 'Normal' in filename:
-            return 'Normal'
-        if 'ERM' in filename or 'ORM' in filename:
-            return 'ERM'
-        return None
-    
-    def get_new_folder_name(self, address, number, obj_type):
-        if obj_type == 'Main' and number:
-            return f"SM_{address}_{number}"
-        if obj_type == 'Main' and not number:
-            return f"SM_{address}"
-        if obj_type == 'Ground':
-            return f"SM_{address}_Ground"
-        return None
-    
-    def update_material_paths(self, obj, old_folder, new_folder):
-        """Update material texture paths after folder rename"""
-        new_textures = {}
-        try:
-            for filename in os.listdir(new_folder):
-                if filename.endswith('.1001.png'):
-                    if 'Diffuse' in filename:
-                        new_textures['Diffuse'] = filename
-                    elif 'Normal' in filename:
-                        new_textures['Normal'] = filename
-                    elif 'ERM' in filename or 'ORM' in filename:
-                        new_textures['ERM'] = filename
-        except OSError:
-            return
+        return get_texture_type_from_filename(filename)
 
-        if not hasattr(obj.data, 'materials'):
-            return
-
-        for mat_slot in obj.data.materials:
-            if not mat_slot or not mat_slot.use_nodes:
-                continue
-            tree = mat_slot.node_tree
-            if not tree:
-                continue
-            nodes = tree.nodes
-
-            bsdf = None
-            for node in nodes:
-                if node.type == 'BSDF_PRINCIPLED':
-                    bsdf = node
-                    break
-            if not bsdf:
-                continue
-
-            # Update Diffuse texture
-            if bsdf.inputs['Base Color'].is_linked and 'Diffuse' in new_textures:
-                diffuse_link = bsdf.inputs['Base Color'].links[0]
-                diffuse_node = diffuse_link.from_node
-                if diffuse_node.type == 'TEX_IMAGE':
-                    self.load_udim_texture(new_folder, new_textures['Diffuse'], diffuse_node, 'sRGB')
-
-            # Update ERM texture
-            for node in nodes:
-                if node.type in ['SEPRGB', 'SEPARATE_COLOR']:
-                    is_connected = any(link.to_node == bsdf for output in node.outputs for link in output.links)
-                    if is_connected and node.inputs[0].is_linked and 'ERM' in new_textures:
-                        erm_node = node.inputs[0].links[0].from_node
-                        if erm_node.type == 'TEX_IMAGE':
-                            self.load_udim_texture(new_folder, new_textures['ERM'], erm_node, 'Non-Color')
-                        break
-
-            # Update Normal texture
-            for node in nodes:
-                if node.type == 'NORMAL_MAP':
-                    if node.outputs['Normal'].is_linked and node.inputs['Color'].is_linked and 'Normal' in new_textures:
-                        if any(link.to_node == bsdf for link in node.outputs['Normal'].links):
-                            normal_node = node.inputs['Color'].links[0].from_node
-                            if normal_node.type == 'TEX_IMAGE':
-                                self.load_udim_texture(new_folder, new_textures['Normal'], normal_node, 'Non-Color')
-                            break
-
-    def load_udim_texture(self, folder, filename, node, color_space='sRGB'):
-        """Load new UDIM texture into node"""
-        try:
-            base_name = filename.replace('.1001.png', '')
-            udim_path = os.path.join(folder, f"{base_name}.<UDIM>.png")
-            abs_path = os.path.abspath(udim_path)
-            new_image = bpy.data.images.load(abs_path, check_existing=True)
-            new_image.source = 'TILED'
-            new_image.colorspace_settings.name = color_space
-            node.image = new_image
-        except Exception as e:
-            print(f"  ⚠️ Error loading UDIM texture {filename}: {e}")
-    
-    def process_textures_batch(self, obj, textures, target_folder, address, number, obj_type):
-        renamed_count = 0
-        old_images = []
-        new_texture_paths = {}
-        loaded_images = []
-        
-        for img in textures:
-            is_packed = img.packed_file is not None
-            filename = img.name if not img.filepath else os.path.basename(img.filepath)
-            tex_type = self.get_texture_type_from_filename(filename)
-            if not tex_type:
-                continue
-            
-            if is_packed:
-                temp_filename = f"temp_{img.name}"
-                temp_path = os.path.join(target_folder, temp_filename)
-                try:
-                    img.filepath = temp_path
-                    img.save()
-                    old_abs_path = temp_path
-                except Exception:
-                    continue
-            else:
-                if not img.filepath:
-                    continue
-                old_abs_path = bpy.path.abspath(img.filepath)
-                if not os.path.exists(old_abs_path):
-                    continue
-            
-            if obj_type == 'Main' and number:
-                new_filename = f"T_{address}_{number}_{obj_type}_{tex_type}_1.png"
-            elif obj_type == 'Main' and not number:
-                new_filename = f"T_{address}_{obj_type}_{tex_type}_1.png"
-            elif obj_type == 'Ground':
-                new_filename = f"T_{address}_Ground_{tex_type}_1.png"
-            elif obj_type.startswith('GroundE') and obj_type != 'Ground':
-                new_filename = f"T_{address}_{obj_type}_{tex_type}_1.png"
-            elif obj_type == 'Flora':
-                new_filename = f"T_{address}_Flora_{tex_type}_1.png"
-            else:
-                continue
-            
-            new_filepath = os.path.join(target_folder, new_filename)
-            
-            try:
-                if is_packed:
-                    if os.path.exists(old_abs_path) and old_abs_path != new_filepath:
-                        import shutil
-                        shutil.move(old_abs_path, new_filepath)
-                else:
-                    import shutil
-                    shutil.copy2(old_abs_path, new_filepath)
-                
-                new_texture_paths[tex_type] = new_filepath
-                old_images.append(img)
-                renamed_count += 1
-            except Exception as e:
-                print(f"Error processing texture: {e}")
-        
-        if new_texture_paths:
-            loaded_images = self.reconnect_textures(obj, new_texture_paths)
-            for old_img in old_images:
-                try:
-                    bpy.data.images.remove(old_img)
-                except Exception:
-                    pass
-        
-        return renamed_count, new_texture_paths, loaded_images
-    
-    def reconnect_textures(self, obj, new_texture_paths):
-        loaded_images = []
-
-        for mat_slot in obj.data.materials:
-            if not mat_slot or not mat_slot.use_nodes:
-                continue
-
-            nodes = mat_slot.node_tree.nodes
-            bsdf = None
-            for node in nodes:
-                if node.type == 'BSDF_PRINCIPLED':
-                    bsdf = node
-                    break
-
-            if not bsdf:
-                continue
-
-            # Diffuse
-            if 'd' in new_texture_paths and bsdf.inputs['Base Color'].is_linked:
-                diffuse_link = bsdf.inputs['Base Color'].links[0]
-                diffuse_node = diffuse_link.from_node
-                if diffuse_node.type == 'TEX_IMAGE':
-                    new_img = self.load_texture(new_texture_paths['d'], 'sRGB')
-                    if new_img:
-                        diffuse_node.image = new_img
-                        loaded_images.append(new_img)
-
-            # DiffuseOpacity (LOW-atlas '_do' files). Regular low sets use
-            # separate _d/_o maps, so this fires only when an atlas material
-            # actually references a _do image — replace it wherever it is
-            # used (Base Color and Alpha share the same TEX_IMAGE node),
-            # otherwise the renamed file would be lost by cleanup.
-            if 'do' in new_texture_paths:
-                for node in nodes:
-                    if node.type == 'TEX_IMAGE' and node.image:
-                        old_name = os.path.basename(node.image.filepath) if node.image.filepath else node.image.name
-                        if re.search(r'_do(_\d+)?(\.png)?(\.\d{3})?$', old_name):
-                            new_img = self.load_texture(new_texture_paths['do'], 'sRGB')
-                            if new_img:
-                                node.image = new_img
-                                loaded_images.append(new_img)
-
-            # Normal
-            if 'n' in new_texture_paths:
-                for node in nodes:
-                    if node.type == 'NORMAL_MAP':
-                        if node.outputs['Normal'].is_linked and node.inputs['Color'].is_linked:
-                            if any(link.to_node == bsdf for link in node.outputs['Normal'].links):
-                                normal_node = node.inputs['Color'].links[0].from_node
-                                if normal_node.type == 'TEX_IMAGE':
-                                    new_img = self.load_texture(new_texture_paths['n'], 'Non-Color')
-                                    if new_img:
-                                        normal_node.image = new_img
-                                        loaded_images.append(new_img)
-                                break
-
-            # ERM (through Separate Color / Separate RGB node)
-            if 'erm' in new_texture_paths:
-                for node in nodes:
-                    if node.type in ['SEPRGB', 'SEPARATE_COLOR']:
-                        is_connected = any(link.to_node == bsdf for output in node.outputs for link in output.links)
-                        if is_connected and node.inputs[0].is_linked:
-                            erm_node = node.inputs[0].links[0].from_node
-                            if erm_node.type == 'TEX_IMAGE':
-                                new_img = self.load_texture(new_texture_paths['erm'], 'Non-Color')
-                                if new_img:
-                                    erm_node.image = new_img
-                                    loaded_images.append(new_img)
-                            break
-
-            # Roughness (direct connection to BSDF)
-            if 'r' in new_texture_paths and bsdf.inputs['Roughness'].is_linked:
-                roughness_link = bsdf.inputs['Roughness'].links[0]
-                roughness_node = roughness_link.from_node
-                if roughness_node.type == 'TEX_IMAGE':
-                    new_img = self.load_texture(new_texture_paths['r'], 'Non-Color')
-                    if new_img:
-                        roughness_node.image = new_img
-                        loaded_images.append(new_img)
-
-            # Metallic (direct connection to BSDF)
-            if 'm' in new_texture_paths and bsdf.inputs['Metallic'].is_linked:
-                metallic_link = bsdf.inputs['Metallic'].links[0]
-                metallic_node = metallic_link.from_node
-                if metallic_node.type == 'TEX_IMAGE':
-                    new_img = self.load_texture(new_texture_paths['m'], 'Non-Color')
-                    if new_img:
-                        metallic_node.image = new_img
-                        loaded_images.append(new_img)
-
-            # Emit
-            if 'e' in new_texture_paths and bsdf.inputs['Emission Color'].is_linked:
-                emit_link = bsdf.inputs['Emission Color'].links[0]
-                emit_node = emit_link.from_node
-                if emit_node.type == 'TEX_IMAGE':
-                    new_img = self.load_texture(new_texture_paths['e'], 'sRGB')
-                    if new_img:
-                        emit_node.image = new_img
-                        loaded_images.append(new_img)
-
-            # Opacity (Alpha on BSDF)
-            if 'o' in new_texture_paths and bsdf.inputs['Alpha'].is_linked:
-                alpha_link = bsdf.inputs['Alpha'].links[0]
-                alpha_node = alpha_link.from_node
-                if alpha_node.type == 'TEX_IMAGE':
-                    new_img = self.load_texture(new_texture_paths['o'], 'Non-Color')
-                    if new_img:
-                        alpha_node.image = new_img
-                        loaded_images.append(new_img)
-
-        return loaded_images
-    
-    def load_texture(self, filepath, color_space='sRGB'):
-        try:
-            abs_path = os.path.abspath(filepath)
-            new_image = bpy.data.images.load(abs_path, check_existing=True)
-            new_image.colorspace_settings.name = color_space
-            return new_image
-        except Exception as e:
-            print(f"Error loading texture {filepath}: {e}")
-            return None
-    
-    def _pack_textures_and_cleanup(self, folder_path, images, created_paths=None):
-        seen_paths = set()
-
-        for img in (images or []):
-            if not img:
-                continue
-            try:
-                abs_path = bpy.path.abspath(img.filepath)
-            except Exception:
-                continue
-
-            if not abs_path or abs_path in seen_paths:
-                continue
-            seen_paths.add(abs_path)
-
-            if not os.path.exists(abs_path):
-                continue
-
-            try:
-                if not img.packed_file:
-                    img.pack()
-            except Exception:
-                continue
-
-        # Remove only the files this operator created — low_texture may
-        # contain foreign user files that must survive the cleanup.
-        for path in (created_paths or []):
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except Exception:
-                pass
-
-        # rmdir succeeds only when the folder is empty
-        try:
-            os.rmdir(folder_path)
-        except OSError:
-            pass
 
 
 # ============= Rename GEOJSON =============
@@ -1125,9 +705,15 @@ class AGR_OT_rename_geojson(Operator):
         obj = context.active_object
         if not obj or obj.type != 'MESH':
             return False
-        obj_name = re.sub(r'\.\d{3}$', '', obj.name)
-        return bool(re.match(r'^SM_.+?(_\d{3})?_(Main|Ground)', obj_name))
-    
+        # Same parser and same type set the panel uses — the old unanchored
+        # regex let SM_X_GroundEl through as "Ground" and the button then
+        # errored out.
+        parsed = parse_sm_name(obj.name)
+        if not parsed or parsed[2] not in RENAME_ALLOWED_TYPES['geojson']:
+            cls.poll_message_set("Активный объект должен быть SM_*_Main или SM_*_Ground")
+            return False
+        return True
+
     def execute(self, context):
         obj = context.active_object
         new_address = _get_new_address(context.scene)
@@ -1210,8 +796,28 @@ class AGR_OT_rename_geojson(Operator):
                         if node.image.source == 'TILED' and node.image.filepath:
                             abs_path = bpy.path.abspath(node.image.filepath)
                             return os.path.dirname(abs_path)
+        # A UDIM node is not the only place a delivery geojson can live: for a
+        # plain (packed) lowpoly object it sits in the object's own SM_* folder
+        # next to the .blend, or in the .blend folder itself. The project twin
+        # already fell back this way — the per-object button used to hard-fail.
+        blend_path = bpy.data.filepath
+        if not blend_path:
+            return None
+        root = os.path.dirname(blend_path)
+        parsed = parse_sm_name(obj.name)
+        if parsed:
+            address, number, obj_type = parsed
+            for candidate in rename_shared.geojson_search_dirs(root, [address], number, obj_type):
+                try:
+                    if any(f.endswith('.geojson') for f in os.listdir(candidate)):
+                        return candidate
+                except OSError:
+                    continue
+        if os.path.isdir(root):
+            return root
         return None
-    
+
+
     def find_geojson_file(self, folder, obj_type, number):
         geojson_file = None
         old_address = None
@@ -1329,32 +935,12 @@ class AGR_OT_rename_geojson(Operator):
 
 # ============= Rename Lights Root =============
 
-def _rename_child_lights_root(root_obj, address, number, obj_type):
-    """Rename LIGHT children of a Root EMPTY using project naming convention."""
-    spot_counter = 1
-    point_counter = 1
-    light_objects = [child for child in root_obj.children if child.type == 'LIGHT']
-    light_objects.sort(key=lambda x: x.name)
-    for light_obj in light_objects:
-        light_type = light_obj.data.type
-        if light_type == 'SPOT':
-            lighttype_name = 'Spot'
-            counter = spot_counter
-            spot_counter += 1
-        elif light_type == 'POINT':
-            # Project convention: point lights are named "Omni" (3ds Max style)
-            lighttype_name = 'Omni'
-            counter = point_counter
-            point_counter += 1
-        else:
-            continue
-        if obj_type == 'Ground':
-            new_light_name = f"{address}_Ground_{lighttype_name}_{counter:03d}"
-        elif obj_type == 'Main' and number:
-            new_light_name = f"{address}_{number}_{lighttype_name}_{counter:03d}"
-        else:
-            new_light_name = f"{address}_{lighttype_name}_{counter:03d}"
-        light_obj.name = new_light_name
+def _rename_child_lights_root(root_obj, address, number, obj_type, operator=None):
+    """Rename LIGHT children of a Root EMPTY (one implementation, shared with
+    the project twin — collision handling used to exist only for UCX)."""
+    renamed, _conflicts = rename_shared.rename_child_lights(
+        operator, root_obj, address, number, obj_type)
+    return renamed
 
 
 class AGR_OT_rename_lights_root(Operator):
@@ -1435,40 +1021,8 @@ class AGR_OT_rename_lights_root_dialog(Operator):
 
 # ============= Autofill address from the scene =============
 
-# The lowpoly collection is the imported FBX name: NNNN_<address>_Ground[.fbx]
-# (e.g. "0109_BolshaiaPirogovskaia_ZU_51_1_Ground.fbx" -> number "0109",
-# address "BolshaiaPirogovskaia_ZU_51_1").  BOTH the 4-digit number AND the
-# _Ground tail are REQUIRED — that is what tells the lowpoly collection apart
-# from every other NNNN_* collection in the scene.
-_LOWPOLY_COLL_RE = re.compile(r'^(\d{4})_(.+?)_Ground(?:\.[Ff][Bb][Xx])?$')
-
-
-def _strip_dup_suffix(name):
-    """Blender's '.001' duplicate suffix."""
-    return re.sub(r'\.\d{3}$', '', name)
-
-
-def find_lowpoly_collections(scene):
-    """Collections named NNNN_<address>_Ground[.fbx] in the scene tree, in
-    tree order.  Returns [(number, address, collection_name)]; a collection
-    linked in several places is visited once."""
-    found = []
-    seen = set()
-
-    def walk(coll):
-        if coll.as_pointer() in seen:
-            return
-        seen.add(coll.as_pointer())
-        match = _LOWPOLY_COLL_RE.match(_strip_dup_suffix(coll.name))
-        if match:
-            found.append((match.group(1), match.group(2), coll.name))
-        for child in coll.children:
-            walk(child)
-
-    if scene is not None:
-        for child in scene.collection.children:
-            walk(child)
-    return found
+# Collection scanning lives in rename_shared.find_lowpoly_collections
+# (re-exported at the top of this module).
 
 
 class AGR_OT_rename_autofill_address(Operator):
@@ -1521,6 +1075,15 @@ def _autofill_address_on_load(_dummy):
         print(f"📍 AGR Rename: адрес заполнен из коллекции {coll_name} — {number}_{address}")
     except Exception as exc:
         print(f"⚠️ AGR Rename autofill on load: {exc}")
+
+
+def _drop_stale_load_handlers():
+    """Dev reload (reloadOnSave) builds a NEW function object every time, so an
+    identity check never spots the previous copy and the handler stacks up —
+    dedupe by __name__ instead (same fix as operators_link's save_pre)."""
+    for handler in list(bpy.app.handlers.load_post):
+        if getattr(handler, "__name__", "") == _autofill_address_on_load.__name__:
+            bpy.app.handlers.load_post.remove(handler)
 
 
 # ============= Register =============
@@ -1583,15 +1146,14 @@ def register():
         default="",
     )
 
-    if _autofill_address_on_load not in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.append(_autofill_address_on_load)
+    _drop_stale_load_handlers()
+    bpy.app.handlers.load_post.append(_autofill_address_on_load)
 
     print("✅ Rename operators registered")
 
 
 def unregister():
-    if _autofill_address_on_load in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.remove(_autofill_address_on_load)
+    _drop_stale_load_handlers()
 
     if hasattr(bpy.types.Scene, "agr_rename_address"):
         del bpy.types.Scene.agr_rename_address
@@ -1602,6 +1164,5 @@ def unregister():
     if hasattr(bpy.types.Scene, "agr_glass_obj_type"):
         del bpy.types.Scene.agr_glass_obj_type
     
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)
 

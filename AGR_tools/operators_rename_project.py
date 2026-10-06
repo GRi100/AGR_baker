@@ -12,6 +12,16 @@ import bpy
 from bpy.types import Operator
 from bpy.props import StringProperty
 
+from .log import agr_report, unregister_classes
+from . import rename_shared
+from .rename_shared import (
+    RENAME_ALLOWED_TYPES,
+    parse_sm_name,
+    get_texture_type_from_filename,
+    get_color_space_for_texture_type,
+    udim_aware_material_name,
+)
+
 
 def _agr_baker_get_new_address(scene):
     """Get address from scene properties"""
@@ -67,23 +77,86 @@ class AGR_RP_OT_rename_project(Operator):
     """Переименование всего проекта с заданным Address"""
     bl_idname = "agr.rename_project"
     bl_label = "Переименовать проект"
-    bl_options = {'REGISTER', 'UNDO'}
+    # NO 'UNDO': the operator renames files, folders and geojson on disk, and
+    # Ctrl+Z would restore only the names inside the .blend — leaving the scene
+    # pointing at paths that no longer exist. An honest REGISTER-only operator
+    # plus an explicit confirmation is the lesser evil (RENAME-6).
+    bl_options = {'REGISTER'}
+
+    # Set in execute(); class-level defaults keep the helpers callable when a
+    # test or another operator drives them directly.
+    _old_addresses = frozenset()
+    _emptied_collections = frozenset()
+
+    def _plan_summary(self, context):
+        """Rough scale of the damage for the confirmation popup — counted
+        BEFORE anything is touched."""
+        objects = 0
+        roots = 0
+        for obj in context.scene.objects:
+            if obj.type == 'MESH' and obj.name.startswith(('SM_', 'UCX_SM_')):
+                objects += 1
+            elif obj.type == 'EMPTY' and obj.name.endswith('_Root'):
+                roots += 1
+
+        root_dir = _agr_baker_get_project_root()
+        folders = 0
+        files = 0
+        if root_dir and os.path.isdir(root_dir):
+            try:
+                for entry in os.listdir(root_dir):
+                    path = os.path.join(root_dir, entry)
+                    if os.path.isdir(path):
+                        if re.match(r'^\d{4}_', entry) or entry.startswith('SM_'):
+                            folders += 1
+                    elif entry.lower().endswith(('.fbx', '.geojson', '.png')):
+                        files += 1
+            except OSError:
+                pass
+        return objects, roots, folders, files
+
+    def invoke(self, context, event):
+        objects, roots, folders, files = self._plan_summary(context)
+        message = (
+            f"Объектов SM_/UCX_: {objects}, Root света: {roots}, "
+            f"папок: {folders}, файлов рядом с .blend: {files}. "
+            "Будут переименованы файлы и папки на диске — отмена невозможна."
+        )
+        try:
+            return context.window_manager.invoke_confirm(
+                self, event,
+                title="Переименовать ВЕСЬ ПРОЕКТ?",
+                message=message,
+                confirm_text="Переименовать",
+            )
+        except TypeError:
+            # Older Blender builds: invoke_confirm without title/message
+            agr_report(self, 'WARNING', message)
+            return context.window_manager.invoke_confirm(self, event)
 
     def execute(self, context):
         new_address = _agr_baker_get_new_address(context.scene)
         if not new_address:
-            self.report({'ERROR'}, "Введите Address в панели AGR_rename")
+            agr_report(self, 'ERROR', "Введите Address в панели AGR_rename")
             return {'CANCELLED'}
 
         lowpoly_number = getattr(context.scene, "agr_rp_project_lowpoly_number", "").strip()
         if lowpoly_number and (len(lowpoly_number) != 4 or not lowpoly_number.isdigit()):
-            self.report({'ERROR'}, "Введите ровно 4 цифры для номера lowpoly (например: 0903)")
+            agr_report(self, 'ERROR', "Введите ровно 4 цифры для номера lowpoly (например: 0903)")
             return {'CANCELLED'}
 
         has_lowpoly = self.detect_lowpoly_objects(context)
         if has_lowpoly and not lowpoly_number:
-            self.report({'ERROR'}, "Найдены lowpoly коллекции — укажите 4-значный номер во второй строке")
+            agr_report(self, 'ERROR',
+                       "Найдены lowpoly коллекции — укажите 4-значный номер во второй строке")
             return {'CANCELLED'}
+
+        # Addresses replaced during this run — the geojson/FBX pass may only
+        # touch files that carry one of them (RENAME-5).
+        self._old_addresses = set()
+        # Collections THIS operator emptied — the only ones it may delete
+        # afterwards (RENAME-6).
+        self._emptied_collections = set()
 
         return self.execute_rename(context, new_address, lowpoly_number if has_lowpoly else None)
 
@@ -115,86 +188,87 @@ class AGR_RP_OT_rename_project(Operator):
         self.report({'INFO'}, summary)
         return {'FINISHED'}
 
+    def _rename_sm_object(self, obj, new_address, keep_suffix):
+        """Rename ONE SM_* object + its materials through the shared parser.
+        Returns True when the name matched the convention.
+
+        Both branches used to carry their own regex ladders: the highpoly one
+        knew four types out of seven and skipped every `.001` duplicate, so
+        Flora/GroundEl kept the OLD address and nothing said so (RENAME-8)."""
+        parsed = parse_sm_name(obj.name)
+        if not parsed:
+            return False
+        _address, number, obj_type = parsed
+        if obj_type not in RENAME_ALLOWED_TYPES['materials']:
+            return False
+
+        suffix = ""
+        if keep_suffix:
+            suffix_match = re.search(r'(\.\d{3})$', obj.name)
+            suffix = suffix_match.group(1) if suffix_match else ""
+
+        if _address:
+            if not isinstance(self._old_addresses, set):
+                self._old_addresses = set(self._old_addresses)
+            self._old_addresses.add(_address)
+        if number:
+            obj.name = f"SM_{new_address}_{number}_{obj_type}{suffix}"
+        else:
+            obj.name = f"SM_{new_address}_{obj_type}{suffix}"
+        self.rename_materials(obj, new_address, number, obj_type)
+        return True
+
+    def _report_unmatched(self, unmatched):
+        if unmatched:
+            agr_report(self, 'WARNING',
+                       "Не подошли под шаблон SM_Адрес[_NNN]_Тип и оставлены как есть: "
+                       + ", ".join(sorted(unmatched)))
+
     def rename_highpoly_objects(self, context, new_address):
         renamed_count = 0
+        unmatched = []
         for obj in context.scene.objects:
             if obj.type != 'MESH':
                 continue
             if _agr_baker_obj_in_lowpoly_collection(obj):
                 continue
-            obj_name = obj.name
-            if re.search(r'\.\d{3}$', obj_name):
+            if not obj.name.startswith('SM_'):
                 continue
-            match = re.match(r'^SM_(.+?)_(\d{3})_(Main|MainGlass)$', obj_name)
-            if match:
-                number = match.group(2)
-                obj_type = match.group(3)
-                obj.name = f"SM_{new_address}_{number}_{obj_type}"
-                self.rename_materials(obj, new_address, number, obj_type)
+            if self._rename_sm_object(obj, new_address, keep_suffix=True):
                 renamed_count += 1
-                continue
-            match = re.match(r'^SM_(.+?)_(Main|MainGlass)$', obj_name)
-            if match:
-                obj_type = match.group(2)
-                obj.name = f"SM_{new_address}_{obj_type}"
-                self.rename_materials(obj, new_address, None, obj_type)
-                renamed_count += 1
-                continue
-            match = re.match(r'^SM_(.+?)_(Ground|GroundGlass)$', obj_name)
-            if match:
-                obj_type = match.group(2)
-                obj.name = f"SM_{new_address}_{obj_type}"
-                self.rename_materials(obj, new_address, None, obj_type)
-                renamed_count += 1
-                continue
+            else:
+                unmatched.append(obj.name)
+        self._report_unmatched(unmatched)
         return renamed_count
 
     def rename_lowpoly_objects(self, context, new_address):
         renamed_count = 0
+        unmatched = []
         for obj in context.scene.objects:
             if obj.type != 'MESH':
                 continue
             if not _agr_baker_obj_in_lowpoly_collection(obj):
                 continue
-            obj_name = obj.name
-            obj_name_clean = re.sub(r'(\.\d{3})$', '', obj_name)
-            suffix_match = re.search(r'(\.\d{3})$', obj_name)
-            suffix = suffix_match.group(1) if suffix_match else ""
-            match = re.match(r'^SM_(.+?)_(\d{3})_(Main|MainGlass)$', obj_name_clean)
-            if match:
-                number = match.group(2)
-                obj_type = match.group(3)
-                obj.name = f"SM_{new_address}_{number}_{obj_type}{suffix}"
-                self.rename_materials(obj, new_address, number, obj_type)
-                renamed_count += 1
+            if not obj.name.startswith('SM_'):
                 continue
-            match = re.match(r'^SM_(.+?)_(Ground|GroundGlass)$', obj_name_clean)
-            if match:
-                obj_type = match.group(2)
-                obj.name = f"SM_{new_address}_{obj_type}{suffix}"
-                self.rename_materials(obj, new_address, None, obj_type)
+            if self._rename_sm_object(obj, new_address, keep_suffix=True):
                 renamed_count += 1
-                continue
-            match = re.match(r'^SM_(.+?)_(GroundEl|GroundElGlass|Flora)$', obj_name_clean)
-            if match:
-                obj_type = match.group(2)
-                obj.name = f"SM_{new_address}_{obj_type}"
-                self.rename_materials(obj, new_address, None, obj_type)
-                renamed_count += 1
-                continue
+            else:
+                unmatched.append(obj.name)
+        self._report_unmatched(unmatched)
         return renamed_count
 
     def rename_materials(self, obj, address, number, obj_type):
         if obj.data.materials:
             for idx, mat_slot in enumerate(obj.data.materials, 1):
-                if mat_slot:
-                    if re.match(r'^M_Glass_\d{2}$', mat_slot.name):
-                        continue
-                    if number:
-                        mat_name = f"M_{address}_{number}_{obj_type}_{idx}"
-                    else:
-                        mat_name = f"M_{address}_{obj_type}_{idx}"
-                    mat_slot.name = mat_name
+                # udim_aware_material_name keeps the shared Ground material of
+                # GroundEl/Flora siblings on its documented Ground name and
+                # skips glass materials.
+                mat_name = udim_aware_material_name(mat_slot, address, number,
+                                                    obj_type, idx)
+                if not mat_name or mat_slot.name == mat_name:
+                    continue
+                mat_slot.name = mat_name
 
     def rename_ucx_objects(self, context, new_address):
         renamed_count = 0
@@ -368,37 +442,23 @@ class AGR_RP_OT_rename_project(Operator):
         return textures if textures else None
 
     def get_texture_type_from_filename(self, filename):
-        # Anchor to end of filename — prevents false match on address parts like Volkhonka_D_5
-        # Check longer codes first (erm before r, do before d/o)
-        for tex_type in ('erm', 'do', 'd', 'o', 'm', 'n', 'r', 'e'):
-            if re.search(rf'_{tex_type}_\d+\.png$', filename) or filename.endswith(f'_{tex_type}.png'):
-                return tex_type
-        return None
+        return get_texture_type_from_filename(filename)
+
+    def get_color_space_for_texture_type(self, tex_type):
+        return get_color_space_for_texture_type(tex_type)
 
     def process_udim_textures(self, obj, address, number, obj_type):
         texture_folder = self.get_udim_texture_folder(obj)
         if not texture_folder:
-            self.report({'ERROR'}, "Не найдена папка с UDIM текстурами")
+            agr_report(self, 'ERROR', "Не найдена папка с UDIM текстурами")
             return False
         if not os.path.exists(texture_folder):
-            self.report({'ERROR'}, f"Папка с текстурами не найдена: {texture_folder}")
-            return False
-        renamed_count = self.rename_udim_textures(texture_folder, address, number, obj_type)
-        if renamed_count == 0:
+            agr_report(self, 'ERROR', f"Папка с текстурами не найдена: {texture_folder}")
             return False
 
-        new_folder_name = self.get_new_folder_name(address, number, obj_type)
-        if not new_folder_name:
-            return True
-        parent_folder = os.path.dirname(texture_folder)
-        new_folder_path = os.path.join(parent_folder, new_folder_name)
-        try:
-            if texture_folder != new_folder_path and os.path.exists(texture_folder):
-                os.rename(texture_folder, new_folder_path)
-                self.update_material_paths(obj, texture_folder, new_folder_path)
-        except Exception as e:
-            self.report({'WARNING'}, f"Текстуры переименованы, но папка не переименована: {e}")
-        return True
+        renamed_count, _folder_renamed = rename_shared.process_udim_textures(
+            self, obj, texture_folder, address, number, obj_type)
+        return renamed_count > 0
 
     def get_udim_texture_folder(self, obj):
         for mat_slot in obj.data.materials:
@@ -407,171 +467,27 @@ class AGR_RP_OT_rename_project(Operator):
                     if node.type == 'TEX_IMAGE' and node.image:
                         if node.image.source == 'TILED' and node.image.filepath:
                             abs_path = bpy.path.abspath(node.image.filepath)
-                            folder_path = os.path.dirname(abs_path)
-                            return folder_path
+                            return os.path.dirname(abs_path)
         return None
-
-    def rename_udim_textures(self, folder_path, new_address, number, obj_type):
-        renamed_count = 0
-        for filename in os.listdir(folder_path):
-            if not filename.endswith('.png'):
-                continue
-            udim_match = re.search(r'\.(\d{4})\.png$', filename)
-            if not udim_match:
-                continue
-            udim_number = udim_match.group(1)
-            texture_type = self.get_texture_type(filename)
-            if not texture_type:
-                continue
-
-            should_rename = False
-            material_num = None
-            if obj_type == 'Main' and number:
-                pattern = r'^T_.+?_' + re.escape(number) + r'_' + re.escape(texture_type) + r'_(\d+)\.\d{4}\.png$'
-                match = re.match(pattern, filename)
-                if match:
-                    should_rename = True
-                    material_num = match.group(1)
-            elif obj_type == 'Main' and not number:
-                if any(tag in filename for tag in ['_Ground_', '_GroundEl', '_Flora_']):
-                    continue
-                pattern = r'^T_.+?_' + re.escape(texture_type) + r'_(\d+)\.\d{4}\.png$'
-                match = re.match(pattern, filename)
-                if match:
-                    should_rename = True
-                    material_num = match.group(1)
-            elif obj_type == 'Ground':
-                pattern = r'^T_.+?_Ground_' + re.escape(texture_type) + r'_(\d+)\.\d{4}\.png$'
-                match = re.match(pattern, filename)
-                if match:
-                    should_rename = True
-                    material_num = match.group(1)
-
-            if not should_rename:
-                continue
-
-            if obj_type == 'Main' and number:
-                new_filename = f"T_{new_address}_{number}_{texture_type}_{material_num}.{udim_number}.png"
-            elif obj_type == 'Main' and not number:
-                new_filename = f"T_{new_address}_{texture_type}_{material_num}.{udim_number}.png"
-            elif obj_type == 'Ground':
-                new_filename = f"T_{new_address}_Ground_{texture_type}_{material_num}.{udim_number}.png"
-            else:
-                continue
-
-            old_path = os.path.join(folder_path, filename)
-            new_path = os.path.join(folder_path, new_filename)
-            try:
-                if old_path != new_path:
-                    os.rename(old_path, new_path)
-                    renamed_count += 1
-            except Exception as e:
-                print(f"  Ошибка переименования текстуры {filename}: {e}")
-        return renamed_count
 
     def get_texture_type(self, filename):
-        if 'Diffuse' in filename:
-            return 'Diffuse'
-        if 'Normal' in filename:
-            return 'Normal'
-        if 'ERM' in filename or 'ORM' in filename:
-            return 'ERM'
-        return None
+        return rename_shared.udim_texture_type(filename)
 
     def get_new_folder_name(self, address, number, obj_type):
-        if obj_type == 'Main' and number:
-            return f"SM_{address}_{number}"
-        if obj_type == 'Main' and not number:
-            return f"SM_{address}"
-        if obj_type == 'Ground':
-            return f"SM_{address}_Ground"
-        return None
+        return rename_shared.get_new_udim_folder_name(address, number, obj_type)
 
     def update_material_paths(self, obj, old_folder, new_folder):
-        """Update material texture paths after folder rename"""
-        new_textures = {}
-        for filename in os.listdir(new_folder):
-            if filename.endswith('.1001.png'):
-                if 'Diffuse' in filename:
-                    new_textures['Diffuse'] = filename
-                elif 'Normal' in filename:
-                    new_textures['Normal'] = filename
-                elif 'ERM' in filename or 'ORM' in filename:
-                    new_textures['ERM'] = filename
-        
-        for mat_slot in obj.data.materials:
-            if not mat_slot or not mat_slot.use_nodes:
-                continue
-            tree = mat_slot.node_tree
-            if not tree:
-                continue
-            nodes = tree.nodes
-            
-            # Find BSDF node
-            bsdf = None
-            for node in nodes:
-                if node.type == 'BSDF_PRINCIPLED':
-                    bsdf = node
-                    break
-            
-            if not bsdf:
-                continue
-            
-            # Update Diffuse texture
-            if bsdf.inputs['Base Color'].is_linked and 'Diffuse' in new_textures:
-                diffuse_link = bsdf.inputs['Base Color'].links[0]
-                diffuse_node = diffuse_link.from_node
-                if diffuse_node.type == 'TEX_IMAGE':
-                    self.load_new_texture(new_folder, new_textures['Diffuse'], diffuse_node, 'sRGB')
-            
-            # Update ERM texture
-            for node in nodes:
-                if node.type in ['SEPRGB', 'SEPARATE_COLOR', 'SEPARATE_XYZ']:
-                    is_connected = any(link.to_node == bsdf for output in node.outputs for link in output.links)
-                    if is_connected and node.inputs[0].is_linked and 'ERM' in new_textures:
-                        erm_node = node.inputs[0].links[0].from_node
-                        if erm_node.type == 'TEX_IMAGE':
-                            self.load_new_texture(new_folder, new_textures['ERM'], erm_node, 'Non-Color')
-                        break
-            
-            # Update Normal texture
-            for node in nodes:
-                if node.type == 'NORMAL_MAP':
-                    if node.outputs['Normal'].is_linked and node.inputs['Color'].is_linked and 'Normal' in new_textures:
-                        if any(link.to_node == bsdf for link in node.outputs['Normal'].links):
-                            normal_node = node.inputs['Color'].links[0].from_node
-                            if normal_node.type == 'TEX_IMAGE':
-                                self.load_new_texture(new_folder, new_textures['Normal'], normal_node, 'Non-Color')
-                            break
-
-    def load_new_texture(self, folder, filename, node, color_space='sRGB'):
-        """Load new UDIM texture into node"""
-        try:
-            base_name = filename.replace('.1001.png', '')
-            udim_path = os.path.join(folder, f"{base_name}.<UDIM>.png")
-            abs_path = os.path.abspath(udim_path)
-            new_image = bpy.data.images.load(abs_path, check_existing=True)
-            new_image.source = 'TILED'
-            new_image.colorspace_settings.name = color_space
-            node.image = new_image
-            return bpy.path.relpath(abs_path)
-        except Exception as e:
-            print(f"  Ошибка загрузки текстуры {filename}: {e}")
-            return None
+        return rename_shared.update_udim_material_paths(self, obj, new_folder)
 
     def process_regular_textures(self, obj, address, number, obj_type):
-        """Process regular (non-UDIM) textures"""
-        textures = self.get_regular_textures(obj)
-        if not textures:
-            return False
-
+        """Process regular (non-UDIM) textures through the shared pipeline."""
         project_root = _agr_baker_get_project_root()
         if project_root and os.path.exists(project_root):
             target_root = project_root
         else:
             blend_filepath = bpy.data.filepath
             if not blend_filepath:
-                self.report({'ERROR'}, "Сохраните .blend файл")
+                agr_report(self, 'ERROR', "Сохраните .blend файл")
                 return False
             target_root = os.path.dirname(blend_filepath)
 
@@ -579,183 +495,14 @@ class AGR_RP_OT_rename_project(Operator):
         if not os.path.exists(low_texture_folder):
             os.makedirs(low_texture_folder)
 
-        renamed_count, new_texture_paths, loaded_images = self.process_textures(
-            obj, textures, low_texture_folder, address, number, obj_type
-        )
-        if renamed_count > 0 and new_texture_paths:
-            self._pack_textures_and_cleanup(low_texture_folder, loaded_images,
-                                            new_texture_paths.values())
-            return True
-        return False
-
-    def get_color_space_for_texture_type(self, tex_type):
-        """Get color space for texture type"""
-        if tex_type == 'd':
-            return 'sRGB'
-        if tex_type in ['o', 'm', 'r', 'n']:
-            return 'Non-Color'
-        return 'sRGB'
-
-    def process_textures(self, obj, textures, target_folder, address, number, obj_type):
-        """Process and rename texture files"""
-        renamed_count = 0
-        old_images = []
-        new_texture_paths = {}
-        loaded_images = []
-
-        for img in textures:
-            is_packed = img.packed_file is not None
-            filename = img.name if not img.filepath else os.path.basename(img.filepath)
-            tex_type = self.get_texture_type_from_filename(filename)
-            if not tex_type:
-                continue
-
-            if is_packed:
-                temp_filename = f"temp_{img.name}"
-                temp_path = os.path.join(target_folder, temp_filename)
-                try:
-                    img.filepath = temp_path
-                    img.save()
-                    old_abs_path = temp_path
-                except Exception:
-                    continue
-            else:
-                if not img.filepath:
-                    continue
-                old_abs_path = bpy.path.abspath(img.filepath)
-                if not os.path.exists(old_abs_path):
-                    continue
-
-            if obj_type == 'Main' and number:
-                new_filename = f"T_{address}_{number}_{obj_type}_{tex_type}_1.png"
-            elif obj_type == 'Main' and not number:
-                new_filename = f"T_{address}_{obj_type}_{tex_type}_1.png"
-            elif obj_type == 'Ground':
-                new_filename = f"T_{address}_Ground_{tex_type}_1.png"
-            elif obj_type.startswith('GroundE') and obj_type != 'Ground':
-                new_filename = f"T_{address}_{obj_type}_{tex_type}_1.png"
-            elif obj_type == 'Flora':
-                new_filename = f"T_{address}_Flora_{tex_type}_1.png"
-            else:
-                continue
-
-            new_filepath = os.path.join(target_folder, new_filename)
-
-            try:
-                if is_packed:
-                    if os.path.exists(old_abs_path) and old_abs_path != new_filepath:
-                        import shutil
-                        shutil.move(old_abs_path, new_filepath)
-                else:
-                    import shutil
-                    shutil.copy2(old_abs_path, new_filepath)
-
-                new_texture_paths[tex_type] = new_filepath
-                old_images.append(img)
-                renamed_count += 1
-            except Exception:
-                pass
-
-        if new_texture_paths:
-            loaded_images = self.reconnect_textures(obj, new_texture_paths)
-            for old_img in old_images:
-                try:
-                    bpy.data.images.remove(old_img)
-                except Exception:
-                    pass
-
-        return renamed_count, new_texture_paths, loaded_images
-
-    def _pack_textures_and_cleanup(self, folder_path, images, created_paths=None):
-        """Pack textures and cleanup folder"""
-        packed_any = False
-        seen_paths = set()
-        for img in (images or []):
-            if not img:
-                continue
-            try:
-                abs_path = bpy.path.abspath(img.filepath)
-            except Exception:
-                continue
-            if not abs_path or abs_path in seen_paths:
-                continue
-            seen_paths.add(abs_path)
-            if not os.path.exists(abs_path):
-                continue
-            try:
-                if not img.packed_file:
-                    img.pack()
-                    packed_any = True
-            except Exception:
-                continue
-
-        # Remove only the files this operator created — low_texture may
-        # contain foreign user files that must survive the cleanup.
-        for path in (created_paths or []):
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except Exception:
-                pass
-
-        # rmdir succeeds only when the folder is empty
-        try:
-            os.rmdir(folder_path)
-        except OSError:
-            pass
-
-        if packed_any:
-            self.report({'INFO'}, "Lowpoly текстуры упакованы в .blend и папка удалена")
+        renamed_count, _warnings = rename_shared.process_object_textures(
+            self, obj, low_texture_folder, address, number, obj_type)
+        return renamed_count > 0
 
     def reconnect_textures(self, obj, new_texture_paths):
-        """Reconnect textures to materials"""
-        loaded_images = []
-        for mat_slot in obj.data.materials:
-            if not mat_slot or not mat_slot.use_nodes:
-                continue
-            nodes = mat_slot.node_tree.nodes
-            links = mat_slot.node_tree.links
-            principled = None
-            for node in nodes:
-                if node.type == 'BSDF_PRINCIPLED':
-                    principled = node
-                    break
-            if not principled:
-                continue
+        loaded, _applied = rename_shared.reconnect_textures(obj, new_texture_paths)
+        return loaded
 
-            old_tex_nodes = [node for node in nodes if node.type == 'TEX_IMAGE']
-            old_normal_nodes = [node for node in nodes if node.type == 'NORMAL_MAP']
-            for node in old_tex_nodes:
-                nodes.remove(node)
-            for node in old_normal_nodes:
-                nodes.remove(node)
-
-            x_offset = -300
-            y_offset = 0
-            for tex_type, tex_path in new_texture_paths.items():
-                abs_path = os.path.abspath(tex_path)
-                if not os.path.exists(abs_path):
-                    continue
-                tex_node = nodes.new(type='ShaderNodeTexImage')
-                tex_node.location = (principled.location.x + x_offset, principled.location.y + y_offset)
-                img = bpy.data.images.load(abs_path, check_existing=True)
-                tex_node.image = img
-                tex_node.image.colorspace_settings.name = self.get_color_space_for_texture_type(tex_type)
-                loaded_images.append(img)
-                if tex_type == 'd':
-                    links.new(tex_node.outputs['Color'], principled.inputs['Base Color'])
-                elif tex_type == 'o':
-                    links.new(tex_node.outputs['Color'], principled.inputs['Alpha'])
-                elif tex_type == 'm':
-                    links.new(tex_node.outputs['Color'], principled.inputs['Metallic'])
-                elif tex_type == 'n':
-                    normal_map = nodes.new(type='ShaderNodeNormalMap')
-                    normal_map.location = (principled.location.x + x_offset + 200, principled.location.y + y_offset)
-                    links.new(tex_node.outputs['Color'], normal_map.inputs['Color'])
-                    links.new(normal_map.outputs['Normal'], principled.inputs['Normal'])
-                elif tex_type == 'r':
-                    links.new(tex_node.outputs['Color'], principled.inputs['Roughness'])
-        return loaded_images
 
     def parse_object_name(self, obj_name):
         obj_name_clean = re.sub(r'\.\d{3}$', '', obj_name)
@@ -780,37 +527,51 @@ class AGR_RP_OT_rename_project(Operator):
         renamed_count = 0
         processed_keys = set()
         project_root = _agr_baker_get_project_root()
+        # The file's own address must be one we actually renamed away from (or
+        # the new one, for an idempotent re-run) — otherwise a stray delivery
+        # of another building would be adopted.
+        allowed = set(self._old_addresses) | {new_address}
+
         for obj in context.scene.objects:
             if obj.type != 'MESH':
                 continue
-            obj_name = obj.name
-            obj_name_clean = re.sub(r'\.\d{3}$', '', obj_name)
-            match_main = re.match(r'^SM_' + re.escape(new_address) + r'(_\d{3})?_(Main|MainGlass)$', obj_name_clean)
-            match_ground = re.match(r'^SM_' + re.escape(new_address) + r'_(Ground|GroundGlass)$', obj_name_clean)
-            if match_main or match_ground:
-                try:
-                    parsed = self.parse_object_name(obj_name_clean)
-                    if not parsed:
-                        continue
-                    current_address, number, obj_type = parsed
-                    if obj_type not in ['Main', 'Ground']:
-                        continue
-                    if project_root and os.path.exists(project_root):
-                        texture_folder = project_root
-                    else:
-                        texture_folder = self.get_texture_folder_from_material(obj)
-                    if not texture_folder or not os.path.exists(texture_folder):
-                        continue
-                    key = (texture_folder, obj_type, number)
-                    if key in processed_keys:
-                        continue
-                    processed_keys.add(key)
-                    geojson_renamed = self.rename_geojson_in_folder(texture_folder, new_address, number, obj_type)
-                    fbx_renamed = self.rename_fbx_in_folder(texture_folder, new_address, number, obj_type)
-                    if geojson_renamed or fbx_renamed:
-                        renamed_count += 1
-                except Exception as e:
-                    print(f"  Ошибка переименования GEOJSON/FBX для {obj_name}: {e}")
+            parsed = parse_sm_name(obj.name)
+            if not parsed:
+                continue
+            address, number, obj_type = parsed
+            if address != new_address:
+                continue
+            if obj_type in ('MainGlass',):
+                obj_type = 'Main'
+            if obj_type in ('GroundGlass',):
+                obj_type = 'Ground'
+            if obj_type not in ('Main', 'Ground'):
+                continue
+            try:
+                folders = rename_shared.geojson_search_dirs(project_root, allowed, number, obj_type)
+                if not folders:
+                    folder = self.get_texture_folder_from_material(obj)
+                    folders = [folder] if folder and os.path.isdir(folder) else []
+                if not folders:
+                    continue
+                key = (tuple(folders), obj_type, number)
+                if key in processed_keys:
+                    continue
+                processed_keys.add(key)
+
+                geojson_renamed = False
+                fbx_renamed = False
+                for folder in folders:
+                    if not geojson_renamed:
+                        geojson_renamed = self.rename_geojson_in_folder(
+                            folder, new_address, number, obj_type, allowed)
+                    if self.rename_fbx_in_folder(folder, new_address, number, obj_type, allowed):
+                        fbx_renamed = True
+                if geojson_renamed or fbx_renamed:
+                    renamed_count += 1
+            except Exception as e:
+                agr_report(self, 'WARNING',
+                           f"Ошибка переименования GEOJSON/FBX для {obj.name}: {e}")
         return renamed_count
 
     def get_texture_folder_from_material(self, obj):
@@ -827,7 +588,11 @@ class AGR_RP_OT_rename_project(Operator):
             return project_root
         return None
 
-    def rename_geojson_in_folder(self, folder_path, new_address, number, obj_type):
+    def rename_geojson_in_folder(self, folder_path, new_address, number, obj_type, allowed=None):
+        """Rename the delivery geojson inside ONE folder (no recursion).
+
+        os.walk() over the project root used to rename the first geojson it met
+        anywhere, backup folders of past deliveries included (RENAME-5)."""
         try:
             if obj_type == 'Main' and number:
                 pattern = r'^SM_(.+?)_' + re.escape(number) + r'\.geojson$'
@@ -840,27 +605,35 @@ class AGR_RP_OT_rename_project(Operator):
                 new_name = f"SM_{new_address}_Ground.geojson"
             else:
                 return False
-            for root, _, files in os.walk(folder_path):
-                for filename in files:
-                    if obj_type == 'Main' and not number:
-                        if filename.endswith('_Ground.geojson'):
-                            continue
-                    match = re.match(pattern, filename)
-                    if match:
-                        old_path = os.path.join(root, filename)
-                        new_path = os.path.join(root, new_name)
-                        with open(old_path, 'r', encoding='utf-8') as f:
-                            geojson_data = json.load(f)
-                        old_address = match.group(1)
-                        self.update_glass_materials_in_geojson(geojson_data, old_address, new_address)
-                        with open(new_path, 'w', encoding='utf-8') as f:
-                            json.dump(geojson_data, f, ensure_ascii=False, indent=2)
-                        if old_path != new_path and os.path.exists(old_path):
-                            os.remove(old_path)
-                        return True
+
+            for filename in sorted(os.listdir(folder_path)):
+                if obj_type == 'Main' and not number:
+                    if filename.endswith('_Ground.geojson'):
+                        continue
+                match = re.match(pattern, filename)
+                if not match:
+                    continue
+                old_address = match.group(1)
+                if allowed is not None and old_address not in allowed:
+                    continue
+                old_path = os.path.join(folder_path, filename)
+                new_path = os.path.join(folder_path, new_name)
+                if old_path != new_path and os.path.exists(new_path):
+                    agr_report(self, 'WARNING',
+                               f"{new_name} уже существует — {filename} не переименован")
+                    continue
+                with open(old_path, 'r', encoding='utf-8-sig') as f:
+                    geojson_data = json.load(f)
+                self.update_glass_materials_in_geojson(geojson_data, old_address, new_address)
+                with open(new_path, 'w', encoding='utf-8') as f:
+                    json.dump(geojson_data, f, ensure_ascii=False, indent=2)
+                if old_path != new_path and os.path.exists(old_path):
+                    os.remove(old_path)
+                return True
         except Exception as e:
-            print(f"    Ошибка переименования GEOJSON: {e}")
+            agr_report(self, 'WARNING', f"Ошибка переименования GEOJSON: {e}")
         return False
+
 
     def update_glass_materials_in_geojson(self, geojson_data, old_address, new_address):
         try:
@@ -878,7 +651,10 @@ class AGR_RP_OT_rename_project(Operator):
         except Exception as e:
             print(f"    Ошибка обновления материалов в GEOJSON: {e}")
 
-    def rename_fbx_in_folder(self, folder_path, new_address, number, obj_type):
+    def rename_fbx_in_folder(self, folder_path, new_address, number, obj_type, allowed=None):
+        """Rename the delivery FBX files inside ONE folder (no recursion) —
+        the recursive version renamed every match in every subfolder, archives
+        of past deliveries included (RENAME-5)."""
         renamed = False
         try:
             if obj_type == 'Main' and number:
@@ -898,30 +674,36 @@ class AGR_RP_OT_rename_project(Operator):
                 new_light = f"SM_{new_address}_Ground_Light.fbx"
             else:
                 return False
-            for root, _, files in os.walk(folder_path):
-                for filename in files:
-                    if obj_type == 'Main' and not number:
-                        if filename.endswith('_Ground.fbx') or filename.endswith('_Ground_Light.fbx'):
-                            continue
-                    skip_main_match = obj_type == 'Main' and not number and filename.endswith('_Light.fbx')
-                    if not skip_main_match:
-                        match = re.match(pattern_main, filename)
-                        if match:
-                            old_path = os.path.join(root, filename)
-                            new_path = os.path.join(root, new_main)
-                            if old_path != new_path:
-                                os.rename(old_path, new_path)
-                                renamed = True
-                    match = re.match(pattern_light, filename)
-                    if match:
-                        old_path = os.path.join(root, filename)
-                        new_path = os.path.join(root, new_light)
-                        if old_path != new_path:
-                            os.rename(old_path, new_path)
-                            renamed = True
+
+            def _rename(filename, new_filename):
+                old_path = os.path.join(folder_path, filename)
+                new_path = os.path.join(folder_path, new_filename)
+                if old_path == new_path:
+                    return False
+                if os.path.exists(new_path):
+                    agr_report(self, 'WARNING',
+                               f"{new_filename} уже существует — {filename} не переименован")
+                    return False
+                os.rename(old_path, new_path)
+                return True
+
+            for filename in sorted(os.listdir(folder_path)):
+                if obj_type == 'Main' and not number:
+                    if filename.endswith('_Ground.fbx') or filename.endswith('_Ground_Light.fbx'):
+                        continue
+                skip_main_match = obj_type == 'Main' and not number and filename.endswith('_Light.fbx')
+                if not skip_main_match:
+                    match = re.match(pattern_main, filename)
+                    if match and (allowed is None or match.group(1) in allowed):
+                        renamed = _rename(filename, new_main) or renamed
+                        continue
+                match = re.match(pattern_light, filename)
+                if match and (allowed is None or match.group(1) in allowed):
+                    renamed = _rename(filename, new_light) or renamed
         except Exception as e:
-            print(f"    Ошибка переименования FBX: {e}")
+            agr_report(self, 'WARNING', f"Ошибка переименования FBX: {e}")
         return renamed
+
 
     def rename_lights_for_roots(self, context, new_address):
         renamed_count = 0
@@ -951,30 +733,12 @@ class AGR_RP_OT_rename_project(Operator):
         return renamed_count
 
     def rename_child_lights(self, root_obj, address, number, obj_type):
-        spot_counter = 1
-        point_counter = 1
-        light_objects = [child for child in root_obj.children if child.type == 'LIGHT']
-        light_objects.sort(key=lambda x: x.name)
-        for light_obj in light_objects:
-            light_type = light_obj.data.type
-            if light_type == 'SPOT':
-                lighttype_name = 'Spot'
-                counter = spot_counter
-                spot_counter += 1
-            elif light_type == 'POINT':
-                # Project convention: point lights are named "Omni" (3ds Max style)
-                lighttype_name = 'Omni'
-                counter = point_counter
-                point_counter += 1
-            else:
-                continue
-            if obj_type == 'Ground':
-                new_light_name = f"{address}_Ground_{lighttype_name}_{counter:03d}"
-            elif obj_type == 'Main' and number:
-                new_light_name = f"{address}_{number}_{lighttype_name}_{counter:03d}"
-            else:
-                new_light_name = f"{address}_{lighttype_name}_{counter:03d}"
-            light_obj.name = new_light_name
+        """One implementation, shared with operators_rename (RENAME-10):
+        names are claimed through temp names and collisions are reported."""
+        renamed, _conflicts = rename_shared.rename_child_lights(
+            self, root_obj, address, number, obj_type)
+        return renamed
+
 
     def distribute_to_collections(self, context, new_address, lowpoly_number=None):
         if lowpoly_number:
@@ -1084,6 +848,7 @@ class AGR_RP_OT_rename_project(Operator):
             for obj in objects:
                 for old_coll in obj.users_collection:
                     old_coll.objects.unlink(obj)
+                    self._note_emptied(old_coll)
                 if obj.name not in new_coll.objects:
                     new_coll.objects.link(obj)
                     total_objects += 1
@@ -1177,6 +942,7 @@ class AGR_RP_OT_rename_project(Operator):
             for obj in objects:
                 for old_coll in obj.users_collection:
                     old_coll.objects.unlink(obj)
+                    self._note_emptied(old_coll)
                 if obj.name not in new_coll.objects:
                     new_coll.objects.link(obj)
                     total_objects += 1
@@ -1192,25 +958,68 @@ class AGR_RP_OT_rename_project(Operator):
         else:
             self.report({'WARNING'}, f"Не найдено lowpoly объектов с адресом {address}")
 
+    def _note_emptied(self, collection):
+        """Remember a collection THIS operator took objects out of."""
+        try:
+            if not isinstance(self._emptied_collections, set):
+                self._emptied_collections = set(self._emptied_collections)
+            self._emptied_collections.add(collection.name)
+        except Exception:
+            pass
+
     def _remove_empty_collections(self, context):
+        """Delete ONLY the collections this run emptied.
+
+        The old sweep removed every empty collection in the file — a user's
+        pre-made empty "Refs" went with it, and Ctrl+Z is not offered by this
+        operator any more (RENAME-6)."""
         removed_count = 0
-
-        def remove_empty_recursive(collection):
-            nonlocal removed_count
-            for child in list(collection.children):
-                remove_empty_recursive(child)
-            if len(collection.objects) == 0 and len(collection.children) == 0:
-                if collection != context.scene.collection:
-                    for parent in bpy.data.collections:
-                        if collection.name in parent.children:
-                            parent.children.unlink(collection)
-                    if collection.name in context.scene.collection.children:
-                        context.scene.collection.children.unlink(collection)
-                    bpy.data.collections.remove(collection)
-                    removed_count += 1
-
-        remove_empty_recursive(context.scene.collection)
+        for name in sorted(self._emptied_collections):
+            collection = bpy.data.collections.get(name)
+            if collection is None:
+                continue
+            if collection == context.scene.collection:
+                continue
+            if len(collection.objects) or len(collection.children):
+                continue
+            for parent in bpy.data.collections:
+                if collection.name in parent.children:
+                    parent.children.unlink(collection)
+            if collection.name in context.scene.collection.children:
+                context.scene.collection.children.unlink(collection)
+            bpy.data.collections.remove(collection)
+            removed_count += 1
         return removed_count
+
+    def _lowpoly_folder_candidates(self, root_dir, lowpoly_number):
+        r"""Directories NNNN_<something> next to the .blend that really hold a
+        lowpoly delivery — proven by an FBX named NNNN_Addr_01.fbx /
+        NNNN_Addr_Ground.fbx inside.
+
+        The old scan took the FIRST `^\d{4}_` directory os.listdir returned and
+        happily renamed `0001_Архив` into the project (RENAME-3)."""
+        candidates = []
+        try:
+            entries = sorted(os.listdir(root_dir))
+        except OSError as exc:
+            agr_report(self, 'WARNING', f"Не удалось прочитать корень проекта: {exc}")
+            return candidates
+
+        for item in entries:
+            item_path = os.path.join(root_dir, item)
+            if not os.path.isdir(item_path):
+                continue
+            match = re.match(r'^(\d{4})_(.+)$', item)
+            if not match:
+                continue
+            try:
+                inner = os.listdir(item_path)
+            except OSError:
+                continue
+            if not any(rename_shared.LOWPOLY_FBX_RE.match(f) for f in inner):
+                continue
+            candidates.append((match.group(1), item_path, item))
+        return candidates
 
     def _rename_lowpoly_folder_and_fbx(self, lowpoly_number, new_address):
         root_dir = _agr_baker_get_project_root()
@@ -1220,44 +1029,60 @@ class AGR_RP_OT_rename_project(Operator):
                 return
             root_dir = os.path.dirname(blend_path)
 
-        old_folder = None
-        old_folder_name = None
-        for item in os.listdir(root_dir):
-            item_path = os.path.join(root_dir, item)
-            if os.path.isdir(item_path):
-                match = re.match(r'^(\d{4})_(.+)$', item)
-                if match:
-                    old_folder = item_path
-                    old_folder_name = item
-                    break
+        new_folder_name = f"{lowpoly_number}_{new_address}"
+        new_folder_path = os.path.join(root_dir, new_folder_name)
 
-        if not old_folder:
-            new_folder_name = f"{lowpoly_number}_{new_address}"
-            new_folder_path = os.path.join(root_dir, new_folder_name)
+        candidates = self._lowpoly_folder_candidates(root_dir, lowpoly_number)
+        # A folder already carrying the target number is the obvious one
+        numbered = [c for c in candidates if c[0] == lowpoly_number]
+        if numbered:
+            candidates = numbered
+
+        if not candidates:
             os.makedirs(new_folder_path, exist_ok=True)
             return
 
-        for filename in os.listdir(old_folder):
-            if filename.endswith('.fbx'):
-                old_fbx_path = os.path.join(old_folder, filename)
-                match = re.match(r'^(\d{4})_(.+?)(_\d{2}|_Ground)(\.fbx)$', filename)
-                if match:
-                    suffix = match.group(3)
-                    extension = match.group(4)
-                    new_fbx_name = f"{lowpoly_number}_{new_address}{suffix}{extension}"
-                    new_fbx_path = os.path.join(old_folder, new_fbx_name)
-                    try:
-                        os.rename(old_fbx_path, new_fbx_path)
-                    except Exception:
-                        pass
+        if len(candidates) > 1:
+            names = ", ".join(c[2] for c in candidates)
+            # WARNING, not ERROR: the rest of the rename already ran, and an
+            # ERROR report makes bpy.ops raise for every script caller.
+            agr_report(self, 'WARNING',
+                       "Не удалось определить папку lowpoly — подходят несколько: "
+                       f"{names}. Переименование папки и FBX ОТМЕНЕНО")
+            return
 
-        new_folder_name = f"{lowpoly_number}_{new_address}"
-        new_folder_path = os.path.join(root_dir, new_folder_name)
-        if old_folder != new_folder_path:
+        _number, old_folder, old_folder_name = candidates[0]
+
+        for filename in sorted(os.listdir(old_folder)):
+            match = rename_shared.LOWPOLY_FBX_RE.match(filename)
+            if not match:
+                continue
+            new_fbx_name = f"{lowpoly_number}_{new_address}{match.group(3)}.fbx"
+            old_fbx_path = os.path.join(old_folder, filename)
+            new_fbx_path = os.path.join(old_folder, new_fbx_name)
+            if old_fbx_path == new_fbx_path:
+                continue
+            if os.path.exists(new_fbx_path):
+                agr_report(self, 'WARNING',
+                           f"{new_fbx_name} уже существует — {filename} не переименован")
+                continue
             try:
-                os.rename(old_folder, new_folder_path)
-            except Exception:
-                pass
+                os.rename(old_fbx_path, new_fbx_path)
+            except Exception as exc:
+                agr_report(self, 'WARNING', f"Не удалось переименовать {filename}: {exc}")
+
+        if old_folder == new_folder_path:
+            return
+        if os.path.exists(new_folder_path):
+            agr_report(self, 'WARNING',
+                       f"Папка {new_folder_name} уже существует — {old_folder_name} не переименована")
+            return
+        try:
+            os.rename(old_folder, new_folder_path)
+        except Exception as exc:
+            agr_report(self, 'WARNING',
+                       f"Не удалось переименовать папку {old_folder_name}: {exc}")
+
 
 
 # ============= Register =============
@@ -1277,8 +1102,7 @@ def register():
 
 
 def unregister():
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)
     
     unregister_scene_properties()
     
