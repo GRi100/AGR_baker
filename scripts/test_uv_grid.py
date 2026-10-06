@@ -1905,6 +1905,334 @@ try:
           f"offsets=({s.offset_u:.4f}, {s.offset_v:.4f})")
     bpy.ops.object.mode_set(mode='OBJECT')
 
+    print("=" * 60)
+    print("TEST 44: «Весь меш» — the cut keeps the orientation gesture (UV-1)")
+    # The documented gesture: in «Весь меш» the LIVE face selection only
+    # orients the grid.  bisect_plane used to destroy it (new faces come out
+    # unselected and the VERT/EDGE flush drops the parent too), so the
+    # follow-up unwrap resolved a DIFFERENT grid — a wall turned into a
+    # floor on a building and pieces landed outside 0..1.
+
+    def set_select_mode(kind):
+        bpy.context.tool_settings.mesh_select_mode = {
+            'VERT': (True, False, False),
+            'EDGE': (False, True, False),
+            'FACE': (False, False, True)}[kind]
+
+    def make_roof_wall(name):
+        """10x10 roof at z=2 plus a 4x2 wall — the mean normal of the WHOLE
+        mesh is vertical (floor grid), of the wall alone horizontal."""
+        me = bpy.data.meshes.new(name)
+        me.from_pydata([(0, 0, 2), (10, 0, 2), (10, 10, 2), (0, 10, 2),
+                        (0, 0, 0), (4, 0, 0), (4, 0, 2), (0, 0, 2)],
+                       [], [(0, 1, 2, 3), (4, 5, 6, 7)])
+        me.validate()
+        ob = bpy.data.objects.new(name, me)
+        bpy.context.collection.objects.link(ob)
+        return ob
+
+    def select_wall(obj):
+        bm = bmesh.from_edit_mesh(obj.data)
+        deselect_all(bm)
+        wall = next(f for f in bm.faces
+                    if abs(f.calc_center_median().z - 1.0) < 0.1)
+        wall.select = True
+        bm.select_flush(True)
+        bmesh.update_edit_mesh(obj.data)
+        return bm
+
+    def world_grid_settings():
+        s = reset_settings()
+        s.grid_source = 'WORLD'
+        s.origin_mode = 'WORLD'
+        s.selection_mode = 'ALL'
+        s.world_cell_u = s.world_cell_v = 1.0
+        return s
+
+    def faces_out_of_unit(obj):
+        bm = bmesh.from_edit_mesh(obj.data)
+        uvl = bm.loops.layers.uv.verify()
+        out = 0
+        for f in bm.faces:
+            for lo in f.loops:
+                u, v = lo[uvl].uv
+                if u < -1e-3 or u > 1 + 1e-3 or v < -1e-3 or v > 1 + 1e-3:
+                    out += 1
+                    break
+        return out, len(bm.faces)
+
+    for mode in ('VERT', 'EDGE'):
+        rw = make_roof_wall(f"RoofWall_{mode}")
+        set_select_mode(mode)
+        enter_edit(rw)
+        select_wall(rw)
+        s = world_grid_settings()
+        b0 = uvmod._resolve_basis(None, s, uvmod._collect_targets(bpy.context, s),
+                                  quiet=True)
+        r = bpy.ops.agr.uv_grid_cut()
+        check(f"{mode}: cut FINISHED", r == {'FINISHED'})
+        bm = bmesh.from_edit_mesh(rw.data)
+        nsel = sum(1 for f in bm.faces if f.select)
+        check(f"{mode}: selection survives the cut", nsel > 0, f"selected={nsel}")
+        b1 = uvmod._resolve_basis(None, s, uvmod._collect_targets(bpy.context, s),
+                                  quiet=True)
+        check(f"{mode}: basis unchanged between cut and unwrap",
+              all(abs(a - b) < 1e-6 for a, b in
+                  zip(list(b0[1]) + list(b0[2]), list(b1[1]) + list(b1[2]))),
+              f"y {tuple(round(c, 2) for c in b0[2])} -> "
+              f"{tuple(round(c, 2) for c in b1[2])}")
+        check(f"{mode}: no scratch attribute left in the mesh",
+              uvmod._SEL_KEEP_LAYER not in
+              [a.name for a in rw.data.attributes],
+              str([a.name for a in rw.data.attributes]))
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        rw2 = make_roof_wall(f"RoofWallOne_{mode}")
+        set_select_mode(mode)
+        enter_edit(rw2)
+        select_wall(rw2)
+        world_grid_settings()
+        r = bpy.ops.agr.uv_grid_cut_unwrap()
+        check(f"{mode}: one-click cut+unwrap FINISHED", r == {'FINISHED'})
+        out, n = faces_out_of_unit(rw2)
+        check(f"{mode}: every face inside 0..1 after one click", out == 0,
+              f"out={out} of {n}")
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 45: closed shell — cut_unwrap never CANCELS after cutting (UV-2)")
+    set_select_mode('VERT')
+    bpy.ops.mesh.primitive_cube_add(size=2.0)
+    cube = bpy.context.active_object
+    bm = enter_edit(cube)
+    deselect_all(bm)
+    px = next(f for f in bm.faces if f.calc_center_median().x > 0.9)
+    px.select = True
+    bm.select_flush(True)
+    bmesh.update_edit_mesh(cube.data)
+    s = reset_settings()
+    s.grid_source = 'WORLD'
+    s.origin_mode = 'WORLD'
+    s.world_cell_u = s.world_cell_v = 0.5
+    before = len(bm.faces)
+    r = bpy.ops.agr.uv_grid_cut_unwrap()
+    bm = bmesh.from_edit_mesh(cube.data)
+    check("closed cube: FINISHED (a CANCELLED here welds the cut into the "
+          "previous undo step)", r == {'FINISHED'})
+    check("closed cube: the mesh really got cut", len(bm.faces) > before,
+          f"{before} -> {len(bm.faces)}")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # the committed-refusal path itself, without needing a mesh that fails
+    class _FakeOp:
+        def __init__(self):
+            self.reports = []
+
+        def report(self, kinds, msg):
+            self.reports.append((set(kinds), msg))
+
+    fake = _FakeOp()
+    _orig_collect = uvmod._collect_targets
+    uvmod._collect_targets = lambda ctx, st: []
+    try:
+        committed_ok = uvmod._do_unwrap(fake, bpy.context, settings(),
+                                        committed=True)
+        plain_ok = uvmod._do_unwrap(_FakeOp(), bpy.context, settings())
+    finally:
+        uvmod._collect_targets = _orig_collect
+    check("committed refusal returns True (operator must FINISH)",
+          committed_ok is True)
+    check("committed refusal reports a WARNING with the Ctrl+Z hint",
+          any('WARNING' in kinds and "Ctrl+Z" in msg
+              for kinds, msg in fake.reports), str(fake.reports))
+    check("plain refusal still returns False", plain_ok is False)
+
+    print("=" * 60)
+    print("TEST 46: per-object isolation of the cut loop (UV-7)")
+    isoa = make_grid_object("IsoCutA", 2, 2, cell=1.0)
+    isob = make_grid_object("IsoCutB", 2, 2, cell=1.0,
+                            matrix=Matrix.Translation(Vector((10, 0, 0))))
+    bpy.ops.object.mode_set(mode='OBJECT')
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    isoa.select_set(True)
+    isob.select_set(True)
+    bpy.context.view_layer.objects.active = isoa
+    bpy.ops.object.mode_set(mode='EDIT')
+    s = reset_settings()
+    s.grid_source = 'WORLD'
+    s.origin_mode = 'WORLD'
+    s.world_cell_u = s.world_cell_v = 0.5
+    _orig_cut_object = uvmod._cut_object
+
+    def _boom_cut(op, settings_, obj, *args, **kwargs):
+        if obj.name == "IsoCutB":
+            raise RuntimeError("boom")
+        return _orig_cut_object(op, settings_, obj, *args, **kwargs)
+
+    uvmod._cut_object = _boom_cut
+    try:
+        r = bpy.ops.agr.uv_grid_cut()
+    finally:
+        uvmod._cut_object = _orig_cut_object
+    status = bpy.context.window_manager.agr_last_status
+    check("failing second object still FINISHES (undo step is pushed)",
+          r == {'FINISHED'}, str(r))
+    check("the failure is named in the report", "IsoCutB" in status, status)
+    bm_a = bmesh.from_edit_mesh(isoa.data)
+    check("the first object is really cut", len(bm_a.faces) > 4,
+          f"faces={len(bm_a.faces)}")
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 47: cut cap lowered to the measured range (UV-4)")
+    check("cap inside the measured 512..800 band",
+          512 <= uvmod._MAX_CUT_LINES <= 800, f"cap={uvmod._MAX_CUT_LINES}")
+    import time as _time
+    big = make_grid_object("CutCapBig", 1, 1, cell=500.0)   # span ~1000 lines
+    bm = enter_edit(big)
+    s = reset_settings()
+    s.grid_source = 'WORLD'
+    s.origin_mode = 'WORLD'
+    s.world_cell_u = s.world_cell_v = 1.0
+    t0 = _time.time()
+    cancelled = expect_cancel(bpy.ops.agr.uv_grid_cut)
+    dt = _time.time() - t0
+    check("~1000 lines refused (the old 2048 cap let it through)", cancelled)
+    check("the refusal is instant", dt < 2.0, f"dt={dt:.2f}s")
+    check("the error names the measured cause",
+          "время растёт быстрее" in bpy.context.window_manager.agr_last_status,
+          bpy.context.window_manager.agr_last_status)
+    bm = bmesh.from_edit_mesh(big.data)
+    check("mesh untouched by the refusal", len(bm.faces) == 1)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    check("a refused cut leaves no scratch attribute either",
+          uvmod._SEL_KEEP_LAYER not in [a.name for a in big.data.attributes],
+          str([a.name for a in big.data.attributes]))
+
+    print("=" * 60)
+    print("TEST 48: overlay fingerprint skips the selection scan when the "
+          "preview already refused (UV-5)")
+    ov = make_grid_object("OverlayCap", 3, 3, cell=1.0)
+    bm = enter_edit(ov)
+    bm.faces.ensure_lookup_table()
+    for f in bm.faces:
+        f.select = False
+    bm.faces[0].select = True
+    bm.select_flush(True)
+    bmesh.update_edit_mesh(ov.data)
+    s = reset_settings()
+    s.grid_source = 'WORLD'
+    s.origin_mode = 'WORLD'
+    uvmod._uv_overlay_refused["key"] = None
+    fp_sel = uvmod._uv_overlay_fingerprint(bpy.context, s)
+    check("normal fingerprint is not the refusal marker", fp_sel[0] != "refused")
+    _old_max = uvmod._OVERLAY_MAX_FACES
+    uvmod._OVERLAY_MAX_FACES = 1
+    try:
+        data = uvmod._uv_overlay_build(bpy.context, s)
+        check("build refuses above the face cap",
+              isinstance(data, dict) and "error" in data, str(data))
+        check("the refusal is remembered",
+              uvmod._uv_overlay_refused["key"] is not None)
+        fp1 = uvmod._uv_overlay_fingerprint(bpy.context, s)
+        check("fingerprint short-circuits to the refusal marker",
+              fp1[0] == "refused", str(fp1)[:80])
+        bm = bmesh.from_edit_mesh(ov.data)
+        bm.faces.ensure_lookup_table()
+        bm.faces[1].select = True
+        bmesh.update_edit_mesh(ov.data)
+        fp2 = uvmod._uv_overlay_fingerprint(bpy.context, s)
+        check("a selection change costs nothing while refused", fp1 == fp2)
+    finally:
+        uvmod._OVERLAY_MAX_FACES = _old_max
+    data = uvmod._uv_overlay_build(bpy.context, s)
+    check("the refusal is dropped once the preview builds again",
+          uvmod._uv_overlay_refused["key"] is None)
+    fp3 = uvmod._uv_overlay_fingerprint(bpy.context, s)
+    bm = bmesh.from_edit_mesh(ov.data)
+    bm.faces.ensure_lookup_table()
+    bm.faces[2].select = True
+    bmesh.update_edit_mesh(ov.data)
+    fp4 = uvmod._uv_overlay_fingerprint(bpy.context, s)
+    check("selection is back in the fingerprint when the preview draws",
+          fp3 != fp4)
+    # the two O(1) short-cuts: nothing / everything selected
+    bm = bmesh.from_edit_mesh(ov.data)
+    for f in bm.faces:
+        f.select = False
+    bmesh.update_edit_mesh(ov.data)
+    fp_none = uvmod._uv_overlay_fingerprint(bpy.context, s)
+    for f in bm.faces:
+        f.select = True
+    bm.select_flush(True)
+    bmesh.update_edit_mesh(ov.data)
+    fp_all = uvmod._uv_overlay_fingerprint(bpy.context, s)
+    check("none-selected and all-selected differ", fp_none != fp_all)
+
+    # In SELECTED mode the target count IS the selected-face count, so the
+    # refusal cache MUST notice a narrower selection: select-all on a city
+    # mesh refused and the preview stayed dead until the geometry changed
+    # (a pure selection change does not bump _uv_geo_version).
+    s.selection_mode = 'SELECTED'
+    uvmod._uv_overlay_refused["key"] = None
+    bm = bmesh.from_edit_mesh(ov.data)
+    bm.faces.ensure_lookup_table()
+    for f in bm.faces:
+        f.select = True
+    bm.select_flush(True)
+    bmesh.update_edit_mesh(ov.data)
+    uvmod._OVERLAY_MAX_FACES = 4
+    try:
+        data = uvmod._uv_overlay_build(bpy.context, s)
+        check("SELECTED: build refuses when the whole mesh is selected",
+              isinstance(data, dict) and "error" in data, str(data))
+        fp_wide = uvmod._uv_overlay_fingerprint(bpy.context, s)
+        check("SELECTED: the wide selection short-circuits to the marker",
+              fp_wide[0] == "refused", str(fp_wide)[:80])
+        for f in bm.faces:
+            f.select = False
+        bm.faces[0].select = True
+        bm.select_flush(True)
+        bmesh.update_edit_mesh(ov.data)
+        fp_narrow = uvmod._uv_overlay_fingerprint(bpy.context, s)
+        check("SELECTED: narrowing the selection leaves the refusal marker",
+              fp_narrow[0] != "refused", str(fp_narrow)[:80])
+        data = uvmod._uv_overlay_build(bpy.context, s)
+        check("SELECTED: the preview comes back without touching geometry",
+              isinstance(data, dict) and "error" not in data, str(data)[:120])
+    finally:
+        uvmod._OVERLAY_MAX_FACES = _old_max
+        uvmod._uv_overlay_refused["key"] = None
+        s.selection_mode = 'ALL'
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    print("=" * 60)
+    print("TEST 49: overlay handlers dedupe by __name__, not identity (UV-9)")
+
+    def _uv_overlay_depsgraph(_scene, _dg):
+        """Stand-in for the handler object of a previous module reload."""
+
+    bpy.app.handlers.depsgraph_update_post.append(_uv_overlay_depsgraph)
+    uvmod._uv_add_handlers()
+    n_dg = sum(1 for h in bpy.app.handlers.depsgraph_update_post
+               if getattr(h, "__name__", "") == "_uv_overlay_depsgraph")
+    check("stale twin dropped by name on add", n_dg == 1, f"n={n_dg}")
+    uvmod._uv_remove_handlers()
+    n_dg = sum(1 for h in bpy.app.handlers.depsgraph_update_post
+               if getattr(h, "__name__", "") == "_uv_overlay_depsgraph")
+    check("remove clears every twin", n_dg == 0, f"n={n_dg}")
+
+    def _uv_sync_handlers_on_load(_dummy):
+        """Stand-in for the load_post handler of a previous module reload."""
+
+    bpy.app.handlers.load_post.append(_uv_sync_handlers_on_load)
+    uvmod.unregister()
+    uvmod.register()   # a dev reload does exactly this
+    n_lp = sum(1 for h in bpy.app.handlers.load_post
+               if getattr(h, "__name__", "") == "_uv_sync_handlers_on_load")
+    check("stale load_post twin dropped on re-register", n_lp == 1, f"n={n_lp}")
+
 except Exception:
     traceback.print_exc()
     FAILS.append("EXCEPTION")

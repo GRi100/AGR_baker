@@ -778,6 +778,26 @@ try:
           len(o1.data.polygons) > f1_before,
           f"{f1_before} -> {len(o1.data.polygons)}")
 
+    print("\n=== TEST 19: the modifier warning is the same on both buttons ===")
+    # Object and Edit paths are two buttons of ONE panel: both unwrap the
+    # BASE mesh, so both must say that the modifiers are not applied.
+    check("the dead out_of_tile_faces key is gone",
+          'out_of_tile_faces' not in uvmod._organic_stats())
+    reset_scene()
+    mod_obj = suzanne("ModEdit", levels=0)
+    mod_obj.modifiers.new("Subsurf", 'SUBSURF')
+    select_only(mod_obj)
+    reset_settings(cell=0.5)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_mode(type='FACE')
+    bpy.ops.mesh.select_all(action='SELECT')
+    r = bpy.ops.agr.uv_organic_unwrap_selected()
+    bpy.ops.object.mode_set(mode='OBJECT')
+    check("edit-mode organic unwrap FINISHED", r == {'FINISHED'}, str(r))
+    check("edit path warns about unapplied modifiers",
+          "модификаторы не применены" in bpy.context.window_manager.agr_last_status,
+          bpy.context.window_manager.agr_last_status[-160:])
+
 except Exception:
     traceback.print_exc()
     FAILS.append("EXCEPTION")

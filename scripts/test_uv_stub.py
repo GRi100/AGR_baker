@@ -321,6 +321,141 @@ check("margin 0.5 -> bbox [0.25..0.75]",
 s.stub_threshold = 256
 s.stub_margin = 0.9
 
+print("== 12. shared tile arithmetic: borders belong to the tile they close ==")
+# ONE formula for the whole addon (core/udim_tiles): the UV module is the
+# producer and operators_udim the consumer, and they used to disagree
+# exactly on the borders — the class of bug that already bit revert_udim.
+from AGR_tools.core.udim_tiles import face_tile_number, uv_to_udim_number
+check("operators_uv delegates to the shared helper",
+      uvmod._uv_to_udim_number is uv_to_udim_number
+      and uvmod._face_tile_number is face_tile_number)
+check("u == 0.0 in row 1 -> 1011 (was 1010: ceil(0) fell to the row below)",
+      uv_to_udim_number(0.0, 1.5) == 1011, str(uv_to_udim_number(0.0, 1.5)))
+check("v == 1.0 closes row 0 -> 1001 (rows are right-closed too)",
+      uv_to_udim_number(0.0, 1.0) == 1001, str(uv_to_udim_number(0.0, 1.0)))
+check("u == 1.0 closes column 0 -> 1001",
+      uv_to_udim_number(1.0, 0.5) == 1001, str(uv_to_udim_number(1.0, 0.5)))
+check("u == 10.0 closes column 9 -> 1010",
+      uv_to_udim_number(10.0, 0.5) == 1010, str(uv_to_udim_number(10.0, 0.5)))
+check("v == 10.0 stays in the last row -> 1091",
+      uv_to_udim_number(0.5, 10.0) == 1091, str(uv_to_udim_number(0.5, 10.0)))
+check("just past the row end -> None (no wrap)",
+      uv_to_udim_number(10.5, 0.5) is None
+      and uv_to_udim_number(0.5, 10.5) is None)
+check("face exactly filling tile 1002 votes 1002 (organic_margin 1.0 case)",
+      face_tile_number([(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0)]) == 1002,
+      str(face_tile_number([(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0)])))
+check("empty uv list -> None", face_tile_number([]) is None)
+
+print("== 13. UV layer is created lazily, never left behind by a refusal ==")
+reset_scene()
+# a collinear triangle: the only face of a stub material, and degenerate,
+# so the operator finds the material but writes nothing
+me13 = bpy.data.meshes.new("FlatMesh")
+me13.from_pydata([(0, 0, 0), (1, 0, 0), (2, 0, 0)], [], [(0, 1, 2)])
+me13.validate()
+o13 = bpy.data.objects.new("FlatObj", me13)
+bpy.context.scene.collection.objects.link(o13)
+o13.data.materials.append(make_mat("M_Flat13", make_image("i13", 128)))
+check("mesh starts without a UV layer", not o13.data.uv_layers)
+select_only(o13)
+check("object path: nothing to unwrap -> CANCELLED",
+      expect_cancel(bpy.ops.agr.uv_unwrap_stub))
+check("object path: no stray UV layer left behind", not o13.data.uv_layers,
+      str([lay.name for lay in o13.data.uv_layers]))
+
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_mode(type='FACE')
+bpy.ops.mesh.select_all(action='SELECT')
+check("edit path: nothing to unwrap -> CANCELLED",
+      expect_cancel(bpy.ops.agr.uv_unwrap_stub_selected))
+bpy.ops.object.mode_set(mode='OBJECT')
+check("edit path: no stray UV layer left behind", not o13.data.uv_layers,
+      str([lay.name for lay in o13.data.uv_layers]))
+
+# and the positive edit-mode path still creates the layer at the first write
+reset_scene()
+o13b = make_grid("EditNoUV", 1, 1, with_uv=False)
+o13b.data.materials.append(make_mat("M_Edit13", make_image("i13b", 128)))
+select_only(o13b)
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_mode(type='FACE')
+bpy.ops.mesh.select_all(action='SELECT')
+check("edit path: real work FINISHES",
+      bpy.ops.agr.uv_unwrap_stub_selected() == {'FINISHED'})
+bpy.ops.object.mode_set(mode='OBJECT')
+check("edit path: the layer is created at the first write",
+      len(o13b.data.uv_layers) == 1)
+check("edit path: the face is unwrapped",
+      bbox_close(uv_bbox(o13b, 0), MARGIN_BBOX), str(uv_bbox(o13b, 0)))
+
+print("== 14. OBJECT-linked slots are named in the refusal, not only in success ==")
+reset_scene()
+o14 = make_grid("OverrideOnly", 1, 1)
+o14.data.materials.append(None)          # empty mesh-level slot
+o14.material_slots[0].link = 'OBJECT'
+o14.material_slots[0].material = make_mat("M_Ovr14", make_image("i14", 128))
+select_only(o14)
+check("all-override object -> CANCELLED",
+      expect_cancel(bpy.ops.agr.uv_unwrap_stub))
+status = bpy.context.window_manager.agr_last_status
+check("the report names the skipped OBJECT slots", "OBJECT" in status, status)
+
+print("== 15. stub basis is built in WORLD space (mirrored/scaled instances) ==")
+reset_scene()
+# a diagonal first edge + non-uniform object scale: the local basis and the
+# world one genuinely disagree, and the world one is what the viewer sees
+me15 = bpy.data.meshes.new("TriMesh")
+me15.from_pydata([(0, 0, 0), (1, 1, 0), (0, 1, 0)], [], [(0, 1, 2)])
+me15.validate()
+o15 = bpy.data.objects.new("TriScaled", me15)
+bpy.context.scene.collection.objects.link(o15)
+o15.scale = (2.0, 1.0, 1.0)
+bpy.context.view_layer.update()
+o15.data.materials.append(make_mat("M_Tri15", make_image("i15", 128)))
+select_only(o15)
+check("scaled object FINISHED", bpy.ops.agr.uv_unwrap_stub() == {'FINISHED'})
+pts_w = [o15.matrix_world @ o15.data.vertices[o15.data.loops[li].vertex_index].co
+         for li in o15.data.polygons[0].loop_indices]
+expect_w = uvmod._stub_face_uvs(pts_w, uvmod._world_normal(pts_w), (0.0, 0.0), 0.9)
+pts_l = [o15.data.vertices[o15.data.loops[li].vertex_index].co
+         for li in o15.data.polygons[0].loop_indices]
+expect_l = uvmod._stub_face_uvs(pts_l, o15.data.polygon_normals[0].vector,
+                                (0.0, 0.0), 0.9)
+check("the two spaces really differ on this face",
+      not uvs_close(expect_w, expect_l, tol=1e-4))
+check("the operator used the WORLD basis",
+      uvs_close(face_uvs(o15, 0), expect_w, tol=1e-5),
+      f"{[tuple(round(c, 4) for c in p) for p in face_uvs(o15, 0)]} vs "
+      f"{[tuple(round(c, 4) for c in p) for p in expect_w]}")
+
+# mirrored instance: the UV area keeps the same sign as its twin, i.e. the
+# "never mirrored" promise of the docstring now holds in WORLD space
+reset_scene()
+
+
+def _uv_area(obj, poly_index):
+    pts = face_uvs(obj, poly_index)
+    s = 0.0
+    for i, (ux, uy) in enumerate(pts):
+        vx, vy = pts[(i + 1) % len(pts)]
+        s += ux * vy - vx * uy
+    return s
+
+
+plain = make_grid("Plain15", 1, 1)
+plain.data.materials.append(make_mat("M_P15", make_image("i15p", 128)))
+mirror = make_grid("Mirror15", 1, 1)
+mirror.data.materials.append(bpy.data.materials["M_P15"])
+mirror.scale = (-1.0, 1.0, 1.0)
+bpy.context.view_layer.update()
+select_only(plain)
+mirror.select_set(True)
+check("both objects FINISHED", bpy.ops.agr.uv_unwrap_stub() == {'FINISHED'})
+check("mirrored instance keeps the UV area sign of its twin",
+      _uv_area(plain, 0) * _uv_area(mirror, 0) > 0,
+      f"{_uv_area(plain, 0):.4f} vs {_uv_area(mirror, 0):.4f}")
+
 print("=" * 60)
 if FAILS:
     print(f"❌ {len(FAILS)} CHECKS FAILED:")

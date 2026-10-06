@@ -57,12 +57,23 @@ from bpy.props import (
 )
 from bpy.types import Operator, Panel, PropertyGroup
 
-from .log import agr_report, logger
+from .log import agr_report, logger, unregister_classes
 from .core.texture_sets import material_texture_entry
+from .core.udim_tiles import face_tile_number, uv_to_udim_number
 from .operators_udim import object_has_udim
 
-# Safety cap for the cut operator: max grid lines per object (both axes)
-_MAX_CUT_LINES = 2048
+# Safety cap for the cut operator: max grid lines per object (both axes).
+# Measured on flat grids in 5.2 (the same chained-bisect cost the organic
+# cut pays): 98 lines 0.02 s, 198 — 0.14 s, 398 — 0.92 s, 598 — 6.75 s
+# (1.5x the lines = 7x the time).  The old 2048 was NOT a guard: a typo in
+# the cell size on a 20x20 m facade (0.02 m instead of 0.2 m) passed it and
+# froze the UI for minutes with no progress bar and no way to cancel.
+_MAX_CUT_LINES = 640
+
+# Scratch face int layer that carries the selection across bisect_plane in
+# «Весь меш» mode (see _cut_object).  Created and dropped inside one call —
+# it must never reach the mesh: the delivery checker forbids stray attrs.
+_SEL_KEEP_LAYER = "agr_uv_sel_tmp"
 
 # Faces whose UVs exceed the unit square by more than this are counted as
 # "bigger than one cell" (the warning suggests cutting first)
@@ -1264,10 +1275,28 @@ def _note_uv_overwrite(obj, bm, faces, atlas_objects, udim_objects):
 _STUB_EPS = 1e-9
 
 
+def _world_normal(pts):
+    """Newell normal of a polygon given by its WORLD points.
+
+    The same construction as `_face_world_area_vector`: derived from the
+    world coordinates, it already carries the flip a mirrored instance
+    (negative matrix determinant) introduces, so the basis built on it is
+    right-handed IN THE WORLD, not merely in object space.
+    """
+    n = Vector((0.0, 0.0, 0.0))
+    for i in range(1, len(pts) - 1):
+        n += (pts[i] - pts[0]).cross(pts[i + 1] - pts[0])
+    return n
+
+
 def _stub_face_uvs(pts, normal, tile_uv=(0.0, 0.0), margin=0.9):
     """Project ONE face onto its own plane and stretch it to fill the unit
     square (user decision: faces are laid on top of each other), then scale
     by `margin` around (0.5, 0.5) and shift into its UDIM tile.
+
+    `pts` and `normal` must be in the SAME space, and the callers pass
+    WORLD space: with local coordinates a mirrored instance (negative
+    determinant) unwraps mirrored relative to its twin.
 
     Basis: x = first edge projected into the plane (rotation-stable),
     y = n × x, so (x × y)·n = +1 and the mapping is never mirrored.
@@ -1303,28 +1332,12 @@ def _stub_face_uvs(pts, normal, tile_uv=(0.0, 0.0), margin=0.9):
     return out
 
 
-def _uv_to_udim_number(u, v):
-    """Checker-compatible tile number (SintezAGRChecker.uv_to_udim_number):
-    1000 + floor(v)*10 + ceil(u), clamped — ceil(0.0) == 0 would otherwise
-    vote for the non-existent tile 1000.  Returns None OUTSIDE the valid
-    UDIM zone (negative UVs — a deliberate parking area that revert_udim
-    also protects — and u past the 10-column row end): a clamped/wrapped
-    number would silently TELEPORT the face onto a real tile."""
-    if u < 0.0 or v < 0.0 or u > 10.0:
-        return None
-    return max(1001, 1000 + int(floor(v)) * 10 + int(ceil(u)))
-
-
-def _face_tile_number(uvs):
-    """Unanimous vote over the face's loop UVs, falling back to the face
-    mean UV when the loops straddle a tile border.  None when the face
-    sits outside the valid UDIM zone."""
-    nums = [_uv_to_udim_number(u, v) for u, v in uvs]
-    if nums and nums[0] is not None and all(num == nums[0] for num in nums):
-        return nums[0]
-    mu = sum(u for u, _v in uvs) / len(uvs)
-    mv = sum(v for _u, v in uvs) / len(uvs)
-    return _uv_to_udim_number(mu, mv)
+# Tile arithmetic lives in core/udim_tiles so that this module (producer)
+# and operators_udim (consumer of the very same numbers) cannot drift apart
+# on the cell borders again.  The two thin wrappers keep the old private
+# names alive for the existing headless tests.
+_uv_to_udim_number = uv_to_udim_number
+_face_tile_number = face_tile_number
 
 
 def _tile_offset(num):
@@ -1410,7 +1423,7 @@ def _organic_stats():
     # ignored; in Edit Mode it IS the mesh, and then the operator must end
     # with {'FINISHED'} even having unwrapped nothing (see _organic_report)
     return {'patches': 0, 'faces': 0, 'cuts': 0,
-            'degenerate': 0, 'out_of_tiles': 0, 'out_of_tile_faces': 0,
+            'degenerate': 0, 'out_of_tiles': 0,
             'folds': 0, 'merged': 0, 'crossed_tiles': 0,
             'rescaled': 0, 'dirty': False,
             'atlas_objects': [], 'udim_objects': [], 'modifier_objects': [],
@@ -2117,14 +2130,46 @@ def _organic_cap_error(op, over):
 # Core: unwrap
 # ============================================================
 
-def _do_unwrap(op, context, settings):
+def _cut_committed_warn(op, reason):
+    """The cut is already in the LIVE edit-BMesh and the unwrap refused.
+
+    Returning {'CANCELLED'} now would push no undo step and weld the cut
+    into the PREVIOUS undo entry, out of Ctrl+Z's reach — the very rule the
+    organic path states as `_organic_report(committed=True)`.  So the
+    operator finishes and says what happened instead.
+    """
+    agr_report(op, 'WARNING',
+               f"Меш нарезан, развёртка не выполнена: {reason}; "
+               "отменить можно через Ctrl+Z")
+    return True
+
+
+def _do_unwrap(op, context, settings, basis=None, committed=False):
+    """Map every target face into the 0..1 square of its grid cell.
+
+    `basis` — resolve the grid ONCE per user action: "Разрезать и
+    развернуть" hands over the basis the CUT used.  Re-resolving it here
+    would read a different input, because the bisect drops the live face
+    selection and `_orientation_targets` then falls back to the whole mesh
+    (a building's roof drags the mean normal vertical and the wall grid
+    turns into a floor grid).  The SURFACE frames are still rebuilt from
+    the new topology — phase anchoring makes them reproducible.
+
+    `committed` — the caller has already mutated the live edit-BMesh, so a
+    refusal must finish with a WARNING (see `_cut_committed_warn`).
+    """
     targets = _collect_targets(context, settings)
     if not targets:
+        if committed:
+            return _cut_committed_warn(op, "не осталось подходящих фейсов")
         _report_no_targets(op, settings)
         return False
-    basis = _resolve_basis(op, settings, targets)
     if basis is None:
-        return False
+        basis = _resolve_basis(op, settings, targets, quiet=committed)
+        if basis is None:
+            if committed:
+                return _cut_committed_warn(op, "сетка не определена")
+            return False
     origin, x_dir, y_dir, cell_u, cell_v = basis
     tol = settings.snap_tolerance
     surface = _surface_mode(settings)
@@ -2137,48 +2182,24 @@ def _do_unwrap(op, context, settings):
     vertical = 0
     atlas_objects = []
     udim_objects = []
+    failed = []
     for obj, bm, faces in targets:
-        op._mutated = True   # live edit-BMesh: writes start here (see mixin)
-        mat = obj.matrix_world
-        _note_uv_overwrite(obj, bm, faces, atlas_objects, udim_objects)
-        uv_layer = bm.loops.layers.uv.verify()
-
-        # STRICT position-faithful mapping (user's final choice — the
-        # smart placement tiers were each tried and rejected): UV = grid
-        # coordinate minus the cell index of the face center, per-vert
-        # snap on top.  Pieces of one cell assemble the tile at their true
-        # places; anything misaligned pokes out of 0..1 honestly and the
-        # oversize counter suggests cutting.
-        for f in faces:
-            pts = [mat @ v.co for v in f.verts]
-            if plan_normal is not None:
-                fn = Vector((0.0, 0.0, 0.0))
-                for i in range(1, len(pts) - 1):
-                    fn += (pts[i] - pts[0]).cross(pts[i + 1] - pts[0])
-                if (fn.length > 1e-12
-                        and abs(fn.dot(plan_normal)) < _TOPZ_FLAT_EPS * fn.length):
-                    vertical += 1
-            if surface:
-                fh, fanchor, fu0 = frames[f]
-                gus = [(fu0 + (p - fanchor).dot(fh)) / cell_u for p in pts]
-            else:
-                gus = [(p - origin).dot(x_dir) / cell_u for p in pts]
-            gvs = [(p - origin).dot(y_dir) / cell_v for p in pts]
-
-            cell_x = floor(sum(gus) / len(gus))
-            cell_y = floor(sum(gvs) / len(gvs))
-            face_out = False
-            for i, loop in enumerate(f.loops):
-                u = _snap(gus[i], tol) - cell_x
-                v = _snap(gvs[i], tol) - cell_y
-                loop[uv_layer].uv = (u, v)
-                if (u < -_UNIT_EPS or u > 1.0 + _UNIT_EPS
-                        or v < -_UNIT_EPS or v > 1.0 + _UNIT_EPS):
-                    face_out = True
-            if face_out:
-                oversize += 1
-        total += len(faces)
-        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        # per-object isolation, same as the organic path: this is the LIVE
+        # edit-BMesh, so once ANY object has been written the operator must
+        # still finish — an uncaught exception on the second object of a
+        # multi-object Edit Mode skips FINISHED, pushes no undo step and
+        # welds the first object's writes into the PREVIOUS undo entry
+        try:
+            n, n_over, n_vert = _unwrap_object(
+                op, obj, bm, faces, basis, frames, surface, plan_normal,
+                tol, atlas_objects, udim_objects)
+            total += n
+            oversize += n_over
+            vertical += n_vert
+        except ReferenceError:
+            raise   # the mixin turns a stale BMesh into a friendly report
+        except Exception as exc:
+            failed.append(f"{obj.name}: {exc}")
 
     msg = f"Развёрнуто фейсов: {total} (ячейка {cell_u:.3g} × {cell_v:.3g} м)"
     if udim_objects:
@@ -2191,25 +2212,140 @@ def _do_unwrap(op, context, settings):
     if vertical:
         msg += (f"; {vertical} фейс(ов) почти вертикальны — вид сверху "
                 "вырождает их UV (для стен нужна мировая сетка)")
-    if udim_objects or atlas_objects or oversize or vertical:
+    if failed:
+        msg += f"; ❌ сбой на объектах: {'; '.join(failed)}"
+    if udim_objects or atlas_objects or oversize or vertical or failed:
         agr_report(op, 'WARNING', msg)
     else:
         agr_report(op, 'INFO', msg)
     return True
 
 
+def _unwrap_object(op, obj, bm, faces, basis, frames, surface, plan_normal,
+                   tol, atlas_objects, udim_objects):
+    """Write the grid UVs of ONE object -> (faces, oversize, vertical)."""
+    origin, x_dir, y_dir, cell_u, cell_v = basis
+    op._mutated = True   # live edit-BMesh: writes start here (see mixin)
+    mat = obj.matrix_world
+    _note_uv_overwrite(obj, bm, faces, atlas_objects, udim_objects)
+    uv_layer = bm.loops.layers.uv.verify()
+    oversize = 0
+    vertical = 0
+
+    # STRICT position-faithful mapping (user's final choice — the smart
+    # placement tiers were each tried and rejected): UV = grid coordinate
+    # minus the cell index of the face center, per-vert snap on top.
+    # Pieces of one cell assemble the tile at their true places; anything
+    # misaligned pokes out of 0..1 honestly and the oversize counter
+    # suggests cutting.
+    for f in faces:
+        pts = [mat @ v.co for v in f.verts]
+        if plan_normal is not None:
+            fn = Vector((0.0, 0.0, 0.0))
+            for i in range(1, len(pts) - 1):
+                fn += (pts[i] - pts[0]).cross(pts[i + 1] - pts[0])
+            if (fn.length > 1e-12
+                    and abs(fn.dot(plan_normal)) < _TOPZ_FLAT_EPS * fn.length):
+                vertical += 1
+        if surface:
+            fh, fanchor, fu0 = frames[f]
+            gus = [(fu0 + (p - fanchor).dot(fh)) / cell_u for p in pts]
+        else:
+            gus = [(p - origin).dot(x_dir) / cell_u for p in pts]
+        gvs = [(p - origin).dot(y_dir) / cell_v for p in pts]
+
+        cell_x = floor(sum(gus) / len(gus))
+        cell_y = floor(sum(gvs) / len(gvs))
+        face_out = False
+        for i, loop in enumerate(f.loops):
+            u = _snap(gus[i], tol) - cell_x
+            v = _snap(gvs[i], tol) - cell_y
+            loop[uv_layer].uv = (u, v)
+            if (u < -_UNIT_EPS or u > 1.0 + _UNIT_EPS
+                    or v < -_UNIT_EPS or v > 1.0 + _UNIT_EPS):
+                face_out = True
+        if face_out:
+            oversize += 1
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    return len(faces), oversize, vertical
+
+
 # ============================================================
 # Core: cut along grid lines
 # ============================================================
 
+def _stamp_selection(context, settings):
+    """Carry the live face selection across the bisect in «Весь меш» mode.
+
+    There the selection is not the target list — it is the grid ORIENTATION
+    gesture (`_orientation_targets`), and `bisect_plane` destroys it: new
+    faces come out unselected and in VERT/EDGE select mode the flush drops
+    the parent face too, so a follow-up unwrap resolved a different grid
+    (a wall turned into a floor on a building).  A face int layer is the
+    only carrier that survives: measured on a 4-way bisect the layer value
+    reaches all 4 pieces, `f.tag` only 2 and `f.select` none.
+
+    Runs BEFORE `_collect_targets` on purpose — adding a custom data layer
+    invalidates every existing Python reference to the BMesh elements.
+    Returns the objects that carry the scratch layer.
+    """
+    if settings.selection_mode != 'ALL':
+        return []
+    stamped = []
+    for obj in _edit_mesh_objects(context):
+        bm = bmesh.from_edit_mesh(obj.data)
+        lay = bm.faces.layers.int.get(_SEL_KEEP_LAYER)
+        if lay is None:
+            lay = bm.faces.layers.int.new(_SEL_KEEP_LAYER)
+        for f in bm.faces:
+            f[lay] = 1 if f.select else 0
+        stamped.append(obj)
+    return stamped
+
+
+def _restore_selection(obj, bm, restore=True):
+    """Re-select the stamped faces and drop the scratch layer.
+
+    The scratch layer must never reach the mesh — the delivery checker
+    forbids stray attributes — so it is dropped even when the cut threw.
+    """
+    lay = bm.faces.layers.int.get(_SEL_KEEP_LAYER)
+    if lay is None:
+        return
+    if restore:
+        for f in bm.faces:
+            if f[lay]:
+                f.select = True   # flushes DOWN only, never select_flush up
+    bm.faces.layers.int.remove(lay)
+
+
 def _do_cut(op, context, settings):
+    """Bisect the target faces along the grid lines.
+
+    Returns the resolved basis (never None on success) so the caller can
+    hand THE SAME grid to the follow-up unwrap; None means nothing was cut
+    and the operator must cancel.
+    """
+    stamped = _stamp_selection(context, settings)
+    try:
+        return _do_cut_inner(op, context, settings, stamped)
+    finally:
+        # objects that were skipped or threw still carry the scratch layer
+        for obj in stamped:
+            try:
+                _restore_selection(obj, bmesh.from_edit_mesh(obj.data))
+            except Exception:
+                pass
+
+
+def _do_cut_inner(op, context, settings, stamped):
     targets = _collect_targets(context, settings)
     if not targets:
         _report_no_targets(op, settings)
-        return False
+        return None
     basis = _resolve_basis(op, settings, targets)
     if basis is None:
-        return False
+        return None
     origin, x_dir, y_dir, cell_u, cell_v = basis
     surface = _surface_mode(settings)
     frames = _make_frames(settings, targets, basis)
@@ -2264,24 +2400,58 @@ def _do_cut(op, context, settings):
         # must not run a follow-up unwrap that would bury this ERROR)
         agr_report(op, 'ERROR',
                    "Слишком много линий разреза: " + ", ".join(skipped) +
-                   f" (лимит {_MAX_CUT_LINES}) — проверьте размер ячейки")
-        return False
+                   f" (лимит {_MAX_CUT_LINES}) — проверьте размер ячейки: "
+                   "рез каждой линией идёт по всей геометрии, и время "
+                   "растёт быстрее числа линий")
+        return None
 
     total_cuts = 0
     total_new = 0
+    failed = []
     for obj, bm, faces, u_plan, min_u, max_u, min_v, max_v in plans:
-        op._mutated = True   # live edit-BMesh: bisects start here (see mixin)
-        mat = obj.matrix_world
-        mat_inv = mat.inverted_safe()
-        # world normal -> local plane normal for bisect_plane (transpose,
-        # NOT inverse: correct under non-uniform scale)
-        nrm_to_local = mat.to_3x3().transposed()
-        # dist is in LOCAL units — divide by the object scale so the weld
-        # tolerance stays ~1e-5 m in world space (FBX imports scale 100+)
-        obj_scale = max(abs(c) for c in mat.to_scale())
-        weld_dist = 1e-5 / max(obj_scale, 1e-9)
-        before = len(faces)
+        # per-object isolation, same as the organic path: the bisects below
+        # go into the LIVE edit-BMesh, so an uncaught exception on the
+        # second object of a multi-object Edit Mode would skip FINISHED,
+        # push no undo step and weld the first object's cut into the
+        # PREVIOUS undo entry
+        try:
+            n_cuts, n_new = _cut_object(op, settings, obj, bm, faces, u_plan,
+                                        min_u, max_u, min_v, max_v,
+                                        basis, surface)
+            total_cuts += n_cuts
+            total_new += n_new
+        except ReferenceError:
+            raise   # the mixin turns a stale BMesh into a friendly report
+        except Exception as exc:
+            failed.append(f"{obj.name}: {exc}")
 
+    msg = f"Разрезов: {total_cuts}, новых фейсов: +{total_new}"
+    if failed:
+        agr_report(op, 'WARNING',
+                   msg + f"; ❌ сбой на объектах: {'; '.join(failed)}")
+    else:
+        agr_report(op, 'INFO', msg)
+    return basis
+
+
+def _cut_object(op, settings, obj, bm, faces, u_plan, min_u, max_u,
+                min_v, max_v, basis, surface):
+    """Bisect ONE object along the grid lines -> (cuts, new faces)."""
+    origin, x_dir, y_dir, cell_u, cell_v = basis
+    op._mutated = True   # live edit-BMesh: bisects start here (see mixin)
+    mat = obj.matrix_world
+    mat_inv = mat.inverted_safe()
+    # world normal -> local plane normal for bisect_plane (transpose,
+    # NOT inverse: correct under non-uniform scale)
+    nrm_to_local = mat.to_3x3().transposed()
+    # dist is in LOCAL units — divide by the object scale so the weld
+    # tolerance stays ~1e-5 m in world space (FBX imports scale 100+)
+    obj_scale = max(abs(c) for c in mat.to_scale())
+    weld_dist = 1e-5 / max(obj_scale, 1e-9)
+    before = len(faces)
+
+    try:
+        total_cuts = 0
         # ---- phase 1 (SURFACE only): per-face U cuts ----
         work_faces = list(faces)
         if surface:
@@ -2336,11 +2506,14 @@ def _do_cut(op, context, settings):
             # user deliberately deselected, e.g. a window in a wall)
             for f in new_faces:
                 f.select = True
-        total_new += len(new_faces) - before
-        bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
-
-    agr_report(op, 'INFO', f"Разрезов: {total_cuts}, новых фейсов: +{total_new}")
-    return True
+        total_new = len(new_faces) - before
+    finally:
+        # restore the «Весь меш» orientation gesture and drop the scratch
+        # layer (removing it invalidates the element refs above, so it must
+        # be the LAST thing done with this BMesh)
+        _restore_selection(obj, bm)
+    bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+    return total_cuts, total_new
 
 
 # ============================================================
@@ -2360,8 +2533,42 @@ _COLOR_AXIS_U = (0.95, 0.25, 0.2, 1.0)   # red: U arrow
 _COLOR_AXIS_V = (0.3, 0.85, 0.3, 1.0)    # green: V arrow
 
 
+# Verdict cache for "too many faces to preview": the build already refused
+# for THIS cheap key, so the fingerprint must not pay an O(faces) selection
+# scan just to produce the same refusal string again (measured: 82 ms per
+# 0.15 s tick on 490k faces — over half the tick budget spent on a preview
+# that draws nothing).  The key deliberately holds no selection data.
+_uv_overlay_refused = {"key": None}
+
+
+def _uv_overlay_cheap_key(context, settings):
+    """Key for the refusal cache: object identity + face/vert counts, plus the
+    O(1) selected-face count in SELECTED mode.
+
+    `_uv_geo_version` is in it so that hiding faces (which changes the ALL
+    target count without changing len(bm.faces)) re-opens the question.
+
+    In SELECTED mode the target count IS the selected-face count, so without
+    `total_face_sel` the refusal stuck: select-all on a city mesh refused, and
+    narrowing the selection to ten wall faces kept the same key (a pure
+    selection change does not bump `_uv_geo_version` — the depsgraph reports
+    ID_RECALC_SELECT, not GEOMETRY), so the preview stayed dead until the
+    geometry was edited.  `mesh.total_face_sel` is O(1) and live in Edit Mode;
+    in ALL mode it is deliberately left out so the cache ignores selection.
+    """
+    key = [settings.selection_mode, _uv_geo_version]
+    for obj in _edit_mesh_objects(context):
+        bm = bmesh.from_edit_mesh(obj.data)
+        key.append((obj.name, len(bm.verts), len(bm.faces),
+                    obj.data.total_face_sel if settings.selection_mode == 'SELECTED' else -1))
+    return tuple(key)
+
+
 def _uv_overlay_fingerprint(context, settings):
     """Cheap state hash: recompute the preview only when this changes."""
+    cheap = _uv_overlay_cheap_key(context, settings)
+    if _uv_overlay_refused["key"] == cheap:
+        return ("refused", cheap)
     s = settings
     fp = [
         s.grid_source, s.projection, s.selection_mode, s.auto_orient, s.swap_axes,
@@ -2377,13 +2584,22 @@ def _uv_overlay_fingerprint(context, settings):
     for obj in _edit_mesh_objects(context):
         bm = bmesh.from_edit_mesh(obj.data)
         # selection is ALWAYS part of the state: the grid orientation follows
-        # the live selection even in «Весь меш» mode
-        sel_count = sel_hash = 0
-        for f in bm.faces:
-            if f.select:
-                sel_count += 1
-                sel_hash = (sel_hash * 31 + f.index) & 0x7FFFFFFF
-        fp.append((obj.name, len(bm.verts), len(bm.faces), sel_count, sel_hash,
+        # the live selection even in «Весь меш» mode.
+        # `mesh.total_face_sel` is O(1) and LIVE in Edit Mode (verified on
+        # 5.2), while mesh.polygons.foreach_get("select") returns the
+        # PRE-edit snapshot there — so numpy is not an option and the two
+        # degenerate cases (nothing / everything selected) are short-cut
+        # instead: their hash is fully determined by the counts.
+        n_faces = len(bm.faces)
+        sel_count = obj.data.total_face_sel
+        sel_hash = 0
+        if 0 < sel_count < n_faces:
+            sel_count = 0
+            for f in bm.faces:
+                if f.select:
+                    sel_count += 1
+                    sel_hash = (sel_hash * 31 + f.index) & 0x7FFFFFFF
+        fp.append((obj.name, len(bm.verts), n_faces, sel_count, sel_hash,
                    tuple(round(v, 5) for row in obj.matrix_world for v in row)))
     return tuple(fp)
 
@@ -2395,7 +2611,10 @@ def _uv_overlay_build(context, settings):
         return None
     total_faces = sum(len(faces) for _o, _b, faces in targets)
     if total_faces > _OVERLAY_MAX_FACES:
+        # remember the refusal so the next ticks skip the selection scan
+        _uv_overlay_refused["key"] = _uv_overlay_cheap_key(context, settings)
         return {"error": f"слишком много фейсов для превью ({total_faces})"}
+    _uv_overlay_refused["key"] = None
     basis = _resolve_basis(None, settings, targets, quiet=True)
     if basis is None:
         return {"error": "сетка не определена (см. настройки)"}
@@ -2675,16 +2894,45 @@ def _uv_overlay_depsgraph(_scene, depsgraph):
             break
 
 
+_UV_DRAW_HANDLE_KEY = "agr_uv_overlay_handle"   # survives a module reload
+
+
+def _uv_drop_stale_handlers(seq, name):
+    """Remove handlers by __name__, not identity: a dev reload builds NEW
+    function objects, so the identity check never matches the old module's
+    handler and it stays registered forever (same fix as operators_link)."""
+    for h in [h for h in seq if getattr(h, "__name__", "") == name]:
+        try:
+            seq.remove(h)
+        except ValueError:
+            pass
+
+
 def _uv_add_handlers():
     global _uv_handle_3d, _uv_draw_error_logged
     _uv_draw_error_logged = False
     _uv_overlay_cache["fp"] = None
     _uv_overlay_cache["next_check"] = 0.0
+    _uv_overlay_refused["key"] = None
     if _uv_handle_3d is None:
+        # a draw handler cannot be enumerated, so the previous module's
+        # handle is parked in the driver namespace, which reload survives
+        _uv_remove_stale_draw_handler()
         _uv_handle_3d = bpy.types.SpaceView3D.draw_handler_add(
             _uv_draw_overlay_3d, (), 'WINDOW', 'POST_VIEW')
-    if _uv_overlay_depsgraph not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(_uv_overlay_depsgraph)
+        bpy.app.driver_namespace[_UV_DRAW_HANDLE_KEY] = _uv_handle_3d
+    _uv_drop_stale_handlers(bpy.app.handlers.depsgraph_update_post,
+                            "_uv_overlay_depsgraph")
+    bpy.app.handlers.depsgraph_update_post.append(_uv_overlay_depsgraph)
+
+
+def _uv_remove_stale_draw_handler():
+    stale = bpy.app.driver_namespace.pop(_UV_DRAW_HANDLE_KEY, None)
+    if stale is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(stale, 'WINDOW')
+        except Exception:
+            pass
 
 
 def _uv_remove_handlers():
@@ -2695,10 +2943,14 @@ def _uv_remove_handlers():
         except Exception:
             pass
         _uv_handle_3d = None
-    if _uv_overlay_depsgraph in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(_uv_overlay_depsgraph)
+        bpy.app.driver_namespace.pop(_UV_DRAW_HANDLE_KEY, None)
+    else:
+        _uv_remove_stale_draw_handler()
+    _uv_drop_stale_handlers(bpy.app.handlers.depsgraph_update_post,
+                            "_uv_overlay_depsgraph")
     _uv_overlay_cache["fp"] = None
     _uv_overlay_cache["data"] = None
+    _uv_overlay_refused["key"] = None
     _uv_last_stats = None
 
 
@@ -3041,7 +3293,7 @@ class AGR_OT_UVGridCut(_AGR_UVGridPollMixin, Operator):
             return {'CANCELLED'}
         if _capture_only_finish(self, context, settings, grid_state):
             return {'FINISHED'}
-        if not _do_cut(self, context, settings):
+        if _do_cut(self, context, settings) is None:
             return {'CANCELLED'}
         return {'FINISHED'}
 
@@ -3064,10 +3316,15 @@ class AGR_OT_UVGridCutUnwrap(_AGR_UVGridPollMixin, Operator):
         if _capture_only_finish(self, context, settings, grid_state):
             return {'FINISHED'}
         # any skipped object aborts before unwrap so the cut ERROR survives
-        if not _do_cut(self, context, settings):
+        basis = _do_cut(self, context, settings)
+        if basis is None:
             return {'CANCELLED'}
-        if not _do_unwrap(self, context, settings):
-            return {'CANCELLED'}
+        # ONE grid per user action: the cut resolved it from the live face
+        # selection (the documented orientation gesture) and its own bisect
+        # then destroyed that selection — re-resolving here would silently
+        # unwrap against a different grid.  committed=True: whatever happens
+        # now, the cut is already in the mesh and the operator must FINISH.
+        _do_unwrap(self, context, settings, basis=basis, committed=True)
         return {'FINISHED'}
 
 
@@ -3119,20 +3376,37 @@ class AGR_OT_UVUnwrapStub(Operator):
 
         stats = {'faces': 0, 'materials': 0, 'tiles': 0,
                  'degenerate': 0, 'out_of_tiles': 0, 'override_slots': 0,
-                 'found_objects': 0,
+                 'found_objects': 0, 'uv_created': [],
                  'atlas_objects': [], 'udim_objects': []}
         for obj in unique_objs:
             self._process_object(obj, threshold, margin, stats)
 
         if stats['faces'] == 0:
+            # the skipped-slot counters belong in BOTH branches: with every
+            # slot an OBJECT override the user used to be told "заглушки не
+            # найдены" while the operator had found them and skipped them
+            tail = ""
+            if stats['override_slots']:
+                tail = (f" (пропущено OBJECT-слотов: {stats['override_slots']}"
+                        f" — оверрайд объекта не правит общий меш)")
+            elif stats['found_objects']:
+                tail = f" (объектов со стаб-материалами: {stats['found_objects']})"
             if stats['found_objects']:
                 agr_report(self, 'WARNING',
                            "⚠️ Стаб-материалы найдены, но ни один фейс не "
-                           "затронут (фейсы на других слотах/тайлах)")
+                           "затронут (фейсы на других слотах/тайлах)" + tail)
             else:
                 agr_report(self, 'WARNING',
                            f"⚠️ Заглушки (≤{threshold}px) не найдены в материалах "
-                           f"выбранных объектов")
+                           f"выбранных объектов" + tail)
+            if stats['uv_created']:
+                # a created UV layer is a mesh mutation: {'CANCELLED'} would
+                # push no undo step and leave it behind for good
+                agr_report(self, 'WARNING',
+                           "⚠️ Развернуть нечего, но UV-слой был создан у: "
+                           + ", ".join(stats['uv_created'])
+                           + " — отменить можно через Ctrl+Z")
+                return {'FINISHED'}
             return {'CANCELLED'}
 
         msg = (f"✅ Stub-развёртка: фейсов {stats['faces']}, "
@@ -3183,13 +3457,23 @@ class AGR_OT_UVUnwrapStub(Operator):
             return
         stats['found_objects'] += 1
 
-        if mesh.uv_layers.active is None:
-            mesh.uv_layers.new(name="UVMap")
-        uv_data = mesh.uv_layers.active.data
-        poly_normals = mesh.polygon_normals  # forces the lazy normals cache
+        # the UV layer is created LAZILY, right before the first real write:
+        # creating it up front and then returning {'CANCELLED'} left a stray
+        # layer in the mesh outside any undo step, against the "1 UV per
+        # object" delivery rule
+        uv_layer = mesh.uv_layers.active
+        uv_data = uv_layer.data if uv_layer is not None else None
+        mat_world = obj.matrix_world
         # a fixed-stub slot on a UDIM object must keep each face in its
         # OWN tile - flattening into 0..1 would silently re-texture it
         keep_tiles = object_has_udim(obj)
+
+        def _poly_uvs(poly):
+            # no UV layer yet -> every loop reads as (0, 0), i.e. tile 1001,
+            # exactly what the freshly created layer used to give
+            if uv_data is None:
+                return [(0.0, 0.0)] * poly.loop_total
+            return [tuple(uv_data[li].uv) for li in poly.loop_indices]
 
         n_touched = 0
         touched_slots = set()
@@ -3199,16 +3483,14 @@ class AGR_OT_UVUnwrapStub(Operator):
             tile_uv = (0.0, 0.0)
             if idx in stub_fixed_slots:
                 if keep_tiles:
-                    uvs = [tuple(uv_data[li].uv) for li in poly.loop_indices]
-                    num = _face_tile_number(uvs)
+                    num = _face_tile_number(_poly_uvs(poly))
                     if num is None:
                         stats['out_of_tiles'] += 1
                         continue
                     tile_uv = _tile_offset(num)
             elif idx in tile_maps:
                 all_tiles, stub_tiles = tile_maps[idx]
-                uvs = [tuple(uv_data[li].uv) for li in poly.loop_indices]
-                num = _face_tile_number(uvs)
+                num = _face_tile_number(_poly_uvs(poly))
                 if num not in stub_tiles:
                     if num not in all_tiles:
                         stats['out_of_tiles'] += 1
@@ -3216,13 +3498,18 @@ class AGR_OT_UVUnwrapStub(Operator):
                 tile_uv = _tile_offset(num)
             else:
                 continue
-            pts = [mesh.vertices[mesh.loops[li].vertex_index].co
+            # WORLD space: a mirrored instance (negative matrix determinant)
+            # turns the right-handed local basis into a left-handed world
+            # one, i.e. a mirrored unwrap — the docstring promises otherwise
+            pts = [mat_world @ mesh.vertices[mesh.loops[li].vertex_index].co
                    for li in poly.loop_indices]
-            new_uvs = _stub_face_uvs(pts, poly_normals[poly.index].vector,
-                                     tile_uv, margin)
+            new_uvs = _stub_face_uvs(pts, _world_normal(pts), tile_uv, margin)
             if new_uvs is None:
                 stats['degenerate'] += 1
                 continue
+            if uv_data is None:
+                uv_data = mesh.uv_layers.new(name="UVMap").data
+                stats['uv_created'].append(obj.name)
             for li, uv in zip(poly.loop_indices, new_uvs):
                 uv_data[li].uv = uv
             n_touched += 1
@@ -3259,6 +3546,7 @@ class AGR_OT_UVUnwrapStubSelected(_AGR_UVGridPollMixin, Operator):
         degenerate = 0
         out_of_zone = 0
         selected_any = False
+        uv_created = []
         atlas_objects = []
         udim_objects = []
 
@@ -3268,17 +3556,20 @@ class AGR_OT_UVUnwrapStubSelected(_AGR_UVGridPollMixin, Operator):
             if not faces:
                 continue
             selected_any = True
-            self._mutated = True   # live edit-BMesh: writes start here (see mixin)
+            # the UV layer is created LAZILY, at the first real write: it is
+            # a mutation of the LIVE edit-BMesh that survives leaving Edit
+            # Mode, so creating it before knowing whether anything gets
+            # unwrapped left a stray layer behind a {'CANCELLED'}
             uv_layer = bm.loops.layers.uv.active
-            if uv_layer is None:
-                uv_layer = bm.loops.layers.uv.new("UVMap")
-            bm.normal_update()
+            mat_world = obj.matrix_world
             keep_tiles = object_has_udim(obj)
             n_done = 0
             for f in faces:
                 tile_uv = (0.0, 0.0)
                 if keep_tiles:
-                    uvs = [tuple(loop[uv_layer].uv) for loop in f.loops]
+                    uvs = ([tuple(loop[uv_layer].uv) for loop in f.loops]
+                           if uv_layer is not None
+                           else [(0.0, 0.0)] * len(f.loops))
                     num = _face_tile_number(uvs)
                     if num is None:
                         # negative parking zone / past the row end - a
@@ -3286,11 +3577,19 @@ class AGR_OT_UVUnwrapStubSelected(_AGR_UVGridPollMixin, Operator):
                         out_of_zone += 1
                         continue
                     tile_uv = _tile_offset(num)
-                pts = [loop.vert.co for loop in f.loops]
-                new_uvs = _stub_face_uvs(pts, f.normal, tile_uv, margin)
+                # WORLD space (see _stub_face_uvs): on a mirrored instance a
+                # local basis comes out left-handed in the world, i.e. the
+                # unwrap is mirrored against the non-mirrored twin
+                pts = [mat_world @ loop.vert.co for loop in f.loops]
+                new_uvs = _stub_face_uvs(pts, _world_normal(pts),
+                                         tile_uv, margin)
                 if new_uvs is None:
                     degenerate += 1
                     continue
+                self._mutated = True   # live edit-BMesh write starts here
+                if uv_layer is None:
+                    uv_layer = bm.loops.layers.uv.new("UVMap")
+                    uv_created.append(obj.name)
                 for loop, uv in zip(f.loops, new_uvs):
                     loop[uv_layer].uv = uv
                 n_done += 1
@@ -3306,9 +3605,17 @@ class AGR_OT_UVUnwrapStubSelected(_AGR_UVGridPollMixin, Operator):
                        "Нет выделенных фейсов — выделите полигоны в Edit Mode")
             return {'CANCELLED'}
         if total == 0:
-            agr_report(self, 'ERROR',
-                       "Развернуть нечего: фейсы вырождены или вне валидной "
-                       "UDIM-зоны")
+            reason = ("Развернуть нечего: фейсы вырождены или вне валидной "
+                      "UDIM-зоны")
+            if uv_created:
+                # a layer in the LIVE edit-BMesh survives leaving Edit Mode;
+                # {'CANCELLED'} pushes no undo step and would leave it there
+                agr_report(self, 'WARNING',
+                           reason + "; UV-слой создан у: "
+                           + ", ".join(uv_created)
+                           + " — отменить можно через Ctrl+Z")
+                return {'FINISHED'}
+            agr_report(self, 'ERROR', reason)
             return {'CANCELLED'}
 
         msg = f"✅ Развёрнуто фейсов внахлёст: {total}"
@@ -3477,6 +3784,10 @@ class AGR_OT_UVOrganicUnwrapSelected(_AGR_UVGridPollMixin, Operator):
         stats = _organic_stats()
         plans, over = [], []
         for obj, bm, faces in targets:
+            if obj.modifiers:
+                # same warning as the Object path: the unwrap runs on the
+                # BASE mesh, so two buttons of one panel must not disagree
+                stats['modifier_objects'].append(obj.name)
             plan = (_organic_plan_cut(obj.matrix_world, faces, params['cell'])
                     if params['cut'] else [])
             if plan is None:
@@ -3719,8 +4030,11 @@ def register():
         update=_uv_grid_toggle,
     )
 
-    if _uv_sync_handlers_on_load not in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.append(_uv_sync_handlers_on_load)
+    # by __name__, not identity: a dev reload builds a NEW function object,
+    # so the identity check would leave the old module's handler registered
+    _uv_drop_stale_handlers(bpy.app.handlers.load_post,
+                            "_uv_sync_handlers_on_load")
+    bpy.app.handlers.load_post.append(_uv_sync_handlers_on_load)
 
     # reloadOnSave: the WindowManager value survives re-registration while
     # the draw handlers do not — re-add them if the overlay was left on
@@ -3735,8 +4049,8 @@ def register():
 
 
 def unregister():
-    if _uv_sync_handlers_on_load in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.remove(_uv_sync_handlers_on_load)
+    _uv_drop_stale_handlers(bpy.app.handlers.load_post,
+                            "_uv_sync_handlers_on_load")
 
     _uv_remove_handlers()
 
@@ -3748,5 +4062,4 @@ def unregister():
     if hasattr(bpy.types.Scene, "agr_uv_settings"):
         del bpy.types.Scene.agr_uv_settings
 
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)
