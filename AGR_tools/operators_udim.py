@@ -5,6 +5,7 @@ UDIM operators for AGR Tools
 import bpy
 from bpy.types import Operator
 from bpy.props import StringProperty
+from bpy.app.handlers import persistent
 import os
 import json
 import math
@@ -14,32 +15,25 @@ from pathlib import Path
 
 from .core.udim_store import (UDIM_STORE, read_udim_record, write_udim_record,
                               strip_udim_record)
-from .log import agr_report
+from .core.udim_tiles import EPS, uv_to_udim_number, face_tile_number
+from .log import agr_report, unregister_classes
+from .rename_shared import parse_sm_name
 
 
 def process_object_name(obj_name):
-    """Extract address and object type from SM_Address_Type format
-    Type is always the last part (Main, Ground, etc.)
-    Address is everything between SM_ and _Type
+    """Extract (address, obj_type) from 'SM_Address[_NNN]_Type[.001]'.
+
+    Delegates to the shared SM_ parser (rename_shared.parse_sm_name) so all
+    7 object types and Blender's '.001' suffix are handled the same way as in
+    AGR Rename / AGR Atlas; the optional 3-digit number stays part of the
+    address, exactly as the old split-by-underscore code produced it.
     """
-    if not obj_name.startswith("SM_"):
-        raise ValueError("Object name must start with SM_")
-    
-    # Remove SM_ prefix
-    name_without_prefix = obj_name[3:]
-    
-    # Split by underscore
-    parts = name_without_prefix.split("_")
-    
-    if len(parts) < 2:
-        raise ValueError("Object name must be in format SM_Address_Type")
-    
-    # Type is the last part
-    obj_type = parts[-1]
-    
-    # Address is everything except the last part
-    address = "_".join(parts[:-1])
-    
+    parsed = parse_sm_name(obj_name)
+    if parsed is None:
+        raise ValueError("Object name must be in format SM_Address[_NNN]_Type")
+    address, number, obj_type = parsed
+    if number:
+        address = f"{address}_{number}"
     return address, obj_type
 
 
@@ -146,14 +140,17 @@ def save_udim_mapping(obj, udim_dir, mapping):
     return write_udim_record(obj, mapping)
 
 
-def find_udim_record_carrier(udim_dir, exclude=None):
+def find_udim_record_carrier(udim_dir, exclude=None, peek=False):
     """Object of this .blend carrying a UDIM record for the given tile
     folder.  The folder is SHARED by every non-Main type of one address
     (Ground/GroundEl/Flora all collapse into SM_<addr>_Ground), but the
     record lives on whichever object created the UDIM — operators running
     from a sibling object must find and update THAT record instead of
     forking a second, diverging one.  Returns (obj, mapping) or (None,
-    None)."""
+    None).
+
+    peek=True uses the cached, never-mutating read — the only variant
+    allowed from poll()/draw()."""
     want = os.path.basename(str(udim_dir))
     for other in bpy.data.objects:
         if other is exclude or other.type != 'MESH':
@@ -163,7 +160,7 @@ def find_udim_record_carrier(udim_dir, exclude=None):
             data = getattr(other, "data", None)
             if data is None or data.attributes.get(UDIM_STORE.prefix + "0") is None:
                 continue
-        rec = read_udim_record(other)
+        rec = UDIM_STORE.peek(other) if peek else read_udim_record(other)
         if not rec:
             continue
         addr = rec.get("address")
@@ -222,8 +219,13 @@ def find_udim_directory(address, obj_type, base_dir, use_main_dir=False):
 
 
 def scan_udim_tiles_in_dir(udim_dir):
-    """Scan directory for UDIM tile numbers (1001-1999)"""
+    """Scan directory for UDIM tile numbers (1001-1999).  A missing folder
+    is simply an empty set — callers use this as an "is the shared address
+    folder already occupied?" probe before creating anything."""
     tiles = set()
+
+    if not os.path.isdir(str(udim_dir)):
+        return tiles
 
     for filename in os.listdir(udim_dir):
         if not filename.lower().endswith('.png'):
@@ -274,8 +276,10 @@ def _png_has_alpha(filepath):
 
 # poll() and panel draw() run on every redraw — scanning every node tree each
 # time lags the UI on heavy scenes. Fingerprint (material names + node counts)
-# is O(slots) instead of O(nodes); UDIM operators clear the cache explicitly
-# because flipping image.source does not change the fingerprint.
+# is O(slots) instead of O(nodes); UDIM operators clear the cache explicitly.
+# Keyed by session_uid, NOT by name: names are reused across files and after a
+# rename, and the consumer in operators_uv decides from this value whether to
+# flatten a face into 0..1 — a stale True/False there rewrites UVs.
 _has_udim_cache = {}
 
 
@@ -283,20 +287,45 @@ def invalidate_udim_cache():
     _has_udim_cache.clear()
 
 
+@persistent
+def _invalidate_udim_cache_on_load(_dummy):
+    # A different .blend brings different objects; session_uid is unique per
+    # session but the cache must not outlive the file it was built from.
+    _has_udim_cache.clear()
+
+
+def _tiled_images_signature():
+    """Cheap global signal that the set of TILED images changed.  Flipping
+    image.source in the shader editor (or swapping the image inside an
+    existing node) leaves material names and node counts untouched, so the
+    per-object fingerprint alone cannot see it.  bpy.data.images is dozens
+    of entries — orders of magnitude cheaper than walking every node tree."""
+    count = 0
+    acc = 0
+    for img in bpy.data.images:
+        if img.source == 'TILED':
+            count += 1
+            acc ^= img.as_pointer()
+    return count, acc
+
+
 def object_has_udim(obj):
     """True when any material of obj uses a TILED (UDIM) image. Cached."""
     if not obj or obj.type != 'MESH':
         return False
     try:
-        fingerprint = tuple(
-            (slot.material.name, len(slot.material.node_tree.nodes))
-            for slot in obj.material_slots
-            if slot.material and slot.material.use_nodes
+        fingerprint = (
+            tuple(
+                (slot.material.name, len(slot.material.node_tree.nodes))
+                for slot in obj.material_slots
+                if slot.material and slot.material.use_nodes
+            ),
+            _tiled_images_signature(),
         )
     except Exception:
         fingerprint = None
 
-    cached = _has_udim_cache.get(obj.name)
+    cached = _has_udim_cache.get(obj.session_uid)
     if cached is not None and cached[0] == fingerprint:
         return cached[1]
 
@@ -310,27 +339,96 @@ def object_has_udim(obj):
         if has_udim:
             break
 
-    _has_udim_cache[obj.name] = (fingerprint, has_udim)
+    _has_udim_cache[obj.session_uid] = (fingerprint, has_udim)
     return has_udim
 
 
 def tiles_with_uv(obj):
     """Set of UDIM tiles actually occupied by the object's UV faces
-    (per-face majority vote, same rule as revert)."""
+    (per-face centroid, the shared rule of core/udim_tiles)."""
     mesh = obj.data
     if not mesh.uv_layers.active:
         return set()
+
+    # Per-loop Python access costs seconds on a 500k-poly Ground and this
+    # runs in invoke(), before the picker even opens — pull the whole UV
+    # layer in one foreach_get and average per face with numpy.
+    try:
+        import numpy as np
+        n_loops = len(mesh.loops)
+        uvs = np.empty(n_loops * 2, dtype=np.float32)
+        mesh.uv_layers.active.data.foreach_get("uv", uvs)
+        uvs = uvs.reshape(n_loops, 2)
+        n_polys = len(mesh.polygons)
+        if n_polys == 0 or n_loops == 0:
+            return set()
+        starts = np.empty(n_polys, dtype=np.int32)
+        totals = np.empty(n_polys, dtype=np.int32)
+        mesh.polygons.foreach_get("loop_start", starts)
+        mesh.polygons.foreach_get("loop_total", totals)
+        # Per-face Python loop cost 2.6 s on 200k polys and this now runs
+        # once per sibling in the revert / picker guards.  loop_start is
+        # monotonic and loop_total > 0 for every real polygon, so the whole
+        # centroid pass is one reduceat.  Arithmetic is 1:1 with
+        # core.udim_tiles.uv_to_udim_number (right-closed columns/rows,
+        # column clamped to 9, invalid zone dropped).
+        starts64 = starts.astype(np.int64)
+        totals64 = np.maximum(totals.astype(np.int64), 1)
+        cu = np.add.reduceat(uvs[:, 0].astype(np.float64), starts64) / totals64
+        cv = np.add.reduceat(uvs[:, 1].astype(np.float64), starts64) / totals64
+        valid = ((cu >= -EPS) & (cv >= -EPS) &
+                 (cu <= 10 + EPS) & (cv <= 10 + EPS) & (totals > 0))
+        col = np.minimum(np.maximum(np.floor(cu - EPS).astype(np.int64), 0), 9)
+        row = np.maximum(np.floor(cv - EPS).astype(np.int64), 0)
+        return set((1001 + col + row * 10)[valid].tolist())
+    except Exception as exc:
+        print(f"⚠️ tiles_with_uv: numpy path failed ({exc}), falling back")
+
     uv_data = mesh.uv_layers.active.data
     used = set()
     for poly in mesh.polygons:
-        votes = {}
-        for li in poly.loop_indices:
-            u, v = uv_data[li].uv
-            t = 1001 + math.floor(u) + math.floor(v) * 10
-            votes[t] = votes.get(t, 0) + 1
-        if votes:
-            used.add(max(votes.items(), key=lambda x: x[1])[0])
+        tile = face_tile_number([uv_data[li].uv for li in poly.loop_indices])
+        if tile is not None:
+            used.add(tile)
     return used
+
+
+# Zombie protection for the tile-picker modals, mirroring operators_library:
+# a modal killed WITHOUT its modal() running again (File→Open, addon
+# reloadOnSave — the standard dev loop of this project) leaves a live draw
+# handler bound to a dead instance plus its __agr_udim_preview_* datablocks.
+_active_hud = None
+_hud_token_counter = 0
+
+# Tiles wider than this are not decoded for the 128px HUD preview
+_PREVIEW_MAX_SIDE = 8192
+
+
+def _cleanup_active_hud():
+    global _active_hud
+    if _active_hud is not None:
+        try:
+            _active_hud._hud_finish(bpy.context)
+        except Exception:
+            pass
+        _active_hud = None
+
+
+def _drop_stale_handlers(handler_list, name):
+    """Remove handlers left by a previous addon reload (same __name__,
+    different function object)."""
+    for handler in list(handler_list):
+        if getattr(handler, "__name__", None) == name:
+            try:
+                handler_list.remove(handler)
+            except ValueError:
+                pass
+
+
+@persistent
+def _on_load_pre_hud(_dummy):
+    # Draw handlers and temp datablocks must not survive a file switch
+    _cleanup_active_hud()
 
 
 class AGR_UDIMGridHUD:
@@ -347,6 +445,10 @@ class AGR_UDIMGridHUD:
     # ---- lifecycle ----
 
     def _hud_start(self, context, udim_dir, tiles, tile_to_material, status):
+        global _active_hud, _hud_token_counter
+        # Only one picker at a time; a previous one (or a zombie from an
+        # earlier reload) is closed before this one paints anything.
+        _cleanup_active_hud()
         self._udim_dir = str(udim_dir)
         self._cell = 64
         self._slots = {t: ((t - 1001) % 10, (t - 1001) // 10) for t in tiles}
@@ -360,6 +462,16 @@ class AGR_UDIMGridHUD:
         self._handle = bpy.types.SpaceView3D.draw_handler_add(
             self._draw_hud, (context,), 'WINDOW', 'POST_PIXEL')
         context.window_manager.modal_handler_add(self)
+        # Ownership token: an addon reload resets the WM property to 0, so
+        # the surviving instance sees a mismatch on its next event and
+        # cleans itself up instead of drawing forever.
+        _hud_token_counter += 1
+        self._udim_token = _hud_token_counter
+        try:
+            context.window_manager.agr_udim_hud_token = self._udim_token
+        except Exception:
+            self._udim_token = None
+        _active_hud = self
         context.area.tag_redraw()
 
     def _load_tile_previews(self, tiles):
@@ -367,6 +479,7 @@ class AGR_UDIMGridHUD:
         Private temp datablocks, downscaled in-place, removed in _hud_finish
         — never touches the scene's TILED images."""
         import gpu
+        from .core.texture_sets import read_png_ihdr
         self._gpu_textures = {}
         self._preview_images = []
         for tile in tiles:
@@ -374,6 +487,17 @@ class AGR_UDIMGridHUD:
             path = tex_files.get('Diffuse') or next(iter(tex_files.values()), None)
             if not path:
                 continue
+            # Each preview shrinks to 128px right after loading, so the
+            # RETAINED cost is tiny — but the full-resolution decode is
+            # not, and an oversized tile would freeze the click that opens
+            # the picker. Header-only probe, then a plain colour cell.
+            try:
+                ihdr = read_png_ihdr(path)
+                if ihdr and max(ihdr[0], ihdr[1]) > _PREVIEW_MAX_SIDE:
+                    print(f"⚠️ UDIM HUD: tile {tile} is {ihdr[0]}x{ihdr[1]} — preview skipped")
+                    continue
+            except Exception:
+                pass
             try:
                 img = bpy.data.images.load(path, check_existing=False)
                 img.name = f"__agr_udim_preview_{tile}"
@@ -384,6 +508,13 @@ class AGR_UDIMGridHUD:
                 print(f"⚠️ UDIM HUD: preview failed for tile {tile}: {e}")
 
     def _hud_finish(self, context):
+        global _active_hud
+        if _active_hud is self:
+            _active_hud = None
+            try:
+                bpy.context.window_manager.agr_udim_hud_token = 0
+            except Exception:
+                pass
         if getattr(self, '_handle', None):
             bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
             self._handle = None
@@ -437,6 +568,18 @@ class AGR_UDIMGridHUD:
     def _handle_common(self, context, event):
         """Shared event handling. Returns a modal result set or None when
         the subclass should process the event itself."""
+        # Ownership check first: a reload zeroed the token, or a newer
+        # picker took over — this instance is a zombie.  Only instances
+        # started through _hud_start() carry a token (operators_library
+        # reuses this mixin with its OWN token and must not be touched).
+        token = getattr(self, '_udim_token', None)
+        if token is not None:
+            wm_token = getattr(context.window_manager, 'agr_udim_hud_token', 0)
+            if wm_token != token:
+                self._udim_token = None   # do not zero the newer owner's token
+                self._hud_finish(context)
+                return {'CANCELLED'}
+
         if context.area:
             context.area.tag_redraw()
 
@@ -559,29 +702,54 @@ class AGR_UDIMGridHUD:
 
 
 def scan_texture_sets_for_udim(context, obj):
-    """Scan AGR_BAKE folder for texture sets matching object materials"""
+    """Scan AGR_BAKE folder for texture sets matching object materials.
+
+    Returns (texture_sets, skipped): the caller MUST look at `skipped` —
+    silently dropping a slot used to leave its faces in tile 1001 wearing
+    another material's texture while its own material was unlinked."""
     texture_sets = []
-    
+    skipped = []
+
     # Get AGR_BAKE folder
     blend_path = bpy.data.filepath
     if not blend_path:
         print("⚠️ Blend file not saved")
-        return texture_sets
-    
+        return texture_sets, skipped
+
     from pathlib import Path
     base_dir = Path(blend_path).parent
     agr_bake_dir = base_dir / _get_output_folder()
-    
+
     if not agr_bake_dir.exists():
         print(f"⚠️ AGR_BAKE folder not found: {agr_bake_dir}")
-        return texture_sets
-    
+        skipped = [f"{slot.material.name} (нет папки {_get_output_folder()})"
+                   for slot in obj.material_slots if slot.material]
+        return texture_sets, skipped
+
     print(f"🔍 Scanning AGR_BAKE for texture sets...")
-    
+
+    # Slots WITHOUT faces carry no geometry into the UDIM, so a missing
+    # texture set for them cannot leave anything wearing the wrong tile —
+    # they are dropped by materials.clear() anyway.  Blocking Create UDIM on
+    # such a leftover slot (Ctrl+J, deleted geometry, an old material) forced
+    # the user to clean slots by hand for no gain.
+    used_slots = set()
+    try:
+        import numpy as np
+        idx = np.empty(len(obj.data.polygons), dtype=np.int32)
+        obj.data.polygons.foreach_get('material_index', idx)
+        used_slots = set(np.unique(idx).tolist())
+    except Exception as exc:
+        print(f"⚠️ UDIM: material_index scan failed ({exc}) — every slot is kept")
+        used_slots = set(range(len(obj.material_slots)))
+
     for mat_idx, slot in enumerate(obj.material_slots):
         if not slot.material:
             continue
-        
+        if mat_idx not in used_slots:
+            print(f"  ⏭️ Material {slot.material.name}: slot has no faces — dropped")
+            continue
+
         material = slot.material
         material_name = material.name
         
@@ -590,8 +758,9 @@ def scan_texture_sets_for_udim(context, obj):
         
         if not set_folder.exists():
             print(f"  ⚠️ Material {material_name}: No texture set folder found (S_{material_name})")
+            skipped.append(f"{material_name} (нет сета S_{material_name})")
             continue
-        
+
         # Check for required textures: DiffuseOpacity (or Diffuse), ERM, Normal
         diffuse_opacity_path = set_folder / f"T_{material_name}_DiffuseOpacity.png"
         diffuse_path = set_folder / f"T_{material_name}_Diffuse.png"
@@ -629,9 +798,180 @@ def scan_texture_sets_for_udim(context, obj):
             if not has_normal:
                 missing.append("Normal")
             print(f"  ⚠️ Material {material_name}: Missing textures: {', '.join(missing)}")
-    
+            skipped.append(f"{material_name} (нет: {', '.join(missing)})")
+
     print(f"✅ Found {len(texture_sets)} complete texture sets")
-    return texture_sets
+    return texture_sets, skipped
+
+
+def material_has_tiled_image(material):
+    """True when the material drives a TILED (UDIM) image."""
+    if not material or not material.use_nodes:
+        return False
+    for node in material.node_tree.nodes:
+        if node.type == 'TEX_IMAGE' and node.image and node.image.source == 'TILED':
+            return True
+    return False
+
+
+def find_udim_material_for_dir(obj, udim_dir):
+    """The object's material whose TILED image lives in `udim_dir`.  Used
+    to hand a sibling of the same address the EXISTING UDIM material
+    instead of a second `M_<addr>_Ground_1.001` datablock."""
+    if obj is None:
+        return None
+    want = os.path.normcase(os.path.abspath(str(udim_dir)))
+    for slot in obj.material_slots:
+        mat = slot.material
+        if not mat or not mat.use_nodes:
+            continue
+        for node in mat.node_tree.nodes:
+            if node.type != 'TEX_IMAGE' or not node.image:
+                continue
+            if node.image.source != 'TILED':
+                continue
+            path = bpy.path.abspath(node.image.filepath)
+            if not path:
+                continue
+            if os.path.normcase(os.path.dirname(os.path.abspath(path))) == want:
+                return mat
+    return None
+
+
+def objects_using_udim_dir(udim_dir, exclude=None):
+    """Every mesh of this .blend whose material drives a TILED image from
+    `udim_dir`.  The folder is SHARED by all non-Main types of one address,
+    so any operator that renames, deletes or re-numbers tiles has to know
+    the siblings — otherwise it moves the files out from under them."""
+    out = []
+    for other in bpy.data.objects:
+        if other is exclude or other.type != 'MESH':
+            continue
+        if find_udim_material_for_dir(other, udim_dir):
+            out.append(other)
+    return out
+
+
+def revert_tile_scope(obj, udim_dir, actual_tiles, mapping):
+    """Split the tiles found on disk into "this object's" and "not its
+    business" for a revert.
+
+    The folder is SHARED by every non-Main type of one address, so:
+      * a tile whose UV faces belong to a SIBLING is skipped — disassembling
+        it built generic M_#_#### materials and empty slots on the wrong
+        object and pulled the tile out of the sibling's record;
+      * a tile that is neither in the mapping nor occupied by this object's
+        own UVs is skipped too — those are the leftover files of a sibling
+        that already reverted (revert never deletes tile files), and they
+        used to resurface as junk materials on the next object.
+
+    Returns (tiles_to_revert, skipped_tiles, mapping_subset, own_tiles,
+    sibling_objects); `mapping` is returned trimmed to the tiles in scope.
+    """
+    own = tiles_with_uv(obj)
+    others = objects_using_udim_dir(udim_dir, exclude=obj)
+    skipped = set()
+    for other in others:
+        skipped |= tiles_with_uv(other)
+    skipped -= own
+
+    json_tiles = set()
+    if mapping:
+        json_tiles = {t.get('udim_number') for t in mapping.get('udim_tiles', [])}
+        skipped |= (set(actual_tiles) - json_tiles - own)
+
+    tiles = set(actual_tiles) - skipped
+    if mapping and skipped:
+        mapping = dict(mapping)
+        mapping['udim_tiles'] = [t for t in mapping.get('udim_tiles', [])
+                                 if t.get('udim_number') not in skipped]
+    return tiles, skipped, mapping, own, others
+
+
+def claim_canonical_material_name(material, canonical):
+    """Give `material` the canonical UDIM name even when an ORPHANED
+    same-named datablock still squats it.  The object's own materials are
+    unlinked right before the UDIM material is assigned, so the source
+    `M_<addr>_Ground_1` sits at 0 users and would otherwise force the new
+    material into `...1.001` — a name that fails the city's FBX naming
+    check.  A live or fake-user datablock is never touched."""
+    if material.name == canonical:
+        return True
+    squatter = bpy.data.materials.get(canonical)
+    if squatter is None:
+        material.name = canonical
+        return True
+    if squatter is material:
+        return True
+    if squatter.users == 0 and not material_has_tiled_image(squatter):
+        squatter.name = canonical + ".src"
+        material.name = canonical
+        print(f"📍 UDIM: freed the canonical name from an orphaned material -> {squatter.name}")
+        return True
+    print(f"⚠️ UDIM: name '{canonical}' is taken by a material in use — keeping '{material.name}'")
+    return False
+
+
+def borrow_carrier_mapping(obj, udim_dir):
+    """Mapping for an object that has no record of its own: the SHARED
+    address folder may be owned by a sibling.  Only the tiles this object's
+    UVs actually occupy are kept — the sibling's tiles are none of its
+    business and would otherwise become empty material slots."""
+    carrier, mapping = find_udim_record_carrier(udim_dir, exclude=obj)
+    if carrier is None or not mapping:
+        return None
+    own_tiles = tiles_with_uv(obj)
+    tiles = [t for t in mapping.get('udim_tiles', [])
+             if t.get('udim_number') in own_tiles]
+    if not tiles:
+        return None
+    print(f"📍 UDIM: using the record of sibling '{carrier.name}' "
+          f"for {len(tiles)} tiles")
+    subset = dict(mapping)
+    subset['udim_tiles'] = tiles
+    return subset
+
+
+def find_sibling_udim_carrier(obj, peek=True):
+    """Carrier of the address' SHARED UDIM record for an object that has no
+    UDIM material of its own.  Name parsing only — no filesystem access, so
+    it is safe to call from poll()/draw()."""
+    if not obj or obj.type != 'MESH' or not obj.name.startswith("SM_"):
+        return None
+    try:
+        address, obj_type = process_object_name(obj.name)
+    except Exception:
+        return None
+    folder = get_udim_directory_name(address, obj_type)
+    carrier, _mapping = find_udim_record_carrier(folder, exclude=obj, peek=peek)
+    return carrier
+
+
+def reload_tiled_images(obj, new_tiles=None):
+    """Reload every TILED image of the object so new tiles show up.
+    `new_tiles` are registered in the image's tile collection first —
+    reload() re-reads the tiles an image already knows about, it does not
+    discover tile files that appeared on disk afterwards."""
+    if obj is None:
+        return
+    for slot in obj.material_slots:
+        if not slot.material or not slot.material.use_nodes:
+            continue
+        for node in slot.material.node_tree.nodes:
+            if node.type == 'TEX_IMAGE' and node.image and node.image.source == 'TILED':
+                img = node.image
+                if new_tiles:
+                    try:
+                        known = {t.number for t in img.tiles}
+                        for number in sorted(new_tiles):
+                            if number not in known:
+                                img.tiles.new(tile_number=number)
+                    except Exception as exc:
+                        print(f"  ⚠️ Could not register tiles on {img.name}: {exc}")
+                try:
+                    img.reload()
+                except Exception as exc:
+                    print(f"  ⚠️ Error reloading {img.name}: {exc}")
 
 
 class AGR_OT_CreateUDIM(Operator):
@@ -672,54 +1012,96 @@ class AGR_OT_CreateUDIM(Operator):
                 return {'CANCELLED'}
             
             # Scan materials
-            texture_sets = scan_texture_sets_for_udim(context, obj)
-            
+            texture_sets, skipped = scan_texture_sets_for_udim(context, obj)
+
+            # Refuse BEFORE any mutation (same contract as the atlas
+            # operator): a skipped slot used to be unlinked anyway and its
+            # faces stayed in tile 1001 wearing another material's texture.
+            if skipped:
+                agr_report(self, 'ERROR',
+                           "UDIM не создан — у этих материалов нет полного сета "
+                           "(Diffuse/DiffuseOpacity + ERM + Normal): "
+                           + "; ".join(skipped))
+                return {'CANCELLED'}
+
             if not texture_sets:
                 self.report({'ERROR'}, "No suitable materials found (need Diffuse, ERM, Normal)")
                 return {'CANCELLED'}
-            
+
             print(f"Found {len(texture_sets)} suitable materials")
-            
+
             # Get use_main_dir setting
             use_main_dir = context.scene.agr_baker_settings.udim_use_main_directory
-            
+
+            # The tile folder is SHARED by every non-Main type of one
+            # address, so it may already hold a sibling's UDIM.  Continue
+            # its numbering instead of overwriting tiles 1001+ on disk.
+            planned_dir = self.udim_directory_path(address, obj_type, use_main_dir)
+            if planned_dir is None:
+                self.report({'ERROR'}, "Save blend file first")
+                return {'CANCELLED'}
+            existing_tiles = scan_udim_tiles_in_dir(planned_dir)
+            carrier, carrier_mapping = find_udim_record_carrier(planned_dir, exclude=obj)
+            start_udim = (max(existing_tiles) + 1) if existing_tiles else 1001
+            if existing_tiles:
+                print(f"📍 UDIM folder already holds tiles {sorted(existing_tiles)} — "
+                      f"continuing from {start_udim}")
+
             # Create UDIM directory
             udim_dir = self.create_udim_directory(address, obj_type, use_main_dir)
             if not udim_dir:
                 self.report({'ERROR'}, "Failed to create UDIM directory")
                 return {'CANCELLED'}
-            
+
             # Create UDIM material and textures
             udim_material = self.create_udim_material_and_textures(
-                context, obj, texture_sets, udim_dir, address, obj_type
+                context, obj, texture_sets, udim_dir, address, obj_type,
+                start_udim=start_udim, carrier=carrier, carrier_mapping=carrier_mapping
             )
-            
+
             if not udim_material:
                 self.report({'ERROR'}, "Failed to create UDIM material")
                 return {'CANCELLED'}
-            
+
             # Move UVs to UDIM tiles. Map original material slot → tile:
             # slots skipped during scanning (no texture set) must not shift
             # the numbering of the remaining tiles.
             slot_to_udim = {
-                mat_info['material_index']: 1001 + i
+                mat_info['material_index']: start_udim + i
                 for i, mat_info in enumerate(texture_sets)
             }
             self.move_uvs_to_udim_tiles(obj, slot_to_udim)
-            
+
             # Assign UDIM material to object
             obj.data.materials.clear()
+            # Slots are empty now, so an orphaned same-named source
+            # material can hand over the canonical name (see UDIM-X1)
+            claim_canonical_material_name(
+                udim_material, get_udim_material_name(address, obj_type))
             obj.data.materials.append(udim_material)
-            
+
             # Set all polygons to use material 0
             for poly in obj.data.polygons:
                 poly.material_index = 0
-            
-            self.report({'INFO'}, f"UDIM set created: {udim_material.name}")
+
+            # New tiles must appear on the sibling that already shows this
+            # folder as well
+            new_numbers = [start_udim + i for i in range(len(texture_sets))]
+            reload_tiled_images(obj, new_numbers)
+            if carrier is not None and carrier is not obj:
+                reload_tiled_images(carrier, new_numbers)
+
+            if carrier is not None:
+                agr_report(self, 'INFO',
+                           f"UDIM дополнен: {udim_material.name}, тайлы "
+                           f"{start_udim}–{start_udim + len(texture_sets) - 1} "
+                           f"(запись на объекте {carrier.name})")
+            else:
+                self.report({'INFO'}, f"UDIM set created: {udim_material.name}")
             print(f"✅ UDIM set created successfully!")
-            
+
             return {'FINISHED'}
-            
+
         except Exception as e:
             print(f"❌ Error creating UDIM: {str(e)}")
             import traceback
@@ -727,9 +1109,21 @@ class AGR_OT_CreateUDIM(Operator):
             self.report({'ERROR'}, f"Error: {str(e)}")
             return {'CANCELLED'}
     
+    def udim_directory_path(self, address, obj_type, use_main_dir=False):
+        """Where the UDIM folder WOULD be — resolved without creating it,
+        so occupancy can be checked before any mkdir/copy."""
+        blend_path = bpy.data.filepath
+        if not blend_path:
+            return None
+        base_dir = Path(blend_path).parent
+        udim_dir_name = get_udim_directory_name(address, obj_type)
+        if use_main_dir:
+            return base_dir / udim_dir_name
+        return base_dir / _get_output_folder() / udim_dir_name
+
     def create_udim_directory(self, address, obj_type, use_main_dir=False):
         """Create directory for UDIM textures
-        
+
         Args:
             address: Object address
             obj_type: Object type (Main, Ground, etc.)
@@ -763,63 +1157,97 @@ class AGR_OT_CreateUDIM(Operator):
             print(f"❌ Error creating UDIM folder: {e}")
             return None
     
-    def create_udim_material_and_textures(self, context, obj, texture_sets, udim_dir, address, obj_type):
-        """Create UDIM material and textures with JSON mapping"""
+    def create_udim_material_and_textures(self, context, obj, texture_sets, udim_dir,
+                                          address, obj_type, start_udim=1001,
+                                          carrier=None, carrier_mapping=None):
+        """Create UDIM material and textures, recording the tiles.
+
+        When a sibling of the same address already owns this SHARED folder
+        (`carrier`), its tiles are extended and its material reused — one
+        Ground UDIM per address, no forked record, no `.001` material."""
         print(f"🎨 Creating UDIM material and textures...")
-        
-        # Create material mapping for JSON
-        material_mapping = {
-            'object_name': obj.name,
-            'address': address,
-            'obj_type': obj_type,
-            'udim_tiles': []
-        }
-        
+
+        reuse_material = find_udim_material_for_dir(carrier, udim_dir) if carrier else None
+
+        # Record: extend the carrier's one, or start our own
+        if carrier is not None and carrier_mapping is not None:
+            material_mapping = carrier_mapping
+            record_obj = carrier
+            material_mapping.setdefault('udim_tiles', [])
+        else:
+            material_mapping = {
+                'object_name': obj.name,
+                'address': address,
+                'obj_type': obj_type,
+                'udim_tiles': []
+            }
+            record_obj = obj
+
         # Create UDIM material
         material_name = get_udim_material_name(address, obj_type)
-        udim_material = bpy.data.materials.new(name=material_name)
-        
-        nodes, links, bsdf = setup_udim_material_nodes(udim_material)
-        
+        if reuse_material is not None:
+            udim_material = reuse_material
+            print(f"♻️ Reusing the address' UDIM material: {udim_material.name}")
+        else:
+            udim_material = bpy.data.materials.new(name=material_name)
+
         # Texture info storage
         texture_info = {
             'Diffuse': {'files': [], 'node': None},
             'ERM': {'files': [], 'node': None},
             'Normal': {'files': [], 'node': None}
         }
-        
-        # Copy textures and create UDIM tiles
+
+        # Nothing may be overwritten: the numbering starts past the tiles
+        # already in the folder, so an existing target means the plan and
+        # the disk disagree — refuse before the first copy2.
+        plan = []
         for i, mat_info in enumerate(texture_sets):
-            udim_number = 1001 + i
+            udim_number = start_udim + i
+            for tex_type in ['Diffuse', 'ERM', 'Normal']:
+                source_path = mat_info.get(f"{tex_type.lower()}_path")
+                if not source_path or not os.path.exists(source_path):
+                    continue
+                udim_filename = get_udim_texture_name(address, obj_type, tex_type, udim_number)
+                target_path = udim_dir / udim_filename
+                if target_path.exists():
+                    agr_report(self, 'ERROR',
+                               f"UDIM не создан: файл тайла уже существует — {udim_filename}")
+                    return None
+                plan.append((i, udim_number, tex_type, source_path, target_path, udim_filename))
+
+        new_tiles = []
+        for i, mat_info in enumerate(texture_sets):
+            udim_number = start_udim + i
             print(f"  Processing material {i}: {mat_info['material_name']} -> UDIM {udim_number}")
-            
-            # Add to JSON mapping
-            tile_info = {
+            new_tiles.append({
                 'udim_number': udim_number,
                 'material_index': mat_info['material_index'],
                 'material_name': mat_info['material_name'],
                 'set_name': f"S_{mat_info['material_name']}"
-            }
-            material_mapping['udim_tiles'].append(tile_info)
-            
-            # Copy each texture type
-            for tex_type in ['Diffuse', 'ERM', 'Normal']:
-                source_path = mat_info.get(f"{tex_type.lower()}_path")
-                
-                if source_path and os.path.exists(source_path):
-                    udim_filename = get_udim_texture_name(address, obj_type, tex_type, udim_number)
-                    target_path = udim_dir / udim_filename
-                    
-                    try:
-                        shutil.copy2(source_path, target_path)
-                        texture_info[tex_type]['files'].append(str(target_path))
-                        print(f"    {tex_type}: {os.path.basename(source_path)} -> {udim_filename}")
-                    except Exception as e:
-                        print(f"    ❌ Error copying {tex_type}: {e}")
-        
-        # Save the mapping on the object (idprop + color mirror)
-        save_udim_mapping(obj, udim_dir, material_mapping)
-        
+            })
+
+        for _i, udim_number, tex_type, source_path, target_path, udim_filename in plan:
+            try:
+                shutil.copy2(source_path, target_path)
+                texture_info[tex_type]['files'].append(str(target_path))
+                print(f"    {tex_type}: {os.path.basename(source_path)} -> {udim_filename}")
+            except Exception as e:
+                print(f"    ❌ Error copying {tex_type}: {e}")
+
+        material_mapping['udim_tiles'].extend(new_tiles)
+
+        # Save the mapping on its carrier (idprop + color mirror)
+        save_udim_mapping(record_obj, udim_dir, material_mapping)
+
+        if reuse_material is not None:
+            # The reused material already points at this tiled set; a
+            # reload picks the new tiles up (done by the caller).
+            print(f"✅ UDIM tiles appended to material: {udim_material.name}")
+            return udim_material
+
+        nodes, links, bsdf = setup_udim_material_nodes(udim_material)
+
         # Create texture nodes
         for tex_type, info in texture_info.items():
             if info['files']:
@@ -936,8 +1364,10 @@ class AGR_OT_AddToUDIM(Operator):
         if not obj or obj.type != 'MESH' or not obj.name.startswith("SM_"):
             cls.poll_message_set("Выберите MESH-объект с именем SM_*")
             return False
-        # Must have UDIM to add to it
-        if not object_has_udim(obj):
+        # Either the object itself carries the UDIM, or a sibling of the
+        # same address owns the SHARED tile folder — adding sets to that
+        # folder is exactly what this operator does.
+        if not object_has_udim(obj) and find_sibling_udim_carrier(obj) is None:
             cls.poll_message_set("У объекта нет UDIM-текстур")
             return False
         return True
@@ -1033,21 +1463,29 @@ class AGR_OT_AddToUDIM(Operator):
             print(f"Found {len(new_sets)} new texture sets to add")
             
             # Add new sets to UDIM (the record goes to its actual carrier)
-            added_count = self.add_sets_to_udim(
+            added_count, failed = self.add_sets_to_udim(
                 record_carrier, new_sets, udim_dir, address, obj_type,
                 max_udim + 1, mapping
             )
-            
+
             if added_count == 0:
-                self.report({'ERROR'}, "Failed to add texture sets")
+                msg = "Не удалось добавить сеты в UDIM"
+                if failed:
+                    msg += ": " + ", ".join(failed)
+                agr_report(self, 'ERROR', msg)
                 return {'CANCELLED'}
-            
+
             # Reload UDIM images
             self.reload_udim_images(obj)
-            
-            self.report({'INFO'}, f"Added {added_count} texture sets to UDIM")
+
+            if failed:
+                agr_report(self, 'WARNING',
+                           f"Добавлено сетов в UDIM: {added_count}; не скопированы: "
+                           + ", ".join(failed))
+            else:
+                self.report({'INFO'}, f"Added {added_count} texture sets to UDIM")
             print(f"✅ Successfully added {added_count} sets to UDIM")
-            
+
             return {'FINISHED'}
             
         except Exception as e:
@@ -1149,23 +1587,27 @@ class AGR_OT_AddToUDIM(Operator):
 
     
     def add_sets_to_udim(self, obj, texture_sets, udim_dir, address, obj_type, start_udim, mapping):
-        """Add texture sets to UDIM folder and update the object record"""
+        """Add texture sets to UDIM folder and update the object record.
+        Returns (added_count, failed_names)."""
         added_count = 0
         new_tiles = []
-        
+        failed = []
+
         for i, mat_info in enumerate(texture_sets):
             udim_number = start_udim + i
             print(f"  Adding material {mat_info['material_name']} -> UDIM {udim_number}")
-            
-            # Prepare tile info for JSON
+
+            # Prepare tile info for the record — appended ONLY after the
+            # files actually landed: a phantom tile survives the operator's
+            # own CANCELLED (the record is written outside the undo step)
+            # and later makes revert build a material for missing files.
             tile_info = {
                 'udim_number': udim_number,
                 'material_index': mat_info['material_index'],
                 'material_name': mat_info['material_name'],
                 'set_name': f"S_{mat_info['material_name']}"
             }
-            new_tiles.append(tile_info)
-            
+
             # Copy each texture type
             success = True
             for tex_type in ['Diffuse', 'ERM', 'Normal']:
@@ -1187,7 +1629,10 @@ class AGR_OT_AddToUDIM(Operator):
             
             if success:
                 added_count += 1
-        
+                new_tiles.append(tile_info)
+            else:
+                failed.append(mat_info['material_name'])
+
         # Update the object record if a mapping exists
         if mapping and new_tiles:
             mapping['udim_tiles'].extend(new_tiles)
@@ -1195,8 +1640,8 @@ class AGR_OT_AddToUDIM(Operator):
             print(f"✅ Updated UDIM mapping with {len(new_tiles)} new tiles")
         elif new_tiles:
             print(f"⚠️ No UDIM mapping to update (added {len(new_tiles)} tiles unrecorded)")
-        
-        return added_count
+
+        return added_count, failed
     
     def reload_udim_images(self, obj):
         """Reload UDIM images to show new tiles"""
@@ -1271,8 +1716,23 @@ class AGR_OT_RevertUDIM(Operator):
                 self.report({'ERROR'}, "No UDIM tiles found in directory")
                 return {'CANCELLED'}
             
-            # Load mapping (object record, legacy JSON fallback)
+            # Load mapping (object record, legacy JSON fallback, then the
+            # sibling that owns this address' SHARED folder)
             mapping = load_udim_mapping(obj, udim_dir)
+            if not mapping:
+                mapping = borrow_carrier_mapping(obj, udim_dir)
+
+            # The folder is SHARED by every non-Main type of one address:
+            # tiles owned by a sibling are none of this object's business and
+            # must not be counted as "missing from the mapping" — otherwise
+            # the dialog scares the user and the hybrid path builds generic
+            # M_#_#### materials for the sibling's tiles.
+            actual_tiles, _skip, mapping, _own, _others = revert_tile_scope(
+                obj, udim_dir, actual_tiles, mapping)
+            if not actual_tiles:
+                self.report({'ERROR'}, "Все тайлы папки принадлежат другим "
+                                       "объектам этого адреса")
+                return {'CANCELLED'}
 
             # Check if we need to show warning
             show_warning = False
@@ -1382,11 +1842,28 @@ class AGR_OT_RevertUDIM(Operator):
                 self.report({'ERROR'}, "No UDIM tiles found")
                 return {'CANCELLED'}
             
-            # Load mapping (object record, legacy JSON fallback)
+            # Load mapping (object record, legacy JSON fallback, then the
+            # sibling that owns this address' SHARED folder)
             mapping = load_udim_mapping(obj, udim_dir)
+            if not mapping:
+                mapping = borrow_carrier_mapping(obj, udim_dir)
+
+            # Shared-folder guard, same as in invoke(): only the tiles this
+            # object actually occupies are disassembled.  full_mapping keeps
+            # the sibling entries so the record can be handed over below.
+            full_mapping = mapping
+            actual_tiles, skip_tiles, mapping, own_tiles, others = revert_tile_scope(
+                obj, udim_dir, actual_tiles, mapping)
+            if not actual_tiles:
+                self.report({'ERROR'}, "Все тайлы папки принадлежат другим "
+                                       "объектам этого адреса")
+                return {'CANCELLED'}
+            if skip_tiles:
+                print(f"📍 UDIM revert: tiles left to the siblings of the shared "
+                      f"folder: {sorted(skip_tiles)}")
 
             result = {'CANCELLED'}
-            
+
             if not mapping:
                 # No JSON - use fallback for all tiles
                 print("⚠️ No JSON mapping found, using fallback method for all tiles")
@@ -1410,9 +1887,9 @@ class AGR_OT_RevertUDIM(Operator):
             if result == {'FINISHED'}:
                 if old_udim_material:
                     self.cleanup_udim_material(old_udim_material)
-                # UDIM disassembled - the per-object record is obsolete
-                strip_udim_record(obj)
-            
+                self._hand_over_record(obj, udim_dir, full_mapping,
+                                       own_tiles, skip_tiles, others)
+
             return result
             
         except Exception as e:
@@ -1422,6 +1899,64 @@ class AGR_OT_RevertUDIM(Operator):
             self.report({'ERROR'}, f"Error: {str(e)}")
             return {'CANCELLED'}
     
+    def _hand_over_record(self, obj, udim_dir, full_mapping, own_tiles,
+                          skip_tiles, others):
+        """Keep the SHARED record alive after one sibling reverted.
+
+        The tile folder belongs to the address, not to the object: wiping the
+        carrier's record outright left every other Ground* object of the
+        address with no memory at all (its revert then produced generic
+        M_#_#### materials).  Two cases:
+          * this object owned the record — strip it, but move the entries of
+            the tiles that are still in use onto an object that still has the
+            UDIM material;
+          * the record was borrowed from a sibling — trim only this object's
+            tiles out of the carrier's record.
+        """
+        live_others = [o for o in others if o.name in bpy.data.objects]
+        try:
+            if read_udim_record(obj) is not None:
+                rest = [t for t in (full_mapping or {}).get('udim_tiles', [])
+                        if t.get('udim_number') in skip_tiles]
+                strip_udim_record(obj)
+                if not rest:
+                    return
+                heir = live_others[0] if live_others else None
+                if heir is None:
+                    agr_report(self, 'WARNING',
+                               "Запись UDIM удалена, но тайлы соседних объектов "
+                               "остались без памяти — некому передать запись")
+                    return
+                heir_map = read_udim_record(heir)
+                if heir_map:
+                    known = {t.get('udim_number') for t in heir_map.get('udim_tiles', [])}
+                    heir_map = dict(heir_map)
+                    heir_map['udim_tiles'] = list(heir_map.get('udim_tiles', [])) + [
+                        t for t in rest if t.get('udim_number') not in known]
+                else:
+                    heir_map = dict(full_mapping)
+                    heir_map['udim_tiles'] = rest
+                    heir_map['object_name'] = heir.name
+                save_udim_mapping(heir, udim_dir, heir_map)
+                print(f"📍 UDIM: record of {len(rest)} shared tiles handed over "
+                      f"to '{heir.name}'")
+                return
+
+            carrier, cmap = find_udim_record_carrier(udim_dir, exclude=obj)
+            if carrier is None or not cmap:
+                return
+            tiles = cmap.get('udim_tiles', [])
+            kept = [t for t in tiles if t.get('udim_number') not in own_tiles]
+            if len(kept) == len(tiles):
+                return
+            cmap = dict(cmap)
+            cmap['udim_tiles'] = kept
+            save_udim_mapping(carrier, udim_dir, cmap)
+            print(f"📍 UDIM: {len(tiles) - len(kept)} reverted tiles dropped "
+                  f"from the record of '{carrier.name}'")
+        except Exception as exc:
+            print(f"⚠️ UDIM: record hand-over failed: {exc}")
+
     def revert_with_partial_json(self, obj, mapping, udim_dir, actual_tiles, missing_tiles):
         """Revert UDIM with partial JSON mapping - use JSON for covered tiles, fallback for missing"""
         print(f"🔀 Using hybrid method: JSON for {len(actual_tiles) - len(missing_tiles)} tiles, fallback for {len(missing_tiles)} tiles")
@@ -1751,20 +2286,12 @@ class AGR_OT_RevertUDIM(Operator):
         skipped_faces = 0
 
         for face in bm.faces:
-            # Determine UDIM tile from UV coordinates
-            tile_votes = {}
-            
-            for loop in face.loops:
-                uv = loop[uv_layer].uv
-                tile_u = math.floor(uv.x)
-                tile_v = math.floor(uv.y)
-                udim_number = 1001 + tile_u + tile_v * 10
-                tile_votes[udim_number] = tile_votes.get(udim_number, 0) + 1
-            
-            # Get most common tile
-            if tile_votes:
-                udim_tile = max(tile_votes.items(), key=lambda x: x[1])[0]
+            # Determine UDIM tile from UV coordinates (shared centroid rule
+            # of core/udim_tiles — the per-loop vote made a face that fills
+            # a tile exactly depend on its loop order)
+            udim_tile = face_tile_number([loop[uv_layer].uv for loop in face.loops])
 
+            if udim_tile is not None:
                 # Shift UVs ONLY for tiles that belong to this UDIM.
                 # Faces in the negative zone (unwrap overshoot below 0 gives
                 # "tile 1000" and a bogus (-9,+1) shift via Python modulo)
@@ -1898,6 +2425,11 @@ def _resolve_udim_context(op, context):
     # REGISTER-only, no UNDO) - merely OPENING a tile picker must not
     # permanently write a record onto the mesh outside the undo stack
     mapping = load_udim_mapping(obj, udim_dir, migrate=False)
+    if not mapping:
+        # Shared address folder: a sibling (GroundEl/Flora) has no record of
+        # its own, the carrier holds ALL tiles.  Without this the picker shows
+        # unlabelled tiles and Convert Tile invents S_<addr>_tileNNNN names.
+        _carrier, mapping = find_udim_record_carrier(udim_dir, exclude=obj)
     tile_to_material = {}
     if mapping:
         for tile_info in mapping.get('udim_tiles', []):
@@ -1970,8 +2502,18 @@ class AGR_OT_ConvertTileToSet(Operator, AGR_UDIMGridHUD):
                 self.report({'ERROR'}, f"No textures found for tile {udim_number}")
                 return {'CANCELLED'}
 
-            # Original set/material name from mapping, fallback to a generic one
-            mapping = load_udim_mapping(bpy.data.objects.get(self._obj_name), self._udim_dir)
+            # Original set/material name from mapping, fallback to a generic
+            # one. migrate=False: this operator is REGISTER-only (files on
+            # disk), so migrating a legacy JSON here would stamp the mirror
+            # attributes onto the mesh outside the undo stack.
+            own = bpy.data.objects.get(self._obj_name)
+            mapping = load_udim_mapping(own, self._udim_dir, migrate=False)
+            if not mapping:
+                # Sibling of a shared address folder — the record lives on the
+                # carrier; without it the set is named S_<addr>_tileNNNN and
+                # loses the link to its source material.
+                _carrier, mapping = find_udim_record_carrier(self._udim_dir,
+                                                             exclude=own)
             material_name = None
             if mapping:
                 for tile_info in mapping.get('udim_tiles', []):
@@ -2155,9 +2697,18 @@ class AGR_OT_UDIMLayoutEditor(Operator, AGR_UDIMGridHUD):
 
         try:
             self._rename_tile_files(changes)
-            self._shift_uvs(obj, changes)
+            # The grid holds every tile of the SHARED address folder: dragging
+            # a sibling's tile renames ITS files, so its UVs and its images
+            # have to follow too, or its faces stay on the old number (= on
+            # another material's texture).
+            users = objects_using_udim_dir(self._udim_dir)
+            if obj not in users:
+                users.append(obj)
+            for user in users:
+                self._shift_uvs(user, changes)
             self._update_mapping(changes)
-            self._reload_images(obj)
+            for user in users:
+                self._reload_images(user)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -2168,8 +2719,31 @@ class AGR_OT_UDIMLayoutEditor(Operator, AGR_UDIMGridHUD):
         self.report({'INFO'}, f"UDIM layout: перемещено тайлов: {len(changes)}")
         return {'FINISHED'}
 
+    def _adopt_orphan_tmp(self, udim_dir):
+        """Restore `*.agrtmp` left behind by an interrupted earlier run.
+        Nothing scans for that extension, so an orphan is a tile that has
+        silently vanished from the set — put it back before planning."""
+        restored = 0
+        for fname in os.listdir(udim_dir):
+            if not fname.endswith('.agrtmp'):
+                continue
+            src = fname[:-len('.agrtmp')]
+            if not re.search(r'\.(\d{4})\.png$', src):
+                continue
+            if os.path.exists(os.path.join(udim_dir, src)):
+                continue   # the real file made it — the temp copy is stale
+            try:
+                os.rename(os.path.join(udim_dir, fname), os.path.join(udim_dir, src))
+                restored += 1
+            except OSError as exc:
+                print(f"⚠️ UDIM layout: could not restore orphan {fname}: {exc}")
+        if restored:
+            print(f"♻️ UDIM layout: restored {restored} orphaned .agrtmp files")
+
     def _rename_tile_files(self, changes):
         udim_dir = self._udim_dir
+        self._adopt_orphan_tmp(udim_dir)
+
         plan = []
         for fname in os.listdir(udim_dir):
             m = re.search(r'\.(\d{4})\.png$', fname)
@@ -2181,11 +2755,39 @@ class AGR_OT_UDIMLayoutEditor(Operator, AGR_UDIMGridHUD):
             dst = f"{fname[:m.start()]}.{changes[old]}.png"
             plan.append((fname, fname + '.agrtmp', dst))
 
-        # Two-phase rename so swapped tiles never collide on disk
-        for src, tmp, _ in plan:
-            os.rename(os.path.join(udim_dir, src), os.path.join(udim_dir, tmp))
-        for _, tmp, dst in plan:
-            os.rename(os.path.join(udim_dir, tmp), os.path.join(udim_dir, dst))
+        # No destination may already exist: renaming onto a live file would
+        # destroy a tile that is not part of this move at all.
+        sources = {src for src, _, _ in plan}
+        for _src, _tmp, dst in plan:
+            if dst not in sources and os.path.exists(os.path.join(udim_dir, dst)):
+                raise RuntimeError(f"целевой файл уже существует: {dst}")
+
+        # Two-phase rename so swapped tiles never collide on disk. Both
+        # phases roll back: a failure in phase 2 (file locked by a viewer)
+        # used to leave *.agrtmp that no scanner sees — the tiles simply
+        # disappeared from the set.
+        done_tmp = []
+        done_dst = []
+        try:
+            for src, tmp, _dst in plan:
+                os.rename(os.path.join(udim_dir, src), os.path.join(udim_dir, tmp))
+                done_tmp.append((src, tmp))
+            for _src, tmp, dst in plan:
+                os.rename(os.path.join(udim_dir, tmp), os.path.join(udim_dir, dst))
+                done_dst.append((tmp, dst))
+        except OSError as exc:
+            for tmp, dst in reversed(done_dst):
+                try:
+                    os.rename(os.path.join(udim_dir, dst), os.path.join(udim_dir, tmp))
+                except OSError as back_exc:
+                    print(f"❌ UDIM layout: rollback failed for {dst}: {back_exc}")
+            for src, tmp in reversed(done_tmp):
+                try:
+                    os.rename(os.path.join(udim_dir, tmp), os.path.join(udim_dir, src))
+                except OSError as back_exc:
+                    print(f"❌ UDIM layout: rollback failed for {tmp}: {back_exc}")
+            raise RuntimeError(f"переименование отменено и откатено: {exc}")
+
         print(f"📁 UDIM layout: renamed {len(plan)} tile files")
 
     def _shift_uvs(self, obj, changes):
@@ -2202,12 +2804,13 @@ class AGR_OT_UDIMLayoutEditor(Operator, AGR_UDIMGridHUD):
 
         moved = 0
         for face in bm.faces:
-            votes = {}
-            for loop in face.loops:
-                uv = loop[uv_layer].uv
-                t = 1001 + math.floor(uv.x) + math.floor(uv.y) * 10
-                votes[t] = votes.get(t, 0) + 1
-            tile = max(votes.items(), key=lambda x: x[1])[0]
+            # Shared centroid rule (core/udim_tiles): a per-loop vote on a
+            # face that exactly fills its tile picked the tile of whichever
+            # corner the loop order started at, and shifted it by another
+            # tile's delta.
+            tile = face_tile_number([loop[uv_layer].uv for loop in face.loops])
+            if tile is None:
+                continue
             new_tile = changes.get(tile)
             if new_tile is None:
                 continue
@@ -2227,13 +2830,19 @@ class AGR_OT_UDIMLayoutEditor(Operator, AGR_UDIMGridHUD):
     def _update_mapping(self, changes):
         obj = bpy.data.objects.get(self._obj_name)
         mapping = load_udim_mapping(obj, self._udim_dir)
+        owner = obj
         if not mapping:
+            # Sibling of a shared address folder: the record lives on the
+            # carrier and MUST be re-numbered there — otherwise the renamed
+            # files no longer match any entry.
+            owner, mapping = find_udim_record_carrier(self._udim_dir, exclude=obj)
+        if not mapping or owner is None:
             return
         for tile_info in mapping.get('udim_tiles', []):
             old = tile_info.get('udim_number')
             if old in changes:
                 tile_info['udim_number'] = changes[old]
-        save_udim_mapping(obj, self._udim_dir, mapping)
+        save_udim_mapping(owner, self._udim_dir, mapping)
 
     def _reload_images(self, obj):
         for slot in obj.material_slots:
@@ -2334,6 +2943,7 @@ class AGR_OT_ReplaceUDIMTile(Operator, AGR_UDIMGridHUD):
 
         replaced = 0
         skipped = []
+        self._alpha_warning = None
         for tex_type, target_path in tile_textures.items():
             src = self._find_source_for_type(tex_type, target_path)
             if src == 'COMPOSED':
@@ -2390,7 +3000,10 @@ class AGR_OT_ReplaceUDIMTile(Operator, AGR_UDIMGridHUD):
         msg = f"Тайл {tile} заменён сетом S_{self._set_material} ({replaced} текстур)"
         if skipped:
             msg += f", пропущено: {', '.join(skipped)}"
-            self.report({'WARNING'}, msg)
+        if self._alpha_warning:
+            msg += f"; ⚠️ {self._alpha_warning}"
+        if skipped or self._alpha_warning:
+            agr_report(self, 'WARNING', msg)
         else:
             self.report({'INFO'}, msg)
         return {'FINISHED'}
@@ -2402,11 +3015,26 @@ class AGR_OT_ReplaceUDIMTile(Operator, AGR_UDIMGridHUD):
         folder, mat = self._set_folder, self._set_material
 
         if tex_type == 'Diffuse':
-            for name in (f"T_{mat}_Diffuse.png", f"T_{mat}_DiffuseOpacity.png"):
-                path = os.path.join(folder, name)
-                if os.path.exists(path):
-                    return path
-            return None
+            # DiffuseOpacity FIRST — create/add build the tile from it and
+            # the UDIM material links its Alpha into the BSDF, so taking
+            # the flat RGB Diffuse silently dropped the tile's alpha.
+            do_path = os.path.join(folder, f"T_{mat}_DiffuseOpacity.png")
+            if os.path.exists(do_path):
+                return do_path
+            d_path = os.path.join(folder, f"T_{mat}_Diffuse.png")
+            if not os.path.exists(d_path):
+                return None
+            o_path = os.path.join(folder, f"T_{mat}_Opacity.png")
+            if os.path.exists(o_path):
+                if self._compose_diffuse_opacity(d_path, o_path, target_path):
+                    print("  ✅ DiffuseOpacity composed from Diffuse + Opacity")
+                    return 'COMPOSED'
+                self._alpha_warning = ("нет DiffuseOpacity, а собрать RGBA "
+                                       "не удалось (нужен Pillow) — альфа тайла потеряна")
+            else:
+                self._alpha_warning = ("в сете нет DiffuseOpacity/Opacity — "
+                                       "альфа тайла потеряна")
+            return d_path
 
         if tex_type == 'ERM':
             path = os.path.join(folder, f"T_{mat}_ERM.png")
@@ -2419,6 +3047,27 @@ class AGR_OT_ReplaceUDIMTile(Operator, AGR_UDIMGridHUD):
 
         path = os.path.join(folder, f"T_{mat}_{tex_type}.png")
         return path if os.path.exists(path) else None
+
+    def _compose_diffuse_opacity(self, diffuse_path, opacity_path, target_path):
+        """Merge the set's separate Diffuse + Opacity into an RGBA file at
+        target_path (the tile keeps its alpha channel)."""
+        try:
+            from PIL import Image
+        except ImportError:
+            return False
+        try:
+            with Image.open(diffuse_path) as d_img, Image.open(opacity_path) as o_img:
+                rgb = d_img.convert('RGB')
+                alpha = o_img.convert('L')
+                if alpha.size != rgb.size:
+                    alpha = alpha.resize(rgb.size, Image.LANCZOS)
+                rgba = rgb.copy()
+                rgba.putalpha(alpha)
+                rgba.save(target_path, 'PNG')
+            return True
+        except Exception as exc:
+            print(f"  ❌ Could not compose DiffuseOpacity: {exc}")
+            return False
 
     def _compose_erm(self, target_path):
         """Pack the set's separate Emit/Roughness/Metallic into an ERM file
@@ -2494,7 +3143,13 @@ class AGR_OT_DeleteUDIMTile(Operator, AGR_UDIMGridHUD):
 
         obj = context.active_object
         self._obj_name = obj.name
-        self._tiles_with_uv = tiles_with_uv(obj)
+        # The picker shows every tile of the SHARED address folder, so the
+        # "contains UV faces" guard has to look at every object using it —
+        # otherwise a sibling's tile is deleted with a single unwarned click.
+        self._tiles_with_uv = set()
+        for user in objects_using_udim_dir(udim_dir):
+            self._tiles_with_uv |= tiles_with_uv(user)
+        self._tiles_with_uv |= tiles_with_uv(obj)
         self._pending_confirm = None
         self._deleted_count = 0
 
@@ -2604,12 +3259,29 @@ def register():
     """Register UDIM operators"""
     for cls in classes:
         bpy.utils.register_class(cls)
+    # Ownership token for the tile-picker HUDs: a reload recreates the
+    # property at 0, so any surviving modal self-destructs on its next
+    # event instead of drawing over the new session.
+    bpy.types.WindowManager.agr_udim_hud_token = bpy.props.IntProperty(default=0)
+    # dev-reload makes NEW function objects, so identity checks never see
+    # the previous registration — dedup by name, as operators_link does
+    _drop_stale_handlers(bpy.app.handlers.load_pre, _on_load_pre_hud.__name__)
+    _drop_stale_handlers(bpy.app.handlers.load_post, _invalidate_udim_cache_on_load.__name__)
+    bpy.app.handlers.load_pre.append(_on_load_pre_hud)
+    bpy.app.handlers.load_post.append(_invalidate_udim_cache_on_load)
     print("✅ UDIM operators registered")
 
 
 def unregister():
     """Unregister UDIM operators"""
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    _cleanup_active_hud()
+    if _on_load_pre_hud in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.remove(_on_load_pre_hud)
+    if _invalidate_udim_cache_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_invalidate_udim_cache_on_load)
+    _has_udim_cache.clear()
+    if hasattr(bpy.types.WindowManager, 'agr_udim_hud_token'):
+        del bpy.types.WindowManager.agr_udim_hud_token
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)
     print("UDIM operators unregistered")
 

@@ -8,7 +8,7 @@ import json
 import struct
 from pathlib import Path
 
-from .atlas_store import atlas_type_for
+from .atlas_store import atlas_type_for, iter_atlas_entries
 
 
 def get_agr_bake_folder(context):
@@ -234,7 +234,19 @@ def scan_texture_sets(context):
         return []
     
     texture_sets = []
-    
+
+    # Atlas types of every per-object record, collected in ONE pass:
+    # asking atlas_type_for() per A_* folder rescanned bpy.data.objects
+    # for each folder (O(folders x objects) on every Refresh).
+    atlas_types = {}
+    try:
+        for _obj, _entry in iter_atlas_entries(peek=True):
+            name = _entry.get("atlas_name")
+            if name and name not in atlas_types:
+                atlas_types[name] = _entry.get("atlas_type", 'HIGH')
+    except Exception as exc:
+        print(f"  ⚠️ Could not read atlas records: {exc}")
+
     # Scan for S_* folders (regular texture sets) and A_* folders (atlases)
     for item in os.listdir(agr_bake_path):
         item_path = os.path.join(agr_bake_path, item)
@@ -269,8 +281,8 @@ def scan_texture_sets(context):
                 except Exception as e:
                     print(f"  ⚠️ Could not read atlas_mapping.json in {item}: {e}")
             else:
-                # No legacy JSON — ask the per-object records in the file
-                atlas_type = atlas_type_for(item, default='HIGH')
+                # No legacy JSON — take it from the pre-collected records
+                atlas_type = atlas_types.get(item, 'HIGH')
 
             if not texture_info['has_any']:
                 # LOW atlases use short-suffix filenames (T_X_d.png ...) —
@@ -355,6 +367,13 @@ def scan_texture_set_folder(folder_path, material_name):
     return texture_info
 
 
+# Subscribers notified after every rebuild of Scene.agr_texture_sets.
+# ui.register() appends its cache invalidator here; the core must never
+# import ui (that would close an import cycle), so the dependency is
+# inverted through this list.
+LIST_REBUILT_CALLBACKS = []
+
+
 def refresh_texture_sets_list(context):
     """Refresh texture sets list in scene properties"""
     texture_sets_collection = context.scene.agr_texture_sets
@@ -427,6 +446,17 @@ def refresh_texture_sets_list(context):
         tex_set.is_assigned = check_if_set_assigned(context, set_data['material_name'])
     
     print(f"✅ Refreshed texture sets list: {len(found_sets)} sets")
+    # Tell every cache keyed on the sets list that its contents are gone.
+    # Eleven operators (bake, blur, mirror, tile, resize, stub, frame, …)
+    # rebuild the collection through this helper WITHOUT going through the
+    # refresh operator, and a same-length rebuild kept the UI caches keyed on
+    # a stale generation stamp.  A plain callback list keeps the core free of
+    # any reverse import of ui.py.
+    for callback in LIST_REBUILT_CALLBACKS:
+        try:
+            callback()
+        except Exception as e:
+            print(f"⚠️ Texture sets: list-rebuilt callback failed: {e}")
     return len(found_sets)
 
 

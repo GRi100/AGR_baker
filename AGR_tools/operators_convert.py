@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from .core.materials import connect_texture_set_to_material
 from .core import baking as baking_core
+from .core.texture_sets import ensure_agr_bake_folder
+from .log import agr_report, unregister_classes
 
 
 def _linear_to_srgb(c):
@@ -23,11 +25,36 @@ def _linear_to_srgb(c):
     return int(encoded * 255 + 0.5)
 
 
+def _group_output_socket(group_node, socket):
+    """Input of the group's active NodeGroupOutput matching `socket` of the
+    outer group node (index first, name as fallback)."""
+    tree = group_node.node_tree
+    outputs = [n for n in tree.nodes if n.type == 'GROUP_OUTPUT']
+    if not outputs:
+        return None
+    out_node = next((n for n in outputs if getattr(n, 'is_active_output', False)),
+                    outputs[0])
+    if socket is None:
+        # No socket context: only unambiguous when the group has one link
+        linked = [s for s in out_node.inputs if s.is_linked]
+        return linked[0] if len(linked) == 1 else None
+    try:
+        idx = list(group_node.outputs).index(socket)
+    except ValueError:
+        idx = -1
+    if 0 <= idx < len(out_node.inputs):
+        return out_node.inputs[idx]
+    return out_node.inputs.get(socket.name)
+
+
 class AGR_OT_ConvertMaterialsToSets(Operator):
     """Convert object materials to texture sets by extracting and splitting textures"""
     bl_idname = "agr.convert_materials_to_sets"
     bl_label = "Convert Materials to Sets"
     bl_options = {'REGISTER', 'UNDO'}
+
+    # Per-material failure notes filled by process_material_textures()
+    last_errors = []
 
     @classmethod
     def poll(cls, context):
@@ -56,15 +83,16 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                 return {'CANCELLED'}
 
             self.base_dir = Path(blend_path).parent
-            agr_bake_dir = self.base_dir / "AGR_BAKE"
-
-            if not agr_bake_dir.exists():
-                agr_bake_dir.mkdir(parents=True)
+            # Output folder name is a user setting: writing a hardcoded
+            # AGR_BAKE put the sets outside the folder the list scans
+            agr_bake_dir = Path(ensure_agr_bake_folder(context))
+            self.agr_bake_dir = agr_bake_dir
 
             print(f"\n🔄 === CONVERTING MATERIALS TO SETS ===")
             print(f"Object: {obj.name}")
 
             converted_count = 0
+            problems = []
 
             for slot in obj.material_slots:
                 if not slot.material:
@@ -74,6 +102,7 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
 
                 if not material.use_nodes:
                     print(f"⚠️ Material {material.name}: No nodes, skipping")
+                    problems.append(f"{material.name}: без нод")
                     continue
 
                 print(f"\n📦 Processing material: {material.name}")
@@ -83,6 +112,14 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                 set_name = f"S_{material.name}"
                 set_folder = agr_bake_dir / set_name
 
+                # Every refusal happens BEFORE the folder is created and
+                # before a single file is written
+                ok, reason = self.preflight_material(material, textures, bsdf, set_folder)
+                if not ok:
+                    print(f"  ⛔ {reason}")
+                    problems.append(reason)
+                    continue
+
                 if not set_folder.exists():
                     set_folder.mkdir(parents=True)
                     print(f"  📁 Created folder: {set_folder}")
@@ -90,13 +127,24 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                 success = self.process_material_textures(context, material, textures, bsdf, set_folder)
 
                 if success:
-                    connect_texture_set_to_material(material, str(set_folder), material.name)
+                    if connect_texture_set_to_material(material, str(set_folder), material.name) is None:
+                        problems.append(f"{material.name}: текстуры записаны, но не подключились "
+                                        f"(нечитаемый файл в {set_folder})")
                     converted_count += 1
                     print(f"  ✅ Material converted and reconnected successfully")
+                else:
+                    problems.append(f"{material.name}: "
+                                    + (self.last_errors[0] if self.last_errors
+                                       else "текстуры не записаны"))
 
             bpy.ops.agr.refresh_texture_sets(skip_alpha_strip=True)
 
-            self.report({'INFO'}, f"Converted {converted_count} materials to texture sets")
+            if problems:
+                agr_report(self, 'WARNING',
+                           f"Сконвертировано материалов: {converted_count}; "
+                           f"пропущено: {'; '.join(problems)}")
+            else:
+                self.report({'INFO'}, f"Converted {converted_count} materials to texture sets")
             print(f"\n✅ Conversion complete: {converted_count} materials")
 
             return {'FINISHED'}
@@ -150,13 +198,13 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
 
         if bsdf.inputs['Base Color'].is_linked:
             link = bsdf.inputs['Base Color'].links[0]
-            tex_node = self.find_texture_node(link.from_node)
+            tex_node = self.find_texture_node(link.from_node, link.from_socket)
             if tex_node and tex_node.image:
                 candidate_diffuse = tex_node
 
         if bsdf.inputs['Alpha'].is_linked:
             link = bsdf.inputs['Alpha'].links[0]
-            tex_node = self.find_texture_node(link.from_node)
+            tex_node = self.find_texture_node(link.from_node, link.from_socket)
             if tex_node and tex_node.image:
                 candidate_opacity = tex_node
 
@@ -186,7 +234,7 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                 if from_node.type in ('SEPARATE_COLOR', 'SEPRGB'):
                     if from_node.inputs[0].is_linked:
                         tex_link = from_node.inputs[0].links[0]
-                        tex_node = self.find_texture_node(tex_link.from_node)
+                        tex_node = self.find_texture_node(tex_link.from_node, tex_link.from_socket)
                         if tex_node and tex_node.image:
                             textures['erm'] = tex_node.image
                             print(f"  ✅ Found packed ERM texture: {tex_node.image.name}")
@@ -205,7 +253,7 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                     from_node = link.from_node
                     # Direct texture connection (not through Separate Color)
                     if from_node.type not in ('SEPARATE_COLOR', 'SEPRGB'):
-                        tex_node = self.find_texture_node(from_node)
+                        tex_node = self.find_texture_node(from_node, link.from_socket)
                         if tex_node and tex_node.image:
                             textures[key] = tex_node.image
                             print(f"  ✅ Found separate {key}: {tex_node.image.name}")
@@ -218,26 +266,89 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
             if from_node.type == 'NORMAL_MAP':
                 if from_node.inputs['Color'].is_linked:
                     tex_link = from_node.inputs['Color'].links[0]
-                    tex_node = self.find_texture_node(tex_link.from_node)
+                    tex_node = self.find_texture_node(tex_link.from_node, tex_link.from_socket)
                     if tex_node and tex_node.image:
                         textures['normal'] = tex_node.image
                         print(f"  ✅ Found Normal texture: {tex_node.image.name}")
 
         return textures, bsdf
 
-    def find_texture_node(self, node):
-        """Recursively find texture image node"""
+    def find_texture_node(self, node, socket=None, visited=None):
+        """Trace a link back to the TEX_IMAGE that feeds it.
+
+        Socket-oriented on purpose: entering a GROUP jumps to that group's
+        NodeGroupOutput and continues from the input matching the socket we
+        arrived through — walking the group's first input instead would
+        happily return a texture belonging to another output.  Without the
+        descent the converter saw no texture at all and wrote a flat colour
+        stub over an existing set (core/baking.py and material_images have
+        descended into groups for releases).
+        """
+        if node is None:
+            return None
+        if visited is None:
+            visited = set()
+        key = (node.as_pointer(), socket.identifier if socket is not None else "")
+        if key in visited:
+            return None
+        visited.add(key)
+
         if node.type == 'TEX_IMAGE':
             return node
+
+        if node.type == 'GROUP' and node.node_tree is not None:
+            inner = _group_output_socket(node, socket)
+            if inner is not None and inner.is_linked:
+                link = inner.links[0]
+                return self.find_texture_node(link.from_node, link.from_socket, visited)
+            return None
+
+        # A texture living OUTSIDE the group, fed in through NodeGroupInput,
+        # cannot be resolved without the outer node — treated as "not found"
+        if node.type == 'GROUP_INPUT':
+            return None
 
         for inp in node.inputs:
             if inp.is_linked:
                 link = inp.links[0]
-                result = self.find_texture_node(link.from_node)
+                result = self.find_texture_node(link.from_node, link.from_socket, visited)
                 if result:
                     return result
 
         return None
+
+    def preflight_material(self, material, textures, bsdf, set_folder):
+        """Decide whether this material may be converted — BEFORE the set
+        folder is created and before a single file is written.
+        Returns (ok, reason)."""
+        if bsdf is None:
+            return False, (f"{material.name}: нет Principled BSDF "
+                           "(стекло/эмиссия) — конвертация невозможна")
+
+        if textures.get('diffuse') or textures.get('diffuse_opacity'):
+            return True, ""
+
+        # No diffuse source. A flat Base Color fill is the DOCUMENTED
+        # behaviour for a bare-colour material — but only then.
+        if bsdf.inputs['Base Color'].is_linked:
+            return False, (f"{material.name}: Base Color подключён, но текстуру "
+                           "проследить не удалось — заглушка не записана")
+
+        # CONV-1 protects REAL textures from being replaced by a flat stub.
+        # A stub written by this very converter is always 256×256 (the flat
+        # branch hardcodes res = 256), so refusing to overwrite it only made
+        # the user delete the folder by hand after tweaking the Base Color.
+        do_path = set_folder / f"T_{material.name}_DiffuseOpacity.png"
+        if do_path.exists():
+            from .core.texture_sets import read_png_ihdr
+            width, height, color_type = read_png_ihdr(str(do_path))
+            # color_type < 0 = unreadable: never overwrite what cannot be
+            # identified as our own stub.
+            if color_type < 0 or max(width, height) > 256:
+                return False, (f"{material.name}: голый цвет, но сет S_{material.name} "
+                               "уже существует — перезапись заглушкой отменена")
+
+        return True, ""
 
     def resolve_image_path(self, img):
         """Resolve a bpy image to a file path with three fallback levels:
@@ -271,7 +382,8 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
 
         # Step 3: packed image — save to temp file
         if img.packed_file:
-            agr_bake_dir = base_dir / "AGR_BAKE"
+            # Same output folder the sets go into (a user setting)
+            agr_bake_dir = Path(getattr(self, 'agr_bake_dir', base_dir / "AGR_BAKE"))
             agr_bake_dir.mkdir(parents=True, exist_ok=True)
 
             safe_name = img.name.replace('/', '_').replace('\\', '_').replace(':', '_')
@@ -322,7 +434,19 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                 img.pixels.foreach_get(pixels)
                 pixels = pixels.reshape(img.size[1], img.size[0], 4)
                 # Flip vertically: Blender pixels are bottom-to-top, Pillow expects top-to-bottom
-                arr = (np.flipud(pixels) * 255).astype('uint8')
+                pixels = np.flipud(pixels)
+                # img.pixels is SCENE-LINEAR float: writing it straight into
+                # a PNG made mid-tones about twice as dark (0.5 -> 54 instead
+                # of 128), and an HDR value > 1.0 wrapped around modulo 256
+                # into colour noise. Encode colour, clamp everything, leave
+                # alpha linear.
+                rgb = np.clip(pixels[:, :, :3], 0.0, 1.0)
+                low = rgb <= 0.0031308
+                rgb = np.where(low, rgb * 12.92,
+                               1.055 * np.power(np.clip(rgb, 1e-8, 1.0), 1.0 / 2.4) - 0.055)
+                alpha = np.clip(pixels[:, :, 3:4], 0.0, 1.0)
+                arr = np.rint(np.concatenate((rgb, alpha), axis=2) * 255.0)
+                arr = np.clip(arr, 0, 255).astype('uint8')
                 return Image.fromarray(arr, 'RGBA')
             except Exception as e:
                 print(f"  ⚠️ Failed to load image via pixel buffer {img.name}: {e}")
@@ -347,7 +471,8 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                 from_node = link.from_node
                 if from_node.type in ('SEPARATE_COLOR', 'SEPRGB'):
                     if from_node.inputs[0].is_linked:
-                        tex_node = self.find_texture_node(from_node.inputs[0].links[0].from_node)
+                        _in_link = from_node.inputs[0].links[0]
+                        tex_node = self.find_texture_node(_in_link.from_node, _in_link.from_socket)
                         if tex_node and tex_node.image == erm_image:
                             channels[key] = True
         return channels
@@ -361,12 +486,15 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
         diffuse_ok = False
         erm_ok = False
         normal_ok = False
+        # Every branch used to raise its flag BEFORE the try, so a failed
+        # load/save still reported success and the set ended up a mix of
+        # the previous DiffuseOpacity and fresh flat ERM/Normal stubs.
+        self.last_errors = []
 
         # ── Diffuse / Opacity ────────────────────────────────────────────────
 
         if textures['diffuse'] and textures['opacity']:
             # Separate diffuse and opacity textures
-            diffuse_ok = True
             try:
                 pil_diffuse = self.load_pil_image(textures['diffuse'])
                 pil_opacity = self.load_pil_image(textures['opacity'])
@@ -399,12 +527,16 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                         rgba.save(str(do_path))
                         print(f"  💾 Saved DiffuseOpacity (RGBA): {do_path.name}")
 
+                    diffuse_ok = True
+                else:
+                    self.last_errors.append("не удалось прочитать Diffuse/Opacity")
+
             except Exception as e:
                 print(f"  ❌ Error processing separate Diffuse/Opacity: {e}")
+                self.last_errors.append(f"Diffuse/Opacity: {e}")
 
         elif textures['diffuse']:
             # Diffuse only — no Alpha connection
-            diffuse_ok = True
             try:
                 pil_img = self.load_pil_image(textures['diffuse'])
                 if pil_img:
@@ -423,16 +555,25 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                     rgb.save(str(do_path))
                     print(f"  💾 Saved DiffuseOpacity (RGB, no alpha): {do_path.name}")
 
+                    diffuse_ok = True
+                else:
+                    self.last_errors.append("не удалось прочитать Diffuse")
+
             except Exception as e:
                 print(f"  ❌ Error processing Diffuse: {e}")
+                self.last_errors.append(f"Diffuse: {e}")
 
         elif textures['diffuse_opacity']:
             # Packed RGBA or RGB texture
             img = textures['diffuse_opacity']
-            diffuse_ok = True
             try:
                 pil_img = self.load_pil_image(img)
                 if pil_img:
+                    # A palette PNG with tRNS (the usual foliage cut-out
+                    # export) reports mode 'P' — converting it to RGB threw
+                    # the alpha away silently, so promote it to RGBA first.
+                    if pil_img.mode in ('P', 'PA') or 'transparency' in pil_img.info:
+                        pil_img = pil_img.convert('RGBA')
                     if pil_img.mode in ('RGBA', 'LA'):
                         rgb = pil_img.convert('RGB')
                         alpha = pil_img.split()[-1]
@@ -477,11 +618,19 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                         rgb.save(str(do_path))
                         print(f"  💾 Saved DiffuseOpacity (RGB, no alpha): {do_path.name}")
 
+                    diffuse_ok = True
+                else:
+                    self.last_errors.append("не удалось прочитать DiffuseOpacity")
+
             except Exception as e:
                 print(f"  ❌ Error processing Diffuse/Opacity: {e}")
+                self.last_errors.append(f"DiffuseOpacity: {e}")
 
         else:
-            # No diffuse texture — create flat color from BSDF Base Color
+            # No diffuse texture — flat colour from BSDF Base Color.  This
+            # branch is only ever reached for a genuinely bare-colour
+            # material: preflight_material() already refused the "Base Color
+            # linked but untraceable" and "set already on disk" cases.
             print(f"  ⚠️ No Diffuse texture found — creating from BSDF Base Color")
             try:
                 res = 256
@@ -500,6 +649,13 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                 diffuse_ok = True
             except Exception as e:
                 print(f"  ❌ Error creating flat Diffuse: {e}")
+                self.last_errors.append(f"плоский Diffuse: {e}")
+
+        if not diffuse_ok:
+            # Writing ERM/Normal now would leave the folder as a mix of the
+            # PREVIOUS diffuse and fresh stubs — worse than not touching it
+            print("  ⛔ Diffuse part failed — ERM/Normal not written")
+            return False
 
         # ── ERM ──────────────────────────────────────────────────────────────
 
@@ -514,7 +670,6 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
 
         if textures['erm']:
             # Packed ERM texture — check which channels are actually wired to the BSDF
-            erm_ok = True
             try:
                 pil_img = self.load_pil_image(textures['erm'])
                 if pil_img:
@@ -559,8 +714,13 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                     b.save(str(metallic_path))
                     print(f"  💾 Saved Metallic: {metallic_path.name}")
 
+                    erm_ok = True
+                else:
+                    self.last_errors.append("не удалось прочитать ERM")
+
             except Exception as e:
                 print(f"  ❌ Error processing packed ERM: {e}")
+                self.last_errors.append(f"ERM: {e}")
 
         else:
             has_any_erm_tex = any(textures[k] for k in ('emit', 'roughness', 'metallic'))
@@ -568,7 +728,6 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
             if has_any_erm_tex:
                 # Build ERM from separately connected textures;
                 # missing channels are filled with BSDF scalar values
-                erm_ok = True
                 try:
                     # Determine output resolution from found textures
                     width, height = 256, 256
@@ -605,13 +764,14 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                     metallic_path = set_folder / f"T_{material_name}_Metallic.png"
                     b_ch.save(str(metallic_path))
                     print(f"  💾 Saved individual ERM channels")
+                    erm_ok = True
 
                 except Exception as e:
                     print(f"  ❌ Error assembling ERM from separate channels: {e}")
+                    self.last_errors.append(f"ERM: {e}")
 
             else:
                 # No ERM textures at all — create flat 256x256 from BSDF values
-                erm_ok = True
                 try:
                     r_val = int(min(max(emit_val, 0.0), 1.0) * 255)
                     g_val = int(min(max(rough_val, 0.0), 1.0) * 255)
@@ -626,23 +786,28 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                     Image.new('L', (256, 256), g_val).save(str(set_folder / f"T_{material_name}_Roughness.png"))
                     Image.new('L', (256, 256), b_val).save(str(set_folder / f"T_{material_name}_Metallic.png"))
                     print(f"  💾 Saved flat individual ERM channels")
+                    erm_ok = True
 
                 except Exception as e:
                     print(f"  ❌ Error creating flat ERM: {e}")
+                    self.last_errors.append(f"плоский ERM: {e}")
 
         # ── Normal ───────────────────────────────────────────────────────────
 
         if textures['normal']:
-            normal_ok = True
             try:
                 pil_img = self.load_pil_image(textures['normal'])
                 if pil_img:
                     normal_path = set_folder / f"T_{material_name}_Normal.png"
                     pil_img.convert('RGB').save(str(normal_path))
                     print(f"  💾 Saved Normal: {normal_path.name}")
+                    normal_ok = True
+                else:
+                    self.last_errors.append("не удалось прочитать Normal")
 
             except Exception as e:
                 print(f"  ❌ Error processing Normal: {e}")
+                self.last_errors.append(f"Normal: {e}")
 
         else:
             # No normal texture — create flat tangent-space normal (128, 128, 255)
@@ -654,6 +819,7 @@ class AGR_OT_ConvertMaterialsToSets(Operator):
                 normal_ok = True
             except Exception as e:
                 print(f"  ❌ Error creating flat Normal: {e}")
+                self.last_errors.append(f"плоский Normal: {e}")
 
         # Diffuse is mandatory; ERM and Normal are generated as flat fallbacks,
         # so they should always succeed unless an exception occurred.
@@ -665,6 +831,9 @@ class AGR_OT_ConvertActiveMaterialToSet(Operator):
     bl_idname = "agr.convert_active_material_to_set"
     bl_label = "Convert Active Material to Set"
     bl_options = {'REGISTER', 'UNDO'}
+
+    # Per-material failure notes filled by process_material_textures()
+    last_errors = []
 
     @classmethod
     def poll(cls, context):
@@ -688,10 +857,8 @@ class AGR_OT_ConvertActiveMaterialToSet(Operator):
                 return {'CANCELLED'}
 
             self.base_dir = Path(blend_path).parent
-            agr_bake_dir = self.base_dir / "AGR_BAKE"
-
-            if not agr_bake_dir.exists():
-                agr_bake_dir.mkdir(parents=True)
+            agr_bake_dir = Path(ensure_agr_bake_folder(context))
+            self.agr_bake_dir = agr_bake_dir
 
             material = obj.active_material
 
@@ -703,6 +870,12 @@ class AGR_OT_ConvertActiveMaterialToSet(Operator):
             set_name = f"S_{material.name}"
             set_folder = agr_bake_dir / set_name
 
+            # Refuse before the folder exists and before any file is written
+            ok, reason = self.preflight_material(material, textures, bsdf, set_folder)
+            if not ok:
+                agr_report(self, 'ERROR', reason)
+                return {'CANCELLED'}
+
             if not set_folder.exists():
                 set_folder.mkdir(parents=True)
                 print(f"  📁 Created folder: {set_folder}")
@@ -710,7 +883,10 @@ class AGR_OT_ConvertActiveMaterialToSet(Operator):
             success = self.process_material_textures(context, material, textures, bsdf, set_folder)
 
             if success:
-                connect_texture_set_to_material(material, str(set_folder), material.name)
+                if connect_texture_set_to_material(material, str(set_folder), material.name) is None:
+                    agr_report(self, 'WARNING',
+                               f"{material.name}: текстуры записаны, но не подключились "
+                               f"(нечитаемый файл в {set_folder})")
                 print(f"  ✅ Material converted and reconnected successfully")
 
             bpy.ops.agr.refresh_texture_sets(skip_alpha_strip=True)
@@ -718,7 +894,9 @@ class AGR_OT_ConvertActiveMaterialToSet(Operator):
             if success:
                 self.report({'INFO'}, f"Converted active material: {material.name}")
             else:
-                self.report({'WARNING'}, f"Conversion incomplete for: {material.name}")
+                agr_report(self, 'WARNING',
+                           f"Конвертация не завершена: {material.name} — "
+                           + ("; ".join(self.last_errors) or "текстуры не записаны"))
 
             print(f"\n✅ Active material conversion complete")
             return {'FINISHED'}
@@ -737,6 +915,7 @@ class AGR_OT_ConvertActiveMaterialToSet(Operator):
 _SHARED_METHODS = (
     'find_material_textures',
     'find_texture_node',
+    'preflight_material',
     'resolve_image_path',
     'load_pil_image',
     '_get_erm_channel_connections',
@@ -762,6 +941,5 @@ def register():
 
 def unregister():
     """Unregister conversion operators"""
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)
     print("Conversion operators unregistered")
