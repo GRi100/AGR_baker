@@ -3,6 +3,7 @@ Frame creation operators for texture sets
 """
 
 import bpy
+from .log import unregister_classes
 from bpy.types import Operator
 from bpy.props import EnumProperty, FloatProperty, StringProperty, CollectionProperty
 import os
@@ -15,25 +16,44 @@ from .core import texture_sets
 NONE_OVERLAY_ID = 'NONE'
 
 
-def get_frames_dir() -> Path:
-    """Addon's resources directory where frame overlay PNGs live.
+def get_bundled_frames_dir() -> Path:
+    """Addon's resources directory: the shipped templates, READ-ONLY.
 
-    Kept inside the addon so no per-user config is needed. Trade-off:
-    reinstalling the addon wipes user-imported overlays — acceptable for
-    this workflow.
+    It lives in the repository and goes into make_zip; with the usual junction
+    install a delete here is a delete in the git working tree.
     """
     return Path(__file__).parent / "resources"
 
 
-def list_frame_overlays() -> list:
-    """Return a sorted list of PNG filenames available as frame overlays."""
-    d = get_frames_dir()
-    if not d.exists():
+def get_frames_dir(create: bool = False) -> Path:
+    """Where user-imported overlays are written: Blender's per-user DATAFILES.
+    Survives addon reinstalls and never touches the shipped resources.
+    """
+    return Path(bpy.utils.user_resource('DATAFILES', path='agr_tools/frames',
+                                        create=create))
+
+
+def _pngs_in(directory: Path) -> list:
+    if not directory.exists():
         return []
-    return sorted(
-        f.name for f in d.iterdir()
-        if f.is_file() and f.suffix.lower() == ".png"
-    )
+    return [f.name for f in directory.iterdir()
+            if f.is_file() and f.suffix.lower() == ".png"]
+
+
+def list_frame_overlays() -> list:
+    """Sorted PNG filenames available as overlays: user directory + bundled.
+    A user file with the same name shadows the bundled one (resolve order)."""
+    names = set(_pngs_in(get_frames_dir())) | set(_pngs_in(get_bundled_frames_dir()))
+    return sorted(names)
+
+
+def is_bundled_overlay(frame_name: str) -> bool:
+    """True for a shipped template that no user file shadows — not deletable."""
+    if not frame_name or frame_name == NONE_OVERLAY_ID:
+        return False
+    if (get_frames_dir() / frame_name).exists():
+        return False
+    return (get_bundled_frames_dir() / frame_name).exists()
 
 
 _frame_overlay_items_cache: list = []
@@ -52,11 +72,15 @@ def frame_overlay_items(self, context):
 
 
 def resolve_overlay_path(frame_overlay_id: str):
-    """Resolve enum id to a full filesystem path, or None for NONE / missing."""
+    """Resolve enum id to a full filesystem path, or None for NONE / missing.
+    User directory wins over the bundled one."""
     if frame_overlay_id == NONE_OVERLAY_ID:
         return None
-    path = get_frames_dir() / frame_overlay_id
-    return str(path) if path.exists() else None
+    for directory in (get_frames_dir(), get_bundled_frames_dir()):
+        path = directory / frame_overlay_id
+        if path.exists():
+            return str(path)
+    return None
 
 
 class AGR_OT_CreateFrameOnSets(Operator):
@@ -411,15 +435,45 @@ class AGR_OT_CreateFrameOnFiles(Operator):
             self.report({'WARNING'}, "No files selected")
             return {'CANCELLED'}
 
+        # Plan every target BEFORE the first write: the result is always a PNG,
+        # so a .jpg/.tga source writes a .png sibling — and that sibling used to
+        # silently replace an unrelated ready file (or the .png of the same root
+        # picked in the SAME selection). Rejected sources are skipped, not fixed.
+        plan = []
+        taken = {}
+        collision_count = 0
+
+        for file_elem in self.files:
+            filepath = os.path.join(self.directory, file_elem.name)
+            if not os.path.exists(filepath):
+                continue
+
+            root, ext = os.path.splitext(filepath)
+            target = filepath if ext.lower() == '.png' else root + '.png'
+            key = os.path.normcase(os.path.abspath(target))
+            source_key = os.path.normcase(os.path.abspath(filepath))
+
+            if key in taken:
+                print(f"⚠️ {file_elem.name}: target {os.path.basename(target)} "
+                      f"is already produced by {os.path.basename(taken[key])} — skipped")
+                collision_count += 1
+                continue
+
+            if key != source_key and os.path.exists(target):
+                print(f"⚠️ {file_elem.name}: {os.path.basename(target)} already exists "
+                      "and was not selected — skipped")
+                collision_count += 1
+                continue
+
+            taken[key] = filepath
+            plan.append((filepath, target))
+
         processed_count = 0
         skipped_count = 0
         error_count = 0
 
-        for file_elem in self.files:
-            filepath = os.path.join(self.directory, file_elem.name)
-
-            if not os.path.exists(filepath):
-                continue
+        for filepath, target_path in plan:
+            file_elem_name = os.path.basename(filepath)
 
             try:
                 # Load image
@@ -427,7 +481,7 @@ class AGR_OT_CreateFrameOnFiles(Operator):
 
                 # Skip if resolution <= 256
                 if img.width <= 256 or img.height <= 256:
-                    print(f"⏭️ {file_elem.name}: skipped (resolution {img.width}x{img.height} <= 256px)")
+                    print(f"⏭️ {file_elem_name}: skipped (resolution {img.width}x{img.height} <= 256px)")
                     skipped_count += 1
                     img.close()
                     continue
@@ -498,13 +552,10 @@ class AGR_OT_CreateFrameOnFiles(Operator):
                 if not has_alpha and result_img.mode == 'RGBA':
                     result_img = result_img.convert('RGB')
 
-                # Output is always PNG — for non-PNG sources write a .png
-                # sibling instead of stuffing PNG bytes into a .jpg/.tga file
-                root, ext = os.path.splitext(filepath)
-                if ext.lower() != '.png':
-                    filepath = root + '.png'
-                result_img.save(filepath, 'PNG')
-                print(f"✅ {os.path.basename(filepath)}: framed and saved")
+                # Output is always PNG — the target was planned (and checked for
+                # collisions) before the loop
+                result_img.save(target_path, 'PNG')
+                print(f"✅ {os.path.basename(target_path)}: framed and saved")
 
                 processed_count += 1
 
@@ -513,13 +564,16 @@ class AGR_OT_CreateFrameOnFiles(Operator):
                 result_img.close()
 
             except Exception as e:
-                print(f"❌ Error processing {file_elem.name}: {e}")
+                print(f"❌ Error processing {file_elem_name}: {e}")
                 error_count += 1
 
-        if error_count > 0:
-            self.report({'WARNING'}, f"Processed {processed_count} files, skipped {skipped_count}, {error_count} errors")
-        else:
-            self.report({'INFO'}, f"Processed {processed_count} files, skipped {skipped_count} (<=256px)")
+        parts = [f"Processed {processed_count} files", f"skipped {skipped_count} (<=256px)"]
+        if collision_count:
+            parts.append(f"пропущено из-за конфликта имён: {collision_count}")
+        if error_count:
+            parts.append(f"{error_count} errors")
+        level = 'WARNING' if (error_count or collision_count) else 'INFO'
+        self.report({level}, ", ".join(parts))
 
         return {'FINISHED'}
 
@@ -663,9 +717,9 @@ class AGR_OT_AddFrameOverlay(Operator):
             self.report({'WARNING'}, "No files selected")
             return {'CANCELLED'}
 
-        target_dir = get_frames_dir()
-        if not target_dir.exists():
-            target_dir.mkdir(parents=True, exist_ok=True)
+        # User overlays go to the per-user DATAFILES directory, never into the
+        # addon's resources/ (that is the shipped, read-only set)
+        target_dir = get_frames_dir(create=True)
         copied = 0
 
         for f in self.files:
@@ -714,17 +768,30 @@ class AGR_OT_DeleteFrameOverlay(Operator):
 
     @classmethod
     def description(cls, context, properties):
+        if is_bundled_overlay(properties.frame_name):
+            return (f"Штатный шаблон '{properties.frame_name}' удалить нельзя "
+                    "(поставляется с аддоном)")
         return f"Delete overlay '{properties.frame_name}' from disk"
 
-    def invoke(self, context, event):
+    def _reject(self):
+        """Shipped templates live in the addon (git working tree under the
+        junction install) and are never deletable from the UI."""
         if not self.frame_name or self.frame_name == NONE_OVERLAY_ID:
             self.report({'WARNING'}, "Select an overlay to delete (not 'None')")
+            return True
+        if is_bundled_overlay(self.frame_name):
+            self.report({'ERROR'},
+                        f"Штатный шаблон '{self.frame_name}' удалить нельзя")
+            return True
+        return False
+
+    def invoke(self, context, event):
+        if self._reject():
             return {'CANCELLED'}
         return context.window_manager.invoke_confirm(self, event)
 
     def execute(self, context):
-        if not self.frame_name or self.frame_name == NONE_OVERLAY_ID:
-            self.report({'WARNING'}, "No overlay selected")
+        if self._reject():
             return {'CANCELLED'}
 
         target = get_frames_dir() / self.frame_name
@@ -759,5 +826,4 @@ def register():
 
 
 def unregister():
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)

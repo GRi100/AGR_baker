@@ -3,6 +3,7 @@ Baking operators for AGR Tools
 """
 
 import bpy
+from .log import unregister_classes
 from bpy.types import Operator
 from bpy.props import EnumProperty, BoolProperty
 import os
@@ -16,6 +17,127 @@ from .core import baking, materials, texture_sets
 def sanitize_material_name(name):
     """Replace filesystem-unsafe characters in material name with underscores"""
     return re.sub(r'[/\\:*?"<>|]', '_', name)
+
+
+def compose_erm_from_files(set_folder, material_name, erm_img):
+    """Fill erm_img with R=Emit, G=Roughness, B=Metallic read from the saved PNGs.
+
+    Returns False when the fast path does not apply (no Pillow, exotic bit depth,
+    sizes that disagree) so the caller can fall back to the datablock path.
+
+    Why: the datablock path loads three full float32 images — 268 MB each at 4K,
+    ~1 GB transient per material — to take ONE channel from each of them.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return False
+
+    paths = [os.path.join(set_folder, f"T_{material_name}_{t}.png")
+             for t in ("Emit", "Roughness", "Metallic")]
+    if not all(os.path.exists(path) for path in paths):
+        return False
+
+    try:
+        planes = []
+        for path in paths:
+            with Image.open(path) as img:
+                # 16-bit / float modes quantise differently — leave them to the
+                # legacy path rather than guessing
+                if img.mode not in ('L', 'LA', 'P', 'RGB', 'RGBA'):
+                    return False
+                planes.append(np.asarray(img.convert('RGB').getchannel(0)))
+
+        if planes[0].shape != planes[1].shape or planes[0].shape != planes[2].shape:
+            return False
+        height, width = planes[0].shape
+        if (width, height) != tuple(erm_img.size):
+            return False
+
+        erm_array = np.empty((height, width, 4), dtype=np.float32)
+        # PIL rows run top-down, Blender's pixel buffer bottom-up
+        for channel, plane in enumerate(planes):
+            erm_array[:, :, channel] = np.flipud(plane).astype(np.float32) / 255.0
+        erm_array[:, :, 3] = 1.0
+
+        erm_img.pixels.foreach_set(erm_array.ravel())
+        erm_img.update()
+        print(f"  ✅ Created ERM texture from saved files (uint8 path)")
+        return True
+
+    except Exception as e:
+        print(f"  ⚠️ Fast ERM path failed ({e}), falling back")
+        return False
+
+
+def disable_alpha_on_material(material):
+    """Unlink Alpha and force it to 1.0 on every Principled BSDF of a material.
+    Returns the saved state for restore_alpha_on_material."""
+    saved_state = []
+
+    if not material or not material.use_nodes or not material.node_tree:
+        return saved_state
+
+    for node in material.node_tree.nodes:
+        if node.type != 'BSDF_PRINCIPLED':
+            continue
+
+        alpha_value = node.inputs['Alpha'].default_value
+        alpha_links = [(link.from_node, link.from_socket)
+                       for link in material.node_tree.links
+                       if link.to_socket == node.inputs['Alpha']]
+
+        saved_state.append((node, alpha_value, alpha_links))
+
+        for link in list(material.node_tree.links):
+            if link.to_socket == node.inputs['Alpha']:
+                material.node_tree.links.remove(link)
+
+        node.inputs['Alpha'].default_value = 1.0
+
+    return saved_state
+
+
+def restore_alpha_on_material(material, saved_state):
+    """Restore what disable_alpha_on_material saved."""
+    if not material or not material.node_tree:
+        return
+    for node, alpha_value, alpha_links in saved_state:
+        node.inputs['Alpha'].default_value = alpha_value
+        for _from_node, from_socket in alpha_links:
+            material.node_tree.links.new(from_socket, node.inputs['Alpha'])
+
+
+def disable_alpha_on_objects(objects):
+    """Disable Alpha on every material of every object (deduped by material).
+
+    Simple Bake bakes Roughness/Metallic/Emit/Normal with alpha off; the
+    selected-to-active path used to leave the high-poly cutout alive, so rays
+    passed through leaves/grids and the two pipelines disagreed on the same
+    material.
+    """
+    states = []
+    processed_materials = set()
+
+    for obj in objects:
+        for mat_slot in obj.material_slots:
+            mat = mat_slot.material
+            if not mat or not mat.use_nodes:
+                continue
+            if mat.name in processed_materials:
+                continue
+            processed_materials.add(mat.name)
+            saved = disable_alpha_on_material(mat)
+            if saved:
+                states.append((mat, saved))
+
+    return states
+
+
+def restore_alpha_on_objects(states):
+    """Restore what disable_alpha_on_objects saved."""
+    for mat, saved in states:
+        restore_alpha_on_material(mat, saved)
 
 
 def _image_pixels_to_np(image):
@@ -93,7 +215,8 @@ class AGR_OT_BakeTextures(Operator):
         print(f"🔧 Bake settings: engine=CYCLES, samples={settings.bake_samples}, device={settings.bake_device}, denoising={settings.bake_use_denoising}")
         
         resolution = int(settings.resolution)
-        
+        failed_connects = []
+
         try:
             # Bake each material
             for mat_slot in target_obj.material_slots:
@@ -134,16 +257,29 @@ class AGR_OT_BakeTextures(Operator):
                 
                 # Connect textures to material
                 print(f"🔗 Connecting textures to material {material_name}...")
-                materials.connect_texture_set_to_material(
+                connected = materials.connect_texture_set_to_material(
                     material,
                     set_folder,
                     material_name
                 )
+                if connected is None:
+                    # Textures are on disk but unreadable: the material graph is
+                    # left untouched, so say so instead of reporting success
+                    failed_connects.append(material_name)
+
+                # Drop the T_*.001 leftovers this run renamed away — every
+                # iterative re-bake used to add five generated datablocks
+                AGR_OT_SimpleBake.cleanup_renamed_images(material_name)
             
             # Refresh texture sets list
             texture_sets.refresh_texture_sets_list(context)
-            
-            self.report({'INFO'}, f"Baking complete! Textures in {agr_bake_path}")
+
+            if failed_connects:
+                self.report({'WARNING'},
+                            "Запечено, но текстуры не подключились (файлы не читаются): "
+                            + ", ".join(failed_connects))
+            else:
+                self.report({'INFO'}, f"Baking complete! Textures in {agr_bake_path}")
         
         finally:
             # Restore render settings
@@ -269,71 +405,82 @@ class AGR_OT_BakeTextures(Operator):
             self.restore_metallic_states(original_metallic_states)
             print("  ✅ Restored metallic values")
         
-        # Bake Roughness
-        print("  📸 Baking Roughness...")
-        baking.bake_texture(
-            context, target_obj, source_objects, img_roughness,
-            'ROUGHNESS', mat_idx,
-            max_ray_distance=settings.max_ray_distance,
-            extrusion=settings.extrusion
-        )
-        baking.save_texture(
-            img_roughness,
-            os.path.join(set_folder, f"T_{material_name}_Roughness.png")
-        )
-        
-        # Bake Metallic (via roughness channel)
-        print("  📸 Baking Metallic...")
-        self.bake_metallic_via_roughness(
-            context, target_obj, source_objects,
-            img_metallic, mat_idx, settings
-        )
-        baking.save_texture(
-            img_metallic,
-            os.path.join(set_folder, f"T_{material_name}_Metallic.png")
-        )
-        
-        # Bake Emit (via roughness channel)
-        print("  📸 Baking Emit...")
-        self.bake_emit_via_roughness(
-            context, target_obj, source_objects,
-            img_emit, mat_idx, settings
-        )
-        baking.save_texture(
-            img_emit,
-            os.path.join(set_folder, f"T_{material_name}_Emit.png")
-        )
-        
-        # Bake Normal
-        print("  📸 Baking Normal...")
-        if settings.bake_normal_enabled and len(source_objects) > 0:
-            # Bake from high-poly with correct resolution
-            img_normal = baking.create_texture_image(
-                f"T_{material_name}_Normal", resolution
-            )
-            img_normal.colorspace_settings.name = 'Non-Color'
+        # Disable alpha for the PBR/Normal passes on the HIGH-POLY sources —
+        # the same treatment Simple Bake gives its material, otherwise a cutout
+        # high-poly leaves holes in Roughness/Metallic/Emit/Normal
+        print("  🔄 Disabling alpha for PBR baking...")
+        alpha_states = disable_alpha_on_objects(source_objects)
+
+        try:
+            # Bake Roughness
+            print("  📸 Baking Roughness...")
             baking.bake_texture(
-                context, target_obj, source_objects, img_normal,
-                'NORMAL', mat_idx,
+                context, target_obj, source_objects, img_roughness,
+                'ROUGHNESS', mat_idx,
                 max_ray_distance=settings.max_ray_distance,
                 extrusion=settings.extrusion
             )
-            print(f"  ✅ Baked normal from high-poly at {resolution}px")
-        else:
-            # Create flat normal stub 256px when baking is disabled or no high-poly
-            img_normal = baking.create_flat_normal_image(
-                f"T_{material_name}_Normal", 256
+            baking.save_texture(
+                img_roughness,
+                os.path.join(set_folder, f"T_{material_name}_Roughness.png")
             )
-            if not settings.bake_normal_enabled:
-                print(f"  🔄 Created flat normal stub 256px (baking disabled)")
+
+            # Bake Metallic (via roughness channel)
+            print("  📸 Baking Metallic...")
+            self.bake_metallic_via_roughness(
+                context, target_obj, source_objects,
+                img_metallic, mat_idx, settings
+            )
+            baking.save_texture(
+                img_metallic,
+                os.path.join(set_folder, f"T_{material_name}_Metallic.png")
+            )
+
+            # Bake Emit (via roughness channel)
+            print("  📸 Baking Emit...")
+            self.bake_emit_via_roughness(
+                context, target_obj, source_objects,
+                img_emit, mat_idx, settings
+            )
+            baking.save_texture(
+                img_emit,
+                os.path.join(set_folder, f"T_{material_name}_Emit.png")
+            )
+
+            # Bake Normal
+            print("  📸 Baking Normal...")
+            if settings.bake_normal_enabled and len(source_objects) > 0:
+                # Bake from high-poly with correct resolution
+                img_normal = baking.create_texture_image(
+                    f"T_{material_name}_Normal", resolution
+                )
+                img_normal.colorspace_settings.name = 'Non-Color'
+                baking.bake_texture(
+                    context, target_obj, source_objects, img_normal,
+                    'NORMAL', mat_idx,
+                    max_ray_distance=settings.max_ray_distance,
+                    extrusion=settings.extrusion
+                )
+                print(f"  ✅ Baked normal from high-poly at {resolution}px")
             else:
-                print(f"  🔄 Created flat normal stub 256px (no high-poly)")
-        
-        baking.save_texture(
-            img_normal,
-            os.path.join(set_folder, f"T_{material_name}_Normal.png")
-        )
-        
+                # Create flat normal stub 256px when baking is disabled or no high-poly
+                img_normal = baking.create_flat_normal_image(
+                    f"T_{material_name}_Normal", 256
+                )
+                if not settings.bake_normal_enabled:
+                    print(f"  🔄 Created flat normal stub 256px (baking disabled)")
+                else:
+                    print(f"  🔄 Created flat normal stub 256px (no high-poly)")
+
+            baking.save_texture(
+                img_normal,
+                os.path.join(set_folder, f"T_{material_name}_Normal.png")
+            )
+
+        finally:
+            restore_alpha_on_objects(alpha_states)
+            print("  ✅ Restored alpha values")
+
         # Create ERM texture from saved files
         print("  🎨 Creating ERM from saved files...")
         img_erm = baking.create_texture_image(
@@ -455,6 +602,9 @@ class AGR_OT_BakeTextures(Operator):
     
     def create_erm_from_files(self, set_folder, material_name, erm_img):
         """Create ERM texture from saved E, R, M files"""
+        if compose_erm_from_files(set_folder, material_name, erm_img):
+            return
+
         emit_file = roughness_file = metallic_file = None
         try:
             emit_path = os.path.join(set_folder, f"T_{material_name}_Emit.png")
@@ -690,7 +840,22 @@ class AGR_OT_SimpleBake(Operator):
         if not active_material:
             self.report({'ERROR'}, "No active material")
             return {'CANCELLED'}
-        
+
+        # Guard BEFORE any mutation: setup_bake_node would otherwise hang a new
+        # empty Principled on an Emission/Glass material, bake its grey default
+        # over the existing set and rebuild the material from those greys
+        if baking.material_lacks_principled(active_material):
+            # Principled внутри нод-группы виден только тут: сам отказ верный,
+            # но совет «переведите эмиссию/стекло» такому материалу бесполезен
+            if baking.principled_hidden_in_group(active_material):
+                hint = "вынесите Principled из нод-группы на верхний уровень материала"
+            else:
+                hint = "переведите эмиссию/стекло на Principled"
+            self.report({'ERROR'},
+                        f"Материал '{active_material.name}' без Principled BSDF "
+                        f"на верхнем уровне — {hint}")
+            return {'CANCELLED'}
+
         # Check if blend file is saved
         if not bpy.path.abspath("//"):
             self.report({'ERROR'}, "Save blend file first")
@@ -777,7 +942,7 @@ class AGR_OT_SimpleBake(Operator):
             
             # Connect textures to original material
             print(f"🔗 Connecting textures to material {material_name}...")
-            materials.connect_texture_set_to_material(
+            connected = materials.connect_texture_set_to_material(
                 active_material,
                 set_folder,
                 material_name
@@ -788,8 +953,13 @@ class AGR_OT_SimpleBake(Operator):
             
             # Cleanup renamed images (T_*.001, T_*.010, etc)
             AGR_OT_SimpleBake.cleanup_renamed_images(material_name)
-            
-            self.report({'INFO'}, f"Simple bake complete! Textures in {set_folder}")
+
+            if connected is None:
+                self.report({'WARNING'},
+                            f"Запечено в {set_folder}, но текстуры не подключились "
+                            "(файлы не читаются)")
+            else:
+                self.report({'INFO'}, f"Simple bake complete! Textures in {set_folder}")
         
         finally:
             # Delete bake plane
@@ -828,6 +998,12 @@ class AGR_OT_SimpleBake(Operator):
                             set_folder, diffuse_res, pbr_res, normal_res, bake_with_alpha):
         """Bake all textures from material on plane"""
 
+        # Operators guard this before mutating anything; a script caller gets an
+        # honest error instead of a grey bake over the author's shader (BAKE-3)
+        if baking.material_lacks_principled(material):
+            raise RuntimeError(
+                f"Material '{material.name}' has no Principled BSDF — simple bake refused")
+
         # Validate single Principled BSDF
         if material.use_nodes:
             bsdf_count = sum(1 for n in material.node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
@@ -848,9 +1024,10 @@ class AGR_OT_SimpleBake(Operator):
             f"T_{material_name}_Emit", pbr_res
         )
         
-        # Setup bake node
-        baking.setup_bake_node(material)
-        
+        # Setup bake node (create_missing=False: the material is already known
+        # to carry a Principled BSDF, and inventing one here is exactly the bug)
+        baking.setup_bake_node(material, create_missing=False)
+
         # Disable metallic for diffuse baking
         print(f"  🔄 Disabling metallic for Diffuse baking...")
         metallic_state = AGR_OT_SimpleBake.disable_metallic_simple(material)
@@ -1040,59 +1217,54 @@ class AGR_OT_SimpleBake(Operator):
     
     @staticmethod
     def disable_alpha_simple(material):
-        """Disable alpha on material for PBR baking (Roughness, Metallic, Emit, Normal)"""
-        saved_state = []
-        
-        if not material.use_nodes:
-            return saved_state
-        
-        for node in material.node_tree.nodes:
-            if node.type == 'BSDF_PRINCIPLED':
-                alpha_value = node.inputs['Alpha'].default_value
-                
-                alpha_links = []
-                
-                for link in material.node_tree.links:
-                    if link.to_socket == node.inputs['Alpha']:
-                        alpha_links.append((link.from_node, link.from_socket))
-                
-                saved_state.append((node, alpha_value, alpha_links))
-                
-                # Remove alpha connections
-                for link in list(material.node_tree.links):
-                    if link.to_socket == node.inputs['Alpha']:
-                        material.node_tree.links.remove(link)
-                
-                node.inputs['Alpha'].default_value = 1.0
-        
-        return saved_state
-    
+        """Disable alpha on material for PBR baking (Roughness, Metallic, Emit, Normal).
+        Thin wrapper: the selected-to-active path uses the same helper."""
+        return disable_alpha_on_material(material)
+
     @staticmethod
     def restore_alpha_simple(material, saved_state):
         """Restore alpha values after PBR baking"""
-        for node, alpha_value, alpha_links in saved_state:
-            node.inputs['Alpha'].default_value = alpha_value
-            
-            # Restore connections
-            for from_node, from_socket in alpha_links:
-                material.node_tree.links.new(from_socket, node.inputs['Alpha'])
-    
+        restore_alpha_on_material(material, saved_state)
+
     @staticmethod
     def cleanup_renamed_images(material_name):
-        """Remove renamed images like T_materialname_*.001, T_materialname_*.010"""
+        """Remove LEFTOVER renamed images like T_materialname_*.001.
+
+        Only datablocks nobody references are dropped: a same-named .001 image
+        can belong to a twin material (duplicate / Append / AGR Share copy), and
+        deleting it blanked that material's texture nodes file-wide.
+        """
         import re
         pattern = re.compile(rf"^T_{re.escape(material_name)}_\w+\.\d{{3}}$")
-        
+
         removed_count = 0
         for img in list(bpy.data.images):
-            if pattern.match(img.name):
+            if pattern.match(img.name) and img.users == 0:
                 print(f"  🗑️ Removing renamed image: {img.name}")
                 bpy.data.images.remove(img)
                 removed_count += 1
-        
+
+        # Give the surviving texture its canonical name back. The connect step
+        # loads the file BEFORE clearing the graph (so a broken PNG cannot wipe
+        # it), and at that moment the generated bake image still holds the name
+        # — the loaded one lands as T_*_Type.001 and the generated one is orphaned
+        # a moment later.
+        for img in list(bpy.data.images):
+            if not pattern.match(img.name):
+                continue
+            base = img.name.rsplit('.', 1)[0]
+            holder = bpy.data.images.get(base)
+            # Only when the canonical name is held by an ORPHAN: a free name means
+            # nothing conflicts, and a .001 nobody collides with stays as it is
+            if holder is not None and holder is not img and holder.users == 0:
+                print(f"  🗑️ Removing orphaned image: {holder.name}")
+                bpy.data.images.remove(holder)
+                removed_count += 1
+                img.name = base
+
         if removed_count > 0:
             print(f"✅ Cleaned up {removed_count} renamed images")
-    
+
     @staticmethod
     def bake_metallic_simple(context, bake_plane, material, metallic_img):
         """Bake metallic by routing through roughness"""
@@ -1231,6 +1403,9 @@ class AGR_OT_SimpleBake(Operator):
     @staticmethod
     def create_erm_from_files(set_folder, material_name, erm_img):
         """Create ERM texture from saved E, R, M files"""
+        if compose_erm_from_files(set_folder, material_name, erm_img):
+            return
+
         emit_file = roughness_file = metallic_file = None
         try:
             emit_path = os.path.join(set_folder, f"T_{material_name}_Emit.png")
@@ -1335,7 +1510,10 @@ class AGR_OT_SimpleBakeAll(Operator):
         print(f"📦 Materials to bake: {len(active_obj.material_slots)}")
         
         baked_count = 0
-        
+        skipped_materials = []
+        grouped_materials = []   # Principled спрятан в нод-группе — другой совет
+        failed_connects = []
+
         try:
             # Bake each material
             for mat_slot in active_obj.material_slots:
@@ -1345,7 +1523,19 @@ class AGR_OT_SimpleBakeAll(Operator):
                 
                 material = mat_slot.material
                 material_name = sanitize_material_name(material.name)
-                
+
+                # Same guard as Simple Bake, but a whole-object run skips the
+                # slot instead of aborting the batch
+                if baking.material_lacks_principled(material):
+                    print(f"⚠️ Skipping '{material.name}': no Principled BSDF")
+                    # Principled внутри нод-группы отмечается отдельно: совет
+                    # «перевести на Principled» такому материалу не подходит
+                    if baking.principled_hidden_in_group(material):
+                        grouped_materials.append(material.name)
+                    else:
+                        skipped_materials.append(material.name)
+                    continue
+
                 print(f"\n📦 Processing material: {material_name}")
                 
                 # Auto-detect if we should bake with alpha
@@ -1403,11 +1593,13 @@ class AGR_OT_SimpleBakeAll(Operator):
                     
                     # Connect textures to material
                     print(f"🔗 Connecting textures to material {material_name}...")
-                    materials.connect_texture_set_to_material(
+                    connected = materials.connect_texture_set_to_material(
                         material,
                         set_folder,
                         material_name
                     )
+                    if connected is None:
+                        failed_connects.append(material_name)
                     
                     # Cleanup renamed images (T_*.001, T_*.010, etc)
                     AGR_OT_SimpleBake.cleanup_renamed_images(material_name)
@@ -1423,8 +1615,20 @@ class AGR_OT_SimpleBakeAll(Operator):
             
             # Refresh texture sets list
             texture_sets.refresh_texture_sets_list(context)
-            
-            self.report({'INFO'}, f"Simple bake complete! Baked {baked_count} materials")
+
+            notes = []
+            if skipped_materials:
+                notes.append("без Principled BSDF пропущены: " + ", ".join(skipped_materials))
+            if grouped_materials:
+                notes.append("Principled внутри нод-группы (вынесите на верхний "
+                             "уровень материала) пропущены: " + ", ".join(grouped_materials))
+            if failed_connects:
+                notes.append("текстуры не подключились: " + ", ".join(failed_connects))
+            if notes:
+                self.report({'WARNING'},
+                            f"Запечено материалов: {baked_count}; " + "; ".join(notes))
+            else:
+                self.report({'INFO'}, f"Simple bake complete! Baked {baked_count} materials")
         
         finally:
             # Restore render settings
@@ -1466,6 +1670,5 @@ def register():
 
 
 def unregister():
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)
 

@@ -70,8 +70,68 @@ def create_flat_normal_image(name, resolution=256):
     return image
 
 
-def setup_bake_node(material):
-    """Setup material nodes for baking"""
+def find_principled_bsdf(material):
+    """Return the material's Principled BSDF node, or None."""
+    if not material or not material.use_nodes or not material.node_tree:
+        return None
+    for node in material.node_tree.nodes:
+        if node.type == 'BSDF_PRINCIPLED':
+            return node
+    return None
+
+
+def principled_hidden_in_group(material, _max_depth=8):
+    """True when the TOP level has no Principled BSDF but some node group does.
+
+    find_principled_bsdf deliberately looks only at the material's own tree
+    (baking rewires sockets on that node), so a shader group carrying the
+    Principled reads as "no Principled at all". The refusal is right, but the
+    advice "переведите эмиссию/стекло на Principled" is useless there — this
+    tells the caller to word it as "вынесите Principled из нод-группы".
+    """
+    if not material or not material.use_nodes or not material.node_tree:
+        return False
+    if find_principled_bsdf(material) is not None:
+        return False
+    seen = set()
+
+    def walk(tree, depth):
+        if tree is None or depth > _max_depth or id(tree) in seen:
+            return False
+        seen.add(id(tree))
+        for node in tree.nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                return True
+            if node.type == 'GROUP' and walk(getattr(node, 'node_tree', None), depth + 1):
+                return True
+        return False
+
+    return walk(material.node_tree, 0)
+
+
+def material_lacks_principled(material):
+    """True when the material has a node tree driven by something OTHER than a
+    Principled BSDF (Emission, Glass, custom group).
+
+    A node-less material is NOT reported: switching use_nodes on gives it a
+    default Principled that carries its own diffuse color, so baking it is
+    honest. Simple Bake paths refuse on True instead of silently replacing the
+    author's shader with a grey default (BAKE-3).
+    """
+    if not material:
+        return False
+    if not material.use_nodes or not material.node_tree:
+        return False
+    return find_principled_bsdf(material) is None
+
+
+def setup_bake_node(material, create_missing=True):
+    """Setup material nodes for baking.
+
+    create_missing=False keeps the Simple Bake paths from inventing a Principled
+    BSDF on an Emission/Glass material (they refuse such materials up front);
+    selected-to-active keeps the default — an empty target material is normal there.
+    """
     material.use_nodes = True
     nodes = material.node_tree.nodes
     
@@ -93,7 +153,7 @@ def setup_bake_node(material):
             bsdf = node
             break
     
-    if not bsdf:
+    if not bsdf and create_missing:
         bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
         bsdf.location = (0, 0)
         material.node_tree.links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
@@ -163,59 +223,62 @@ def bake_texture(context, target_obj, source_objects, image, bake_type,
         'normal_space': bake.normal_space,
     }
     original_cycles_bake_type = context.scene.cycles.bake_type
-
-    # Configure baking settings
-    simple_mode = len(source_objects) == 0
-
-    if simple_mode:
-        context.scene.render.bake.use_selected_to_active = False
-        context.scene.render.bake.cage_extrusion = 0.0
-        context.scene.render.bake.max_ray_distance = 0.0
-    else:
-        context.scene.render.bake.use_selected_to_active = True
-        context.scene.render.bake.cage_extrusion = extrusion
-        context.scene.render.bake.max_ray_distance = max_ray_distance
-    
-    context.scene.render.bake.margin = 0 if (bake_type == 'DIFFUSE' and use_alpha) else 8
-    context.scene.render.bake.use_clear = True
-    
     original_film_transparent = context.scene.render.film_transparent
     
-    # Configure bake type
-    if bake_type == 'DIFFUSE':
-        context.scene.cycles.bake_type = 'DIFFUSE'
-        context.scene.render.bake.use_pass_direct = False
-        context.scene.render.bake.use_pass_indirect = False
-        context.scene.render.bake.use_pass_color = True
-        image.colorspace_settings.name = 'sRGB'
-
-        if use_alpha:
-            context.scene.render.film_transparent = True
-    
-    elif bake_type == 'ROUGHNESS':
-        context.scene.cycles.bake_type = 'ROUGHNESS'
-        image.colorspace_settings.name = 'Non-Color'
-    
-    elif bake_type == 'NORMAL':
-        context.scene.cycles.bake_type = 'NORMAL'
-        context.scene.render.bake.normal_space = 'TANGENT'
-        image.colorspace_settings.name = 'Non-Color'
-    
-    # Select objects for baking
-    bpy.ops.object.select_all(action='DESELECT')
-    
-    if simple_mode:
-        target_obj.select_set(True)
-        context.view_layer.objects.active = target_obj
-    else:
-        for obj in source_objects:
-            obj.select_set(True)
-        target_obj.select_set(True)
-        context.view_layer.objects.active = target_obj
-    
-    # Perform baking — film_transparent must be restored even when the
-    # retry fails and RuntimeError propagates to the caller
+    # The guarded region starts HERE, not at bpy.ops.object.bake: everything
+    # below writes scene state, and an exception in configuration or in the
+    # selection block (object outside the view layer) used to leave the user's
+    # Bake panel dirty for good.
     try:
+        # Configure baking settings
+        simple_mode = len(source_objects) == 0
+
+        if simple_mode:
+            context.scene.render.bake.use_selected_to_active = False
+            context.scene.render.bake.cage_extrusion = 0.0
+            context.scene.render.bake.max_ray_distance = 0.0
+        else:
+            context.scene.render.bake.use_selected_to_active = True
+            context.scene.render.bake.cage_extrusion = extrusion
+            context.scene.render.bake.max_ray_distance = max_ray_distance
+
+        context.scene.render.bake.margin = 0 if (bake_type == 'DIFFUSE' and use_alpha) else 8
+        context.scene.render.bake.use_clear = True
+
+        # Configure bake type
+        if bake_type == 'DIFFUSE':
+            context.scene.cycles.bake_type = 'DIFFUSE'
+            context.scene.render.bake.use_pass_direct = False
+            context.scene.render.bake.use_pass_indirect = False
+            context.scene.render.bake.use_pass_color = True
+            image.colorspace_settings.name = 'sRGB'
+
+            if use_alpha:
+                context.scene.render.film_transparent = True
+
+        elif bake_type == 'ROUGHNESS':
+            context.scene.cycles.bake_type = 'ROUGHNESS'
+            image.colorspace_settings.name = 'Non-Color'
+
+        elif bake_type == 'NORMAL':
+            context.scene.cycles.bake_type = 'NORMAL'
+            context.scene.render.bake.normal_space = 'TANGENT'
+            image.colorspace_settings.name = 'Non-Color'
+
+        # Select objects for baking
+        bpy.ops.object.select_all(action='DESELECT')
+
+        if simple_mode:
+            target_obj.select_set(True)
+            context.view_layer.objects.active = target_obj
+        else:
+            for obj in source_objects:
+                obj.select_set(True)
+            target_obj.select_set(True)
+            context.view_layer.objects.active = target_obj
+
+        # Perform baking — film_transparent must be restored even when the
+        # retry fails and RuntimeError propagates to the caller
         try:
             bpy.ops.object.bake(type=context.scene.cycles.bake_type)
             print(f"✅ Baked {bake_type} for {material.name}")

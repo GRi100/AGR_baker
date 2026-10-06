@@ -9,23 +9,35 @@ import os
 import re
 
 from .core import texture_sets, materials
-from .log import agr_report
+from .log import agr_report, unregister_classes
 
 
-def strip_useless_alpha_in_folders(folders):
+def strip_useless_alpha_in_sets(sets):
     """Convert every RGBA PNG whose alpha channel is fully white to RGB.
+
+    `sets` is an iterable of (folder_path, material_name): only files named
+    T_<material_name>_*.png are touched — reference images, sources and previews
+    the user dropped into the set folder are none of our business, and this runs
+    (without UNDO) on every manual Refresh.
+
     Returns the number of converted files. Requires Pillow (caller checks).
     16-bit PNGs are left alone: Pillow loads them as 8-bit, so a re-save
-    would silently halve the depth of externally authored files."""
+    would silently halve the depth of externally authored files.
+    """
     from PIL import Image
     from .core.texture_sets import png_bit_depth, png_has_alpha
 
     converted = 0
-    for folder in folders:
+    for folder, material_name in sets:
         if not folder or not os.path.isdir(folder):
             continue
+        prefix = f"T_{material_name}_".lower()
         for fname in os.listdir(folder):
-            if not fname.lower().endswith('.png'):
+            lowered = fname.lower()
+            if not lowered.endswith('.png'):
+                continue
+            # Own textures only (see docstring)
+            if not lowered.startswith(prefix):
                 continue
             path = os.path.join(folder, fname)
             if not png_has_alpha(path):
@@ -79,8 +91,9 @@ class AGR_OT_RefreshTextureSets(Operator):
             except ImportError:
                 pass
             else:
-                folders = [ts.folder_path for ts in context.scene.agr_texture_sets if ts.has_alpha]
-                converted = strip_useless_alpha_in_folders(folders)
+                targets = [(ts.folder_path, ts.material_name)
+                           for ts in context.scene.agr_texture_sets if ts.has_alpha]
+                converted = strip_useless_alpha_in_sets(targets)
                 if converted:
                     bpy.ops.agr.check_alpha_on_all_sets()
                     agr_report(self, 'INFO', f"Found {count} sets, stripped useless alpha in {converted} file(s)")
@@ -111,11 +124,45 @@ class AGR_OT_StripUselessAlpha(Operator):
             self.report({'ERROR'}, "PIL/Pillow not available. Install with: pip install Pillow")
             return {'CANCELLED'}
 
-        folders = [ts.folder_path for ts in context.scene.agr_texture_sets if ts.is_selected]
-        converted = strip_useless_alpha_in_folders(folders)
+        targets = [(ts.folder_path, ts.material_name)
+                   for ts in context.scene.agr_texture_sets if ts.is_selected]
+        converted = strip_useless_alpha_in_sets(targets)
         bpy.ops.agr.check_alpha_on_all_sets()
         agr_report(self, 'INFO', f"Converted {converted} file(s) RGBA → RGB")
         return {'FINISHED'}
+
+
+def fit_to_long_side(size, target):
+    """Target size with the LONG side at `target`, aspect preserved.
+
+    Forcing a square turned a hand-edited 2048x1024 Opacity into 1024x1024 and
+    it stopped matching its diffuse.
+    """
+    width, height = size
+    long_side = max(width, height)
+    if long_side == target or long_side <= 0:
+        return (width, height)
+    scale = target / float(long_side)
+    return (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+
+
+def _set_long_sides(tex_set):
+    """Long side of every texture file of a set, read from the PNG header
+    (cheap enough for the dialog forecast — no decoding)."""
+    from .core.texture_sets import read_png_ihdr
+    sides = []
+    folder = tex_set.folder_path
+    if not folder or not os.path.isdir(folder):
+        return sides
+    prefix = f"T_{tex_set.material_name}_".lower()
+    for fname in os.listdir(folder):
+        lowered = fname.lower()
+        if not lowered.endswith('.png') or not lowered.startswith(prefix):
+            continue
+        width, height, _ct = read_png_ihdr(os.path.join(folder, fname))
+        if width > 0:  # (0, 0, -1) = unreadable header
+            sides.append(max(width, height))
+    return sides
 
 
 class AGR_OT_ResizeTextureSet(Operator):
@@ -162,6 +209,7 @@ class AGR_OT_ResizeTextureSet(Operator):
 
         processed_count = 0
         error_count = 0
+        upscaled_count = 0
 
         for tex_set in selected_sets:
             material_name = tex_set.material_name
@@ -197,17 +245,24 @@ class AGR_OT_ResizeTextureSet(Operator):
                         try:
                             with Image.open(tex_path) as img:
                                 original_size = img.size
-                                if img.size == (target_res, target_res):
+                                new_size = fit_to_long_side(original_size, target_res)
+                                if new_size == original_size:
                                     # Already at target - plain copy into the new set
                                     img_resized = img.copy()
                                 else:
-                                    img_resized = img.resize((target_res, target_res), Image.LANCZOS)
+                                    img_resized = img.resize(new_size, Image.LANCZOS)
+
+                            if max(original_size) < target_res:
+                                # Upscaling is lossless-looking mush and blows up
+                                # delivery size — counted and reported, never silent
+                                upscaled_count += 1
 
                             new_filename = f"T_{material_name}_{suffix}_{tex_type}.png"
                             output_path = os.path.join(new_folder_path, new_filename)
                             img_resized.save(output_path, 'PNG')
                             img_resized.close()
-                            print(f"  📐 {tex_type}: {original_size[0]}px → {target_res}px")
+                            print(f"  📐 {tex_type}: {original_size[0]}x{original_size[1]} "
+                                  f"→ {new_size[0]}x{new_size[1]}")
                             resized_count += 1
 
                         except Exception as e:
@@ -235,19 +290,25 @@ class AGR_OT_ResizeTextureSet(Operator):
         # Refresh texture sets list so new _<res>px sets appear
         texture_sets.refresh_texture_sets_list(context)
 
+        parts = [f"Created {processed_count} resized set(s) (_{suffix})"]
+        if upscaled_count:
+            parts.append(f"увеличено текстур: {upscaled_count}")
         if error_count > 0:
-            self.report({'WARNING'}, f"Resized {processed_count} sets, {error_count} errors")
-        else:
-            self.report({'INFO'}, f"Created {processed_count} resized set(s) (_{suffix})")
+            parts.append(f"{error_count} errors")
+        level = 'WARNING' if (error_count or upscaled_count) else 'INFO'
+        self.report({level}, ", ".join(parts))
 
         return {'FINISHED'}
 
     def invoke(self, context, event):
-        selected_count = sum(1 for tex_set in context.scene.agr_texture_sets
-                             if tex_set.is_selected and not tex_set.is_atlas)
-        if selected_count == 0:
+        selected = [ts for ts in context.scene.agr_texture_sets
+                    if ts.is_selected and not ts.is_atlas]
+        if not selected:
             self.report({'WARNING'}, "No sets selected")
             return {'CANCELLED'}
+        # Header-only scan once per dialog: draw() runs on every redraw and must
+        # not touch the disk
+        self._long_sides = [side for ts in selected for side in _set_long_sides(ts)]
         return context.window_manager.invoke_props_dialog(self)
 
     def draw(self, context):
@@ -261,16 +322,57 @@ class AGR_OT_ResizeTextureSet(Operator):
         layout.separator()
         layout.label(text=f"• Creates new S_*_{self.target_resolution}px sets", icon='INFO')
         layout.label(text="• Originals are not modified")
+        layout.label(text="• Пропорции сохраняются (размер по длинной стороне)")
+
+        sides = getattr(self, "_long_sides", None)
+        if sides:
+            upscaled = sum(1 for side in sides if side < int(self.target_resolution))
+            if upscaled:
+                layout.label(text=f"• Будет УВЕЛИЧЕНО текстур: {upscaled}", icon='ERROR')
+
+
+def _selected_regular_sets(context):
+    """Selected rows minus atlases.
+
+    Every copying operation already filters atlases; Connect/Assign did not, and
+    an A_* row produced a material named after the atlas FOLDER (Broadway10_Main_1024_3)
+    which fails the delivery naming check.
+    """
+    return [ts for ts in context.scene.agr_texture_sets
+            if ts.is_selected and not ts.is_atlas]
+
+
+def _poll_regular_sets(cls, context):
+    if not _selected_regular_sets(context):
+        cls.poll_message_set(
+            "Выберите обычные сеты S_*: строки атласов A_* сюда не подходят "
+            "(атлас применяется кнопкой «Apply Atlas to Object»)")
+        return False
+    return True
+
+
+def _connect_report(op, connected_count, failed, label):
+    """One honest message for the connect/assign family."""
+    if failed:
+        agr_report(op, 'WARNING',
+                   f"{label}: {connected_count}, не подключились (файлы не читаются): "
+                   + ", ".join(failed))
+    else:
+        agr_report(op, 'INFO', f"{label}: {connected_count}")
+
 
 class AGR_OT_ConnectSetToMaterial(Operator):
     """Connect selected texture sets to materials"""
     bl_idname = "agr.connect_set_to_material"
     bl_label = "Connect Selected to Materials"
     bl_options = {'REGISTER', 'UNDO'}
-    
+
+    @classmethod
+    def poll(cls, context):
+        return _poll_regular_sets(cls, context)
+
     def execute(self, context):
-        texture_sets_list = context.scene.agr_texture_sets
-        selected_sets = [ts for ts in texture_sets_list if ts.is_selected]
+        selected_sets = _selected_regular_sets(context)
 
         if not selected_sets:
             self.report({'WARNING'}, "No texture sets selected")
@@ -283,6 +385,8 @@ class AGR_OT_ConnectSetToMaterial(Operator):
             return {'CANCELLED'}
 
         # All validated — now connect
+        connected_count = 0
+        failed = []
         for tex_set in selected_sets:
             material_name = tex_set.material_name
             if material_name in bpy.data.materials:
@@ -290,10 +394,14 @@ class AGR_OT_ConnectSetToMaterial(Operator):
             else:
                 material = bpy.data.materials.new(name=material_name)
 
-            materials.connect_texture_set_to_material(material, tex_set.folder_path, material_name)
+            if materials.connect_texture_set_to_material(
+                    material, tex_set.folder_path, material_name) is None:
+                failed.append(material_name)
+                continue
             tex_set.is_assigned = True
+            connected_count += 1
 
-        self.report({'INFO'}, f"Connected {len(selected_sets)} sets to materials")
+        _connect_report(self, connected_count, failed, "Подключено сетов")
         return {'FINISHED'}
 
 
@@ -303,9 +411,12 @@ class AGR_OT_ConnectRegularSetToMaterial(Operator):
     bl_label = "Connect Regular Textures to Materials"
     bl_options = {'REGISTER', 'UNDO'}
 
+    @classmethod
+    def poll(cls, context):
+        return _poll_regular_sets(cls, context)
+
     def execute(self, context):
-        texture_sets_list = context.scene.agr_texture_sets
-        selected_sets = [ts for ts in texture_sets_list if ts.is_selected]
+        selected_sets = _selected_regular_sets(context)
 
         if not selected_sets:
             self.report({'WARNING'}, "No texture sets selected")
@@ -324,6 +435,8 @@ class AGR_OT_ConnectRegularSetToMaterial(Operator):
             return {'CANCELLED'}
 
         # All validated — now connect
+        connected_count = 0
+        failed = []
         for tex_set in selected_sets:
             material_name = tex_set.material_name
             if material_name in bpy.data.materials:
@@ -331,10 +444,15 @@ class AGR_OT_ConnectRegularSetToMaterial(Operator):
             else:
                 material = bpy.data.materials.new(name=material_name)
 
-            materials.connect_regular_texture_set_to_material(material, tex_set.folder_path, material_name)
+            if materials.connect_regular_texture_set_to_material(
+                    material, tex_set.folder_path, material_name) is None:
+                failed.append(material_name)
+                continue
             tex_set.is_assigned = True
+            connected_count += 1
 
-        self.report({'INFO'}, f"Connected {len(selected_sets)} sets with regular textures")
+        _connect_report(self, connected_count, failed,
+                        "Подключено сетов (LOW)")
         return {'FINISHED'}
 
 
@@ -346,15 +464,17 @@ class AGR_OT_AssignSetToActiveObject(Operator):
     
     @classmethod
     def poll(cls, context):
-        return context.active_object and context.active_object.type == 'MESH'
-    
+        if not context.active_object or context.active_object.type != 'MESH':
+            cls.poll_message_set("Нужен активный меш-объект")
+            return False
+        return _poll_regular_sets(cls, context)
+
     def execute(self, context):
-        texture_sets_list = context.scene.agr_texture_sets
         obj = context.active_object
-        
-        # Get all selected sets
-        selected_sets = [tex_set for tex_set in texture_sets_list if tex_set.is_selected]
-        
+
+        # Get all selected sets (atlases excluded, see _selected_regular_sets)
+        selected_sets = _selected_regular_sets(context)
+
         if len(selected_sets) == 0:
             self.report({'WARNING'}, "No texture sets selected")
             return {'CANCELLED'}
@@ -367,18 +487,26 @@ class AGR_OT_AssignSetToActiveObject(Operator):
 
         assigned_count = 0
         skipped_count = 0
+        failed = []
 
         for tex_set in selected_sets:
             material_name = tex_set.material_name
 
             # Find or create material
-            if material_name in bpy.data.materials:
-                material = bpy.data.materials[material_name]
-            else:
+            was_new = material_name not in bpy.data.materials
+            if was_new:
                 material = bpy.data.materials.new(name=material_name)
+            else:
+                material = bpy.data.materials[material_name]
 
             # Connect texture set (HIGH mode)
-            materials.connect_texture_set_to_material(material, tex_set.folder_path, material_name)
+            if materials.connect_texture_set_to_material(
+                    material, tex_set.folder_path, material_name) is None:
+                failed.append(material_name)
+                if was_new:
+                    # Never hang a blank, never-connected material on the object
+                    bpy.data.materials.remove(material)
+                    continue
 
             # Check if material already on object
             already_assigned = False
@@ -396,10 +524,12 @@ class AGR_OT_AssignSetToActiveObject(Operator):
                 skipped_count += 1
                 print(f"⏭️ Skipped {material_name} - already on object")
         
+        parts = [f"Assigned {assigned_count} materials to {obj.name}"]
         if skipped_count > 0:
-            self.report({'INFO'}, f"Assigned {assigned_count}, skipped {skipped_count} (already on object)")
-        else:
-            self.report({'INFO'}, f"Assigned {assigned_count} materials to {obj.name}")
+            parts.append(f"skipped {skipped_count} (already on object)")
+        if failed:
+            parts.append("не подключились (файлы не читаются): " + ", ".join(failed))
+        agr_report(self, 'WARNING' if failed else 'INFO', ", ".join(parts))
         return {'FINISHED'}
 
 
@@ -429,6 +559,7 @@ class AGR_OT_LoadSetsFromFolder(Operator):
                 return {'CANCELLED'}
 
         connected_count = 0
+        failed = []
 
         # Connect each set to its material
         for tex_set in sets_with_materials:
@@ -436,13 +567,21 @@ class AGR_OT_LoadSetsFromFolder(Operator):
             material = bpy.data.materials[material_name]
 
             # Connect texture set (HIGH mode)
-            materials.connect_texture_set_to_material(material, tex_set.folder_path, material_name)
+            if materials.connect_texture_set_to_material(
+                    material, tex_set.folder_path, material_name) is None:
+                failed.append(material_name)
+                continue
 
             tex_set.is_assigned = True
             connected_count += 1
             print(f"✅ Connected S_{material_name} to existing material")
-        
-        self.report({'INFO'}, f"Loaded {count} sets, connected {connected_count} to materials")
+
+        if failed:
+            agr_report(self, 'WARNING',
+                       f"Loaded {count} sets, connected {connected_count}; "
+                       "не подключились (файлы не читаются): " + ", ".join(failed))
+        else:
+            self.report({'INFO'}, f"Loaded {count} sets, connected {connected_count} to materials")
         return {'FINISHED'}
 
 
@@ -986,8 +1125,11 @@ class AGR_OT_GaussianBlurSet(Operator):
                     if material_name in bpy.data.materials:
                         material = bpy.data.materials[material_name]
                         print(f"  🔗 Reconnecting textures to material...")
-                        materials.connect_texture_set_to_material(material, folder_path, material_name)
-                        print(f"  ✅ Reconnected textures to material")
+                        if materials.connect_texture_set_to_material(
+                                material, folder_path, material_name) is None:
+                            print(f"  ⚠️ Textures unreadable, material left untouched")
+                        else:
+                            print(f"  ✅ Reconnected textures to material")
                     
                     processed_count += 1
                 else:
@@ -1547,6 +1689,7 @@ class AGR_OT_SwapSetsOnObject(Operator):
         swapped_count = 0
         no_match_count = 0
         skipped_sets = []
+        unreadable_sets = []
 
         for tex_set in selected_sets:
             derived_name = tex_set.material_name
@@ -1560,8 +1703,11 @@ class AGR_OT_SwapSetsOnObject(Operator):
 
             derived_material = None  # built lazily, only if a matching slot exists
             set_swapped = 0
+            unreadable = False
 
             for obj in targets:
+                if unreadable:
+                    break
                 for slot in obj.material_slots:
                     slot_mat = slot.material
                     if slot_mat is None:
@@ -1574,18 +1720,31 @@ class AGR_OT_SwapSetsOnObject(Operator):
                         continue
 
                     if derived_material is None:
-                        if derived_name in bpy.data.materials:
+                        reused = derived_name in bpy.data.materials
+                        if reused:
                             derived_material = bpy.data.materials[derived_name]
                         else:
                             # Copy keeps blend method / culling / extra nodes of the base
                             derived_material = slot_mat.copy()
                             derived_material.name = derived_name
-                        materials.connect_best_texture_set_to_material(
-                            derived_material, tex_set.folder_path, derived_name)
+                        if materials.connect_best_texture_set_to_material(
+                                derived_material, tex_set.folder_path, derived_name) is None:
+                            # Derived set unreadable: never hang a blank material on
+                            # the object — the base slot stays as it is, and a copy
+                            # made just now goes away with it
+                            unreadable_sets.append(tex_set.name)
+                            if not reused:
+                                bpy.data.materials.remove(derived_material)
+                            derived_material = None
+                            unreadable = True
+                            break
 
                     slot.material = derived_material
                     set_swapped += 1
                     print(f"🔁 {obj.name}: {slot_name} → {derived_name}")
+
+            if unreadable:
+                continue
 
             if set_swapped:
                 tex_set.is_assigned = True
@@ -1599,7 +1758,9 @@ class AGR_OT_SwapSetsOnObject(Operator):
             parts.append(f"{no_match_count} set(s) had no matching material")
         if skipped_sets:
             parts.append(f"{len(skipped_sets)} not derived")
-        level = 'INFO' if swapped_count else 'WARNING'
+        if unreadable_sets:
+            parts.append("не читаются: " + ", ".join(unreadable_sets))
+        level = 'INFO' if (swapped_count and not unreadable_sets) else 'WARNING'
         self.report({level}, ", ".join(parts))
         return {'FINISHED'}
 
@@ -1645,6 +1806,5 @@ def register():
 
 def unregister():
     """Unregister operator classes"""
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)
     print("Texture set operators unregistered")
