@@ -11,19 +11,11 @@ import os
 from bpy.types import Panel, UIList
 from bpy.props import BoolProperty
 
-from .log import LOG_PATH, STATUS_ICONS
-from .operators_atlas import calculate_multi_atlas_packing
+from .core import texture_sets as core_texture_sets
+from .log import LOG_PATH, STATUS_ICONS, pillow_available, unregister_classes
+from .operators_atlas import calculate_multi_atlas_packing, source_material_name
 from .operators_rename import parse_sm_name, RENAME_ALLOWED_TYPES
-from .operators_udim import object_has_udim
-
-# Detected once at import: Python does NOT cache failed imports, so probing
-# PIL inside draw() would rescan sys.path on every panel redraw.
-# agr.install_pillow flips this flag after a successful install.
-try:
-    from PIL import Image as _PILImage  # noqa: F401
-    PILLOW_AVAILABLE = True
-except ImportError:
-    PILLOW_AVAILABLE = False
+from .operators_udim import object_has_udim, find_sibling_udim_carrier
 
 
 # ---- Texture set thumbnails (lazy bpy.utils.previews) ----
@@ -75,9 +67,12 @@ def get_set_thumbnail_icon(tex_set):
 
 
 def invalidate_set_thumbnails():
-    """Drop all cached thumbnails (called by Refresh Sets and unregister)."""
+    """Drop all cached thumbnails (called by Refresh Sets and unregister).
+    Refresh is also the moment resolutions/materials can change, so the
+    caches keyed on the sets list go with them."""
     global _previews
     _thumb_misses.clear()
+    bump_sets_generation()
     if _previews is not None:
         import bpy.utils.previews
         bpy.utils.previews.remove(_previews)
@@ -225,8 +220,8 @@ class AGR_PT_MainPanel(Panel):
             status_row.label(text=last_status, icon=STATUS_ICONS.get(level, 'INFO'))
             status_row.operator("wm.path_open", text="", icon='TEXT').filepath = LOG_PATH
 
-        # Pillow installation check
-        if not PILLOW_AVAILABLE:
+        # Pillow installation check (single cached flag in log.py)
+        if not pillow_available():
             warning = layout.column(align=True)
             warning.alert = True
             warning.label(text="Pillow not installed", icon='ERROR')
@@ -568,48 +563,155 @@ def _ru_plural(n, one, few, many):
 
 
 # Forecast for the Atlas Ops panel: how many atlases Create Multi-Atlas
-# would produce for the active object.  draw() runs on every redraw, so the
-# packing is cached by a cheap fingerprint (object, atlas size, matched sets).
+# would produce for the active object.  Two costs used to sit in draw():
+# an O(materials × sets) linear scan on EVERY redraw (2.8 ms at 120×400) and
+# the bin packing itself on a cache miss (18.9 ms).  Now the scan goes
+# through a {material_name: set} map rebuilt only when the sets collection
+# changes, and the packing runs OUTSIDE draw() in a one-shot timer.
 _ATLAS_FORECAST_CACHE = {}
+_ATLAS_FORECAST_PENDING = set()
+
+# Rebuilt when the sets collection changes identity (len + generation stamp)
+_SETS_BY_MATERIAL = {"key": None, "map": {}}
+
+# Bumped by refresh operators / list edits through invalidate_set_thumbnails
+_SETS_GENERATION = 0
 
 
-def _multi_atlas_forecast(context):
-    """(bins, n_sets, missing, oversize) for the active object, or None."""
+def bump_sets_generation():
+    """Invalidate every cache keyed on the texture-set list contents."""
+    global _SETS_GENERATION
+    _SETS_GENERATION += 1
+    _SETS_BY_MATERIAL["key"] = None
+    _ATLAS_FORECAST_CACHE.clear()
+    _ATLAS_FORECAST_PENDING.clear()
+
+
+def _sets_by_material(scene):
+    """{material_name: resolution} for non-atlas sets, built once per
+    generation instead of once per material per redraw.
+
+    Plain ints, NEVER PropertyGroup references: `refresh_texture_sets_list`
+    does clear()+add(), so every cached reference points into IDProperty
+    memory that call freed.  Past ~200 entries Blender reallocates the array
+    instead of reusing the slots, and the forecast then read garbage out of
+    freed memory (measured: resolution 1024 / material_name '' where the live
+    item says 2048 / 'M10').  LIST_REBUILT_CALLBACKS below keeps the
+    generation stamp honest even for the rebuilds that go straight to the
+    core helper without touching the refresh operator."""
+    key = (len(scene.agr_texture_sets), _SETS_GENERATION)
+    if _SETS_BY_MATERIAL["key"] != key:
+        mapping = {}
+        for ts in scene.agr_texture_sets:
+            if not ts.is_atlas and ts.material_name not in mapping:
+                mapping[ts.material_name] = ts.resolution
+        _SETS_BY_MATERIAL["key"] = key
+        _SETS_BY_MATERIAL["map"] = mapping
+    return _SETS_BY_MATERIAL["map"]
+
+
+def _forecast_inputs(context):
+    """(fingerprint, resolutions, missing) for the active object, or None.
+    Cheap: one pass over the object's slots plus dict lookups."""
     obj = context.active_object
     if obj is None or obj.type != 'MESH' or not obj.material_slots:
         return None
+    seen = set()
     mats = []
     for slot in obj.material_slots:
-        if slot.material and slot.material.name not in mats:
-            mats.append(slot.material.name)
+        if not slot.material:
+            continue
+        # то же каноническое имя, что и в операторе: материал, отодвинутый
+        # атласом соседнего объекта в '<имя>.src', имеет ТОТ ЖЕ сет
+        name = source_material_name(slot.material.name)
+        if name not in seen:
+            seen.add(name)
+            mats.append(name)
     if not mats:
         return None
+
     atlas_size = int(context.scene.agr_baker_settings.atlas_size)
-    sets = []
-    fp = []
+    by_material = _sets_by_material(context.scene)
+    resolutions = []
     missing = 0
     for name in mats:
-        ts = next((t for t in context.scene.agr_texture_sets
-                   if t.material_name == name and not t.is_atlas), None)
-        if ts is None:
+        res = by_material.get(name)
+        if res is None:
             missing += 1
         else:
-            sets.append(ts)
-            fp.append((ts.name, ts.resolution))
-    fingerprint = (obj.name, atlas_size, tuple(fp), missing)
-    cached = _ATLAS_FORECAST_CACHE.get("forecast")
-    if cached is not None and cached[0] == fingerprint:
-        return cached[1]
-    oversize = sum(1 for ts in sets if ts.resolution > atlas_size)
+            resolutions.append(res)
+    # The packing depends only on the resolution multiset and the atlas size,
+    # so two objects with the same materials share one cache entry
+    fingerprint = (atlas_size, tuple(sorted(resolutions)), missing, _SETS_GENERATION)
+    return fingerprint, resolutions, missing
+
+
+class _ForecastSet:
+    """Minimal stand-in for AGR_TextureSet: the packer only reads
+    `resolution`, and a plain object survives outside draw() (a
+    PropertyGroup reference could go stale before the timer fires)."""
+
+    __slots__ = ("resolution", "name")
+
+    def __init__(self, resolution, index):
+        self.resolution = resolution
+        self.name = f"set_{index}"
+
+
+def compute_multi_atlas_forecast(fingerprint, resolutions, missing):
+    """Pure part of the forecast: (bins, n_sets, missing, oversize)."""
+    atlas_size = fingerprint[0]
+    oversize = sum(1 for r in resolutions if r > atlas_size)
     bins = 0
-    if sets and not oversize:
+    if resolutions and not oversize:
         try:
-            bins = len(calculate_multi_atlas_packing(sets, atlas_size))
+            packs = calculate_multi_atlas_packing(
+                [_ForecastSet(r, i) for i, r in enumerate(resolutions)], atlas_size)
+            bins = len(packs)
         except Exception:
-            bins = 0  # draw() must never traceback
-    info = (bins, len(sets), missing, oversize)
-    _ATLAS_FORECAST_CACHE["forecast"] = (fingerprint, info)
-    return info
+            bins = 0  # a packing failure must never break the panel
+    return (bins, len(resolutions), missing, oversize)
+
+
+def _schedule_forecast(fingerprint, resolutions, missing):
+    """Run the packing in a one-shot timer — never inside draw()."""
+    if fingerprint in _ATLAS_FORECAST_PENDING:
+        return
+    _ATLAS_FORECAST_PENDING.add(fingerprint)
+
+    def _run():
+        try:
+            _ATLAS_FORECAST_CACHE[fingerprint] = compute_multi_atlas_forecast(
+                fingerprint, resolutions, missing)
+        finally:
+            _ATLAS_FORECAST_PENDING.discard(fingerprint)
+        for window in getattr(bpy.context.window_manager, "windows", ()):
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+        return None
+
+    try:
+        bpy.app.timers.register(_run, first_interval=0.0)
+    except Exception:
+        # No timer service (background run) — do it inline, correctness first
+        _ATLAS_FORECAST_PENDING.discard(fingerprint)
+        _ATLAS_FORECAST_CACHE[fingerprint] = compute_multi_atlas_forecast(
+            fingerprint, resolutions, missing)
+
+
+def _multi_atlas_forecast(context):
+    """(bins, n_sets, missing, oversize) for the active object, or None.
+    Returns None while the packing is still being computed."""
+    inputs = _forecast_inputs(context)
+    if inputs is None:
+        return None
+    fingerprint, resolutions, missing = inputs
+    cached = _ATLAS_FORECAST_CACHE.get(fingerprint)
+    if cached is not None:
+        return cached
+    _schedule_forecast(fingerprint, resolutions, missing)
+    return _ATLAS_FORECAST_CACHE.get(fingerprint)
 
 
 class AGR_PT_AtlasOpsPanel(Panel):
@@ -674,6 +776,38 @@ class AGR_PT_AtlasFromSelectedPanel(Panel):
         col.operator("agr.create_atlas_only", text="Create Atlas Only", icon='IMAGE_PLANE')
 
 
+# The sibling-carrier lookup walks bpy.data.objects in Python (2.5 ms over
+# 22 000 objects — the exact cost the audit already charged the atlas
+# forecast for).  Cache it behind a key that is cheap AND actually moves when
+# a UDIM appears: creating/removing one always changes the set of TILED
+# images, deleting the carrier changes the object count, and switching the
+# active object changes session_uid.
+_SIBLING_CACHE = {"key": None, "name": None}
+
+
+def _tiled_images_stamp():
+    """(count, xor of pointers) over TILED images — dozens of datablocks,
+    orders of magnitude cheaper than a scan of every object."""
+    count = 0
+    acc = 0
+    for img in bpy.data.images:
+        if img.source == 'TILED':
+            count += 1
+            acc ^= img.as_pointer()
+    return count, acc
+
+
+def _sibling_udim_carrier(obj):
+    """Cached find_sibling_udim_carrier for draw()."""
+    key = (obj.session_uid, len(bpy.data.objects), _tiled_images_stamp())
+    if _SIBLING_CACHE["key"] != key:
+        carrier = find_sibling_udim_carrier(obj)
+        _SIBLING_CACHE["key"] = key
+        _SIBLING_CACHE["name"] = carrier.name if carrier is not None else None
+    name = _SIBLING_CACHE["name"]
+    return bpy.data.objects.get(name) if name else None
+
+
 class AGR_PT_UdimOpsPanel(Panel):
     """UDIM workflows"""
     bl_label = "UDIM Operations"
@@ -705,7 +839,15 @@ class AGR_PT_UdimOpsPanel(Panel):
             col.operator("agr.revert_udim", text="Disassemble UDIM", icon='LOOP_BACK')
         else:
             # Poll() greys the button with the reason in its tooltip
-            layout.operator("agr.create_udim", text="Create UDIM Set", icon='UV_DATA')
+            col = layout.column(align=True)
+            col.operator("agr.create_udim", text="Create UDIM Set", icon='UV_DATA')
+            # The tile folder is shared by every non-Main type of one
+            # address: when a sibling already owns it, offer to add sets to
+            # THAT UDIM instead of leading straight into a second one
+            carrier = _sibling_udim_carrier(obj) if obj else None
+            if carrier is not None:
+                col.label(text=f"UDIM адреса у: {carrier.name}", icon='INFO')
+                col.operator("agr.add_to_udim", text="Add Sets to UDIM", icon='ADD')
 
 
 # ===== SETTINGS =====
@@ -992,6 +1134,9 @@ class AGR_PT_JsonImagePanel(Panel):
 
         col.separator()
         col.operator("agr.add_image_to_geojson", icon='IMAGE_DATA')
+        row = col.row()
+        row.enabled = bool(props.has_image)
+        row.operator("agr.remove_image_from_geojson", icon='TRASH')
 
 
 class AGR_PT_JsonFilePropsPanel(Panel):
@@ -1165,14 +1310,33 @@ def register():
         set=lambda self, value: None,
     )
 
+    # Every rebuild of the sets collection — including the eleven operators
+    # that call core.refresh_texture_sets_list directly — must invalidate the
+    # caches keyed on it.  Dedup by name so a dev reload does not stack
+    # callbacks owned by dead module objects.
+    core_texture_sets.LIST_REBUILT_CALLBACKS[:] = [
+        cb for cb in core_texture_sets.LIST_REBUILT_CALLBACKS
+        if getattr(cb, "__name__", None) != "bump_sets_generation"
+    ]
+    core_texture_sets.LIST_REBUILT_CALLBACKS.append(bump_sets_generation)
+
     print("✅ UI registered")
 
 
 def unregister():
+    core_texture_sets.LIST_REBUILT_CALLBACKS[:] = [
+        cb for cb in core_texture_sets.LIST_REBUILT_CALLBACKS
+        if getattr(cb, "__name__", None) != "bump_sets_generation"
+    ]
+
     invalidate_set_thumbnails()
 
-    del bpy.types.Scene.agr_texture_sets_index
-    del bpy.types.Scene.agr_sets_no_active_index
+    # hasattr-guarded: a rollback after a failed register may run before
+    # these ever existed, and a bare `del` would abort the chain
+    for prop in ("agr_texture_sets_index", "agr_sets_no_active_index"):
+        if hasattr(bpy.types.Scene, prop):
+            delattr(bpy.types.Scene, prop)
 
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    # Idempotent: a rollback may run on a module whose register() died
+    # part-way, leaving only some of these classes live
+    unregister_classes(classes)
