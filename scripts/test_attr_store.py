@@ -395,6 +395,77 @@ if o_imp is not None:
     check("fbx-tri: FULL record rescued after the roundtrip",
           STORE_A.read(o_imp) == RECORD)
 
+print("== 11g. an OFFSET neighbour no longer pins the shared map forever ==")
+# The gate used to be "does every neighbour read RAW from loop 0".  A blob
+# that rides at a loop OFFSET (the record of an object a plain join merged
+# in) never does, so the gate never opened and the shared map stayed the
+# concatenation of the members' maps: raw reads still worked in the .blend
+# while a triangulating FBX export lost EVERY namespace at once.  The gate
+# now asks "does anybody still NEED the map".
+reset_scene()
+host = make_obj("OffsetHost")
+guest = make_obj("OffsetGuest")
+rec_host = {"marker": 1, "ns": "host"}
+rec_guest = {"ns": "guest"}
+STORE_A.write(host, rec_host)
+STORE_B.write(guest, rec_guest)
+for obj in bpy.data.objects:
+    obj.select_set(True)
+bpy.context.view_layer.objects.active = host
+bpy.ops.object.join()
+host.pop("agr_test_b", None)
+check("offset: B's blob does not parse from loop 0",
+      STORE_B.peek_frame_header(host.data) is None)
+check("offset: B is readable as a RAW window", STORE_B.scan_windows(host.data) != [])
+check("offset: the join left the map non-identity",
+      not loop_index_is_canonical(host.data))
+check("offset: A repacks", STORE_A.write(host, rec_host) is True)
+check("offset: the repack canonicalised the map (nobody needs it)",
+      loop_index_is_canonical(host.data))
+check("offset: B's window still reads after that", STORE_B.read(host) == rec_guest)
+
+print("== 11h. a payload the READER would refuse is never packed ==")
+# writer and reader were not agreed: a payload over MAX_PAYLOAD packed
+# "successfully" into layers that peek_frame_header/verify_frame then
+# rejected forever - and the old mirror was already gone by then
+import AGR_tools.core.attr_store as attr_store_mod  # noqa: E402
+reset_scene()
+o_cap = make_obj("CapCarrier")
+STORE_A.write(o_cap, RECORD)
+before_cap = STORE_A.color_names(o_cap.data)
+saved_cap = attr_store_mod.MAX_PAYLOAD
+attr_store_mod.MAX_PAYLOAD = 8      # any real payload is bigger than this
+check("cap: pack_colors refuses", STORE_A.pack_colors(o_cap.data, RECORD) is False)
+check("cap: the OLD mirror survived the refusal",
+      STORE_A.color_names(o_cap.data) == before_cap, str(before_cap))
+attr_store_mod.MAX_PAYLOAD = saved_cap
+check("cap: and it still decodes", STORE_A.decode_colors(o_cap.data) == RECORD)
+
+print("== 11i. read()/peek() rescue an OFFSET window after triangulation ==")
+# decode_colors only rescues a blob that starts at loop 0; the fallback
+# used the RAW window scan, which a triangulating export kills - so the
+# record of a merged-in carrier was unreachable even with a healthy map
+reset_scene()
+r_host = make_obj("RescueHost")
+r_guest = make_obj("RescueGuest")
+rec_rh = {"marker": 1, "ns": "rescue-host"}
+rec_rg = {"ns": "rescue-guest"}
+STORE_A.write(r_host, rec_rh)
+STORE_B.write(r_guest, rec_rg)
+for obj in bpy.data.objects:
+    obj.select_set(True)
+bpy.context.view_layer.objects.active = r_host
+bpy.ops.object.join()
+r_host.pop("agr_test_b", None)
+STORE_A.write(r_host, rec_rh)                 # repack -> identity map
+check("rescue: map identity before the export", loop_index_is_canonical(r_host.data))
+triangulate_mesh(r_host.data)
+check("rescue: raw window scan finds nothing now",
+      STORE_B.scan_windows(r_host.data) == [])
+check("rescue: read() gets the offset window through the map",
+      STORE_B.read(r_host) == rec_rg)
+check("rescue: peek() too", STORE_B.peek(r_host) == rec_rg)
+
 print("=" * 60)
 if FAILS:
     print(f"❌ {len(FAILS)} CHECKS FAILED:")

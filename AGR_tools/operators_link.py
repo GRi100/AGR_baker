@@ -101,10 +101,11 @@ from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
 from bpy.types import Operator, Panel, PropertyGroup, UIList
 from mathutils import Matrix
 
-from .log import agr_report
+from .log import agr_report, unregister_classes
 from .core.attr_store import (ColorBlobStore, preserve_active_color,
                               read_srgb_bytes, loop_index_array,
                               loop_index_is_canonical, drop_orphan_loop_index,
+                              registered_stores, LOOP_IDX_NAME, COLOR_TYPES,
                               HEADER_V1, HEADER_V2)
 from .core.atlas_store import ATLAS_STORE
 from .core.udim_store import UDIM_STORE
@@ -169,6 +170,18 @@ _LINK_STORE = ColorBlobStore(
 # directly.  Both are cleared together (strip/reconcile/unregister), and
 # the alias must keep pointing at the store's own dict (never reassigned).
 _TABLE_CACHE = _LINK_STORE.cache
+
+# UDIM/atlas records share the dual-carrier design (idprop + color mirror,
+# core/attr_store.py) and BREAK the same way: a mesh edit decapitates the
+# mirror while the idprop keeps the .blend working - and the FBX ships
+# without the record.  The link machinery only watched its own namespace;
+# these two used to go out dead in total silence (reproduced: delete the
+# first face of a UDIM/atlas carrier -> both records survive in the .blend
+# and are gone after a default FBX round trip).
+_AUX_STORES = (("UDIM", UDIM_STORE), ("атлас", ATLAS_STORE))
+# object idprop guard set by the atlas apply path (operators_atlas.py):
+# stripping the record while leaving it set blocks Apply AND Unpack forever
+ATLAS_APPLIED_KEY = "agr_atlas_applied"
 
 
 def _parse_table(raw):
@@ -347,6 +360,166 @@ def _remove_tracking_attrs(mesh):
     # the shared loop-index layer goes when no namespace mirrors remain
     # (delivery files must carry no AGR service color attributes at all)
     drop_orphan_loop_index(mesh)
+
+
+def _remove_foreign_store_layers(mesh):
+    """Drop the mirror layers of the OTHER namespaces (UDIM/atlas records,
+    plus the shared loop index once nothing needs it).  A disassembly chunk
+    is a COPY of the container mesh cut down by prune, so it inherits a
+    meaningless slice of every namespace that ever mirrored into the
+    container: the record cannot be decoded from it, which means
+    link_strip's "does it hold a record" test skipped those objects
+    entirely and 13 of 17 restored pieces went into the delivery FBX
+    carrying color attributes the city checker rejects.  Worse, re-joining
+    such a piece produced a container whose shared loop index was pure
+    garbage.  Only for freshly cut chunk meshes — never for a live
+    datablock adopted from the scene, whose records are its own."""
+    for store in registered_stores():
+        store.remove_mirror(mesh)
+    drop_orphan_loop_index(mesh)
+
+
+def _agr_service_layers(mesh):
+    """Every AGR service mesh attribute currently on this mesh (tracking
+    attrs, color mirrors of ANY namespace, the shared loop index and any
+    stray "AGR_*" layer a copy/rename left behind).  The delivery checker
+    rejects service color attributes, so the strip works off PRESENCE of
+    these layers, never off "can the record still be decoded"."""
+    known = {ATTR_NAME, CO_ATTR, ORIG_ATTR, COL_CO, COL_ID, LOOP_IDX_NAME}
+    prefixes = tuple([TABLE_COL_PREFIX] + [s.prefix for s in registered_stores()])
+    out = []
+    for attr in mesh.attributes:
+        if attr.name in known or attr.name.startswith(prefixes):
+            out.append(attr.name)
+        elif attr.name.startswith("AGR_") and attr.data_type in COLOR_TYPES:
+            # a stray "AGR_*" COLOR layer is ours by naming convention (a
+            # duplicated/renamed mirror); UV maps live in the same
+            # collection, so the sweep must not touch anything but colors
+            out.append(attr.name)
+    return out
+
+
+def _agr_idprop_keys(id_data):
+    """AGR custom-property keys on an object or a mesh: the link table,
+    the atlas/UDIM records, the atlas guard flag and the instance-watch
+    base name (``agr_instance_base`` lives on the MESH and used to survive
+    a "полностью чистая сдача" strip untouched)."""
+    return [k for k in id_data.keys()
+            if k.startswith("agr_") or k.startswith("AGR_")]
+
+
+def _normalize_aux_mirrors(obj, drop_unowned, keep_prefixes=()):
+    """Make the UDIM/atlas mirrors of a freshly joined container canonical
+    again, so the shared loop-index layer can go back to the identity.
+
+    A Blender join concatenates the color layers, so every merged-in
+    member's record survives as a window at ITS loop offset — a window
+    that never parses raw from loop 0.  The shared AGR_LoopIdx layer then
+    stays a concatenation of the members' maps forever, and an export with
+    "Triangulate Faces" loses the whole container's memory while the panel
+    stays green (Salarevo).  So the container's OWN record (idprop) is
+    repacked over the FULL mesh, which drops the foreign windows of that
+    namespace with it.
+
+    drop_unowned: the AGR join path, where every participant's custom
+    properties (the records among them) were captured into the table and
+    come back on disassembly — a leftover window there is pure litter.
+    The plain-Ctrl+J absorb path (False) has no such copy, so a single
+    orphaned window is ADOPTED as the container's own record instead of
+    being thrown away; several of them are left alone (which record would
+    the container claim?) and the raw scan keeps reading them.
+    ``keep_prefixes`` names namespaces that must follow the absorb rule
+    even on the join path: a merged-in CONTAINER's own record lives on the
+    object, which the join deletes, and the table copies its INSTANCES, not
+    its properties — dropping that window would be the only loss there.
+    Returns the number of foreign mirrors dropped or adopted."""
+    mesh = obj.data if getattr(obj, "type", None) == 'MESH' else None
+    if mesh is None or mesh.is_editmode:
+        return 0
+    keep_prefixes = keep_prefixes or ()
+    touched = 0
+    for _label, store in _AUX_STORES:
+        drop = drop_unowned and store.prefix not in keep_prefixes
+        record = store.parse_idprop(obj.get(store.prop_key))
+        if record is not None:
+            if store.color_names(mesh):
+                # one fresh blob over the whole mesh; the old layers (ours
+                # AND every merged-in window of this namespace) go with it
+                had_windows = store.count_window_candidates(mesh) > 1
+                store.write(obj, record)
+                touched += 1 if had_windows else 0
+            continue
+        if not store.color_names(mesh):
+            continue
+        if drop:
+            # "no idprop" is safe to read as "not this object's record"
+            # ONLY because the join path materialises every participant's
+            # colors-only record into its idprop BEFORE the join (see
+            # AGR_OT_link_join.execute).  Do NOT try to rescue a blob here
+            # instead: decode_colors falls back to the AGR_LoopIdx rescue,
+            # and on the JOINED mesh that happily reconstructs a MEMBER's
+            # window - the container would adopt somebody else's record.
+            store.remove_mirror(mesh)
+            store.invalidate(obj.name)
+            touched += 1
+            continue
+        wins, _ridx = store.scan_windows_ex(mesh)
+        if len(wins) == 1:
+            store.write(obj, wins[0][2])
+            touched += 1
+    drop_orphan_loop_index(mesh)
+    # the shared map is NOT rewritten here: both callers repack the link
+    # mirror immediately after, and that pack runs the same "does anybody
+    # still need the map" gate - paying for a second full window scan just
+    # to reach the same answer would cost milliseconds on a city container
+    return touched
+
+
+def _capture_aux_records(obj):
+    """([(label, store, record)], atlas_flag) of this object — read while
+    the mesh is still WHOLE.  The disassembly prunes the container mesh
+    down to nothing, and on a colors-only carrier (fresh FBX import, no
+    idprops) that destroys the only copy of the record, so the capture has
+    to happen before the first cut."""
+    records = [(label, store, store.read(obj)) for label, store in _AUX_STORES]
+    return ([(l, s, r) for l, s, r in records if r is not None],
+            obj.get(ATLAS_APPLIED_KEY))
+
+
+def _apply_aux_records(dst, records, flag):
+    """Put captured atlas/UDIM records on another object, REPACKING the
+    mirror (the chunk carries no mirror of its own - the slice it inherited
+    from the container decodes to nothing and is dropped as litter)."""
+    for _label, store, record in records:
+        store.write(dst, record)
+    if flag is not None:
+        dst[ATLAS_APPLIED_KEY] = flag
+
+
+def _rewrite_aux_mirrors(objects):
+    """Repack the color mirror of every atlas/UDIM record that came back
+    from the table's instance props: the props restore the IDPROP only, and
+    the chunk mesh carries no mirror of its own (the inherited slice is
+    unreadable and gets removed).  Without the mirror the record dies at
+    the next FBX export in total silence.  One repack per DATABLOCK -
+    linked twins of a group share it."""
+    done = set()
+    for obj in objects:
+        mesh = getattr(obj, "data", None)
+        if mesh is None:
+            continue
+        for _label, store in _AUX_STORES:
+            record = store.parse_idprop(obj.get(store.prop_key))
+            if record is None:
+                continue
+            key = (store.prefix, mesh.name)
+            if key in done:
+                continue
+            done.add(key)
+            try:
+                store.write(obj, record)
+            except Exception:
+                pass   # a record that cannot be mirrored still lives in the .blend
 
 
 def _read_face_ids(mesh):
@@ -658,6 +831,46 @@ def _decode_table_from_colors(mesh):
     return _LINK_STORE.decode_colors(mesh)
 
 
+# COL_ID carries the instance number in 15 bits: (flag<<7 | id_hi, id_lo)
+MAX_INSTANCE_ID = 32767
+
+
+def _fit_instance_ids(mesh, table):
+    """Keep every instance id inside the 15 bits the color mirror can
+    carry, renumbering the table (and the face attribute with it) when it
+    does not.  The writer used to np.clip the ids to 32767, so everything
+    above that silently COLLAPSED onto one number after an FBX roundtrip -
+    instances merged into each other with no message anywhere.  And
+    ``next_instance`` only ever grows (a disassembly never gives numbers
+    back), so a long-lived container reaches the ceiling without any single
+    huge join.  Renumbering is safe: the ids are private bookkeeping, and
+    the only thing keyed on them - the face attribute - is remapped in the
+    same breath.  Returns False only when there genuinely are more
+    instances than the format can hold."""
+    instances = table.get("instances", {})
+    if not instances:
+        return True
+    try:
+        old_ids = sorted(int(k) for k in instances.keys())
+    except (TypeError, ValueError):
+        return True   # malformed table: let the pack below fail on its own
+    if old_ids[-1] <= MAX_INSTANCE_ID:
+        return True
+    if len(old_ids) > MAX_INSTANCE_ID:
+        agr_report(None, 'ERROR',
+                   f"❌ AGR Link: в контейнере больше {MAX_INSTANCE_ID} объектов — "
+                   f"формат зеркала их не унесёт, разберите контейнер на части")
+        return False
+    id_map = {old: new for new, old in enumerate(old_ids, start=1)}
+    _stamp_remap(mesh, id_map)
+    table["instances"] = {str(id_map[old]): instances[str(old)] for old in old_ids}
+    table["next_instance"] = len(old_ids) + 1
+    agr_report(None, 'WARNING',
+               "⚠️ AGR Link: номера инстансов перенумерованы (в зеркало помещается "
+               f"номер до {MAX_INSTANCE_ID}) — на памяти контейнера это не сказывается")
+    return True
+
+
 def _pack_tracking_to_colors(mesh, table):
     """Mirror the tracking attributes into the two color attributes and
     store the normalisation bounds in the table.  Overwrites any previous
@@ -691,6 +904,12 @@ def _pack_tracking_to_colors(mesh, table):
     if (len(co_attr.data) != n_verts or len(flag_attr.data) != n_verts
             or len(attr.data) != n_polys):
         return False   # arrays not materialised - same "cannot read" case
+
+    # ids must fit the mirror's 15-bit field BEFORE anything is written:
+    # the clip below would fuse everything above 32767 into one instance
+    if not _fit_instance_ids(mesh, table):
+        return False
+    attr = mesh.attributes.get(ATTR_NAME)   # re-fetch: the remap rewrote it
 
     co = np.zeros(n_verts * 3, dtype=np.float32)
     co_attr.data.foreach_get("vector", co)
@@ -1096,6 +1315,19 @@ def _has_link_data(obj):
     if obj.get(PROP_KEY) is not None:
         return True
     return obj.data.attributes.get(TABLE_COL_PREFIX + "0") is not None
+
+
+def _has_aux_data(obj):
+    """Cheap "carries an atlas/UDIM record" test - idprop or mirror
+    present, nothing parsed (same budget as _has_link_data)."""
+    mesh = obj.data if getattr(obj, "type", None) == 'MESH' else None
+    if mesh is None:
+        return False
+    for _label, store in _AUX_STORES:
+        if obj.get(store.prop_key) is not None \
+                or mesh.attributes.get(store.prefix + "0") is not None:
+            return True
+    return False
 
 
 def _store_mirror_state(obj, store):
@@ -1504,10 +1736,17 @@ def _reconcile_container(context, obj):
             q = q32.reshape(-1, 3).astype(np.float64)
             ids_per_loop = np.repeat(face_ids, loop_total)
             extra_tol = float(merged.get("co_quant", 0.0) or 0.0)
+            # index the loops by instance ONCE: the old "ids_per_loop == nid"
+            # per instance was O(instances x loops) - minutes on a city
+            # container (3000 instances over a million loops)
+            order = np.argsort(ids_per_loop, kind="stable")
+            sorted_ids = ids_per_loop[order]
             for _s, _c, id_map in extras:
                 for nid in id_map.values():
+                    lo = int(np.searchsorted(sorted_ids, nid, side="left"))
+                    hi = int(np.searchsorted(sorted_ids, nid, side="right"))
                     vmask = np.zeros(n_verts, dtype=bool)
-                    vmask[vidx[ids_per_loop == nid]] = True
+                    vmask[vidx[order[lo:hi]]] = True
                     vmask &= om
                     core = _fit_affine_core(p, q, vmask, extra_tol)
                     entry = merged["instances"][str(nid)]
@@ -1524,6 +1763,16 @@ def _reconcile_container(context, obj):
         else:
             stale = sum(len(m) for _s, _c, m in extras)
 
+    # the plain Ctrl+J concatenated the UDIM/atlas mirrors too: repack the
+    # container's own record over the full mesh and adopt a lone orphaned
+    # window, so the shared loop-index layer can become the identity again
+    # (a permuted map that nobody needs any more is what killed the memory
+    # of triangulated exports - see _normalize_aux_mirrors)
+    try:
+        _normalize_aux_mirrors(obj, drop_unowned=False)
+    except Exception:
+        pass   # a record we could not repack must never abort the absorb
+
     # idprop FIRST (the table must survive even if the repack fails), then
     # ONE fresh mirror over the whole mesh - absorption is now permanent
     write_table(obj, merged)
@@ -1532,8 +1781,10 @@ def _reconcile_container(context, obj):
     except Exception:
         _remove_color_mirror(mesh)
         mirror_ok = False
-    if mirror_ok:
-        write_table(obj, merged)
+    # unconditional (see the join path): the pack renumbers table AND face
+    # attribute through _fit_instance_ids before it can still fail, and an
+    # idprop left with the old ids makes the container unrecoverable
+    write_table(obj, merged)
     _invalidate_caches(obj.name)
     return {"absorbed": len(extras), "zero_instance": zero_instance,
             "stale": stale, "mirror_ok": mirror_ok}
@@ -1612,8 +1863,9 @@ def _refresh_container(context, obj, absorb=True):
         except Exception:
             _remove_color_mirror(obj.data)
             mirror_ok = False
-        if mirror_ok:
-            write_table(obj, table)
+        # unconditional (see the join path): _fit_instance_ids may have
+        # renumbered both the table and the face ids before the pack failed
+        write_table(obj, table)
 
     _invalidate_caches(obj.name)
     instances = table.get("instances", {})
@@ -1795,6 +2047,44 @@ class AGR_OT_link_join(Operator):
             if recon:
                 absorbed_tables += recon.get("absorbed", 0)
 
+        # A colors-only atlas/UDIM carrier (the NORMAL state after a default
+        # FBX import - no reader materialises the idprop) has no copy of its
+        # record anywhere but the mirror, and _capture_props only sees
+        # obj.keys().  Materialise the idprop BEFORE the instances are
+        # captured: the active's record then takes the "repack" branch of
+        # _normalize_aux_mirrors instead of being dropped as an orphan, and a
+        # member's record rides into entry["props"] like any other property.
+        # decode_colors, not read(): only the object's OWN blob at loop 0 (the
+        # loop-index rescue included) - a window at an offset belongs to
+        # somebody else's mesh that was merged in earlier.
+        # The mirror lives on the MESH, so linked twins share it: when
+        # another user of the same datablock already claims the record with
+        # its idprop, the blob is THAT object's and copying it here would
+        # duplicate somebody else's record onto this one.
+        claimed_aux = set()
+        for other in bpy.data.objects:
+            data = getattr(other, "data", None)
+            if data is None:
+                continue
+            for _label, store in _AUX_STORES:
+                if other.get(store.prop_key) is not None:
+                    claimed_aux.add((store.prefix, data))
+        for obj in participants:
+            for _label, store in _AUX_STORES:
+                if obj.get(store.prop_key) is not None:
+                    continue
+                if (store.prefix, obj.data) in claimed_aux:
+                    continue
+                try:
+                    if not store.color_names(obj.data):
+                        continue
+                    own = store.decode_colors(obj.data)
+                except Exception:
+                    continue   # a record we cannot read must not abort the join
+                if own is not None:
+                    store.write_idprop(obj, own)
+                    store.invalidate(obj.name)
+
         a_mat = active.matrix_world.copy()
         inv_active = a_mat.inverted()
 
@@ -1837,9 +2127,18 @@ class AGR_OT_link_join(Operator):
             stamp_plan.append((active, iid, True, None))
 
         merged_containers = 0
+        # namespaces whose record has no copy anywhere but the mirror: a
+        # merged-in CONTAINER's atlas/UDIM record sits on the OBJECT the
+        # join deletes, and the table takes its instances, not its
+        # properties - so that window must be adopted, never dropped
+        keep_aux_prefixes = set()
         for obj in others:
             sub = read_table(obj)
             if sub is not None:
+                for _label, store in _AUX_STORES:
+                    if obj.get(store.prop_key) is not None \
+                            or obj.data.attributes.get(store.prefix + "0") is not None:
+                        keep_aux_prefixes.add(store.prefix)
                 if obj.data.attributes.get(ATTR_NAME) is None:
                     # freshly imported container joined without a prior
                     # disassembly - restore its attributes from colors first
@@ -1931,6 +2230,23 @@ class AGR_OT_link_join(Operator):
             agr_report(self, 'ERROR', "❌ AGR Link: join не выполнился, изменения откачены")
             return {'CANCELLED'}
 
+        # The join just concatenated the UDIM/atlas mirrors of every
+        # participant into this mesh; left alone, those windows pin the
+        # shared loop-index layer to garbage and a triangulating FBX export
+        # loses the WHOLE container's memory (their records travelled into
+        # the table as instance props, so nothing is lost by dropping them).
+        # guarded like the absorb path: this runs AFTER a successful join,
+        # where a rollback is no longer possible, and an exception escaping
+        # here would leave stamped geometry with no table at all -
+        # unrecoverable by this module's own definition
+        try:
+            aux_dropped = _normalize_aux_mirrors(active, drop_unowned=True,
+                                                 keep_prefixes=keep_aux_prefixes)
+        except Exception as exc:
+            aux_dropped = 0
+            agr_report(self, 'WARNING',
+                       f"⚠️ AGR Link: зеркала записей UDIM/атласа не нормализованы: {exc}")
+
         # idprop FIRST: even if the color mirror fails, the table must exist -
         # a container with stamped geometry and no table is unrecoverable
         write_table(active, table)
@@ -1939,9 +2255,12 @@ class AGR_OT_link_join(Operator):
         except Exception:
             _remove_color_mirror(active.data)
             mirror_ok = False
-        if mirror_ok:
-            write_table(active, table)  # now includes the co_min/co_size bounds
-        else:
+        # unconditional: _fit_instance_ids renumbers the table AND the face
+        # attribute inside the pack, and a pack that failed AFTER that would
+        # leave the idprop holding the OLD numbers - the container then
+        # disassembles into nothing ("без граней", every id unmatched)
+        write_table(active, table)  # now also carries the co_min/co_size bounds
+        if not mirror_ok:
             agr_report(self, 'WARNING',
                        "⚠️ AGR Link: цветовое зеркало не записано — контейнер не переживёт "
                        "FBX-перенос (в .blend разборка работает)")
@@ -1954,6 +2273,9 @@ class AGR_OT_link_join(Operator):
             msg += f", влито контейнеров: {merged_containers}"
         if absorbed_tables:
             msg += f", поглощено таблиц обычного Ctrl+J: {absorbed_tables}"
+        if aux_dropped:
+            msg += (f", зеркала записей UDIM/атласа влитых объектов сняты: {aux_dropped} "
+                    f"(сами записи сохранены в памяти контейнера)")
         agr_report(self, 'INFO', msg)
         return {'FINISHED'}
 
@@ -2150,9 +2472,10 @@ def _uv_matches(mesh_a, mesh_b, atol=1e-5):
     return True
 
 
-def _vote_reference(members, extra_atol=0.0):
-    """Group reference for the restore modes: majority vote among INTACT
-    chunks.  A repainted, flipped or otherwise deviant copy must not
+def _vote_reference(members, extra_atol=0.0, require_intact=True):
+    """Group reference: majority vote among the chunks of one group (under
+    the restore modes only INTACT ones are eligible - see require_intact).
+    A repainted, flipped or otherwise deviant copy must not
     become the new "original" - the healthy majority wins.  On a tie the
     first bucket wins (insertion order is preserved and max() returns the
     first maximum), so the outcome stays deterministic.  Returns the
@@ -2170,11 +2493,21 @@ def _vote_reference(members, extra_atol=0.0):
     in the pre-key, polygon normals at atol 0.1 inside _geometry_matches)
     still separates.  Only buckets carrying the IDENTICAL pre-key are ever
     compared, so the healthy case costs one comparison per member and the
-    scan can never fan out across unrelated shapes."""
+    scan can never fan out across unrelated shapes.
+
+    require_intact=False is the PLAIN disassembly: nothing is rolled back
+    there, but the group still needs a representative, and taking
+    members[0] made the very first instance the yardstick - id 1, whose
+    faces sit at the head of the mesh and are exactly the ones a user
+    edits.  Every other member was then compared against that edited
+    chunk alone, healthy copies were never compared with each other, and
+    a container of 10 bushes came apart into 10 unique meshes with the
+    nine innocent ones blamed for the edit.  Clustering answers it the
+    same way as the restore vote: the biggest bucket is the group."""
     buckets = []      # [{"rep": obj, "objs": [...]}], insertion order kept
     by_key = {}       # pre-key -> indices of the buckets sharing that key
     for obj, _m, info in members:
-        if not info["intact"]:
+        if require_intact and not info["intact"]:
             continue
         slot = by_key.setdefault(_ballot_key(obj.data), [])
         for i in slot:
@@ -2260,10 +2593,23 @@ def _alive_contains_stored_points(alive, members, extra_atol, limit=64):
     return True
 
 
-def _link_to_collections(obj, names, context, fallback_collections):
+def _link_to_collections(obj, names, context, fallback_collections, create=False):
+    """Link the restored object into the collections its table entry names.
+    ``create`` re-creates the missing ones at the scene root: after a
+    delivery FBX is imported into a CLEAN file no collection exists any
+    more, and 40 restored trees used to spill into the Scene Collection in
+    one heap.  The table stores names only, so a re-created collection
+    cannot know its former place in the hierarchy - the scene root is the
+    honest approximation."""
     linked = False
     for name in names:
-        coll = context.scene.collection if name == SCENE_ROOT else bpy.data.collections.get(name)
+        if name == SCENE_ROOT:
+            coll = context.scene.collection
+        else:
+            coll = bpy.data.collections.get(name)
+            if coll is None and create and name:
+                coll = bpy.data.collections.new(name)
+                context.scene.collection.children.link(coll)
         if coll is not None:
             try:
                 coll.objects.link(obj)
@@ -2281,15 +2627,25 @@ def _link_to_collections(obj, names, context, fallback_collections):
             context.scene.collection.objects.link(obj)
 
 
-def _extract_instances(op, context, container, target_ids, restore='OFF'):
+def _extract_instances(op, context, container, target_ids, restore='OFF',
+                       create_collections=True):
     """Core disassembly: pull the given instance ids out of the container.
     restore: 'OFF' - honest disassembly (edited chunks stay unique);
     'SOFT' | 'HARD' - forced restore, see AGR_OT_link_restore.
     Returns the list of created objects or None on error."""
     # blockers FIRST (read_table is a mutation-free view): a CANCELLED
     # outcome must not leave a reconcile mutation stranded outside undo
-    if read_table(container) is None:
+    pre_table = read_table(container)
+    if pre_table is None:
         agr_report(op, 'ERROR', "❌ AGR Link: активный объект — не контейнер AGR Link")
+        return None
+    # the id set is resolved against the MERGED VIEW, which is the very
+    # table the reconcile below materialises (deterministic merge), so this
+    # refusal can - and must - happen before the first mutation: it used to
+    # sit after reconcile + mesh.copy() + write_table, where a CANCELLED
+    # folds those into the PREVIOUS undo step and Ctrl+Z cannot reach them
+    if not {int(i) for i in target_ids if str(i) in pre_table.get("instances", {})}:
+        agr_report(op, 'ERROR', "❌ AGR Link: нечего разбирать (экземпляры не найдены в таблице)")
         return None
     if container.modifiers:
         agr_report(op, 'ERROR',
@@ -2318,16 +2674,29 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
 
     # container came through FBX: generic attributes are gone, but the color
     # mirror survived - rebuild the internal attributes from it, and
-    # materialise the idprop table when it was decoded from colors
-    if mesh.attributes.get(ATTR_NAME) is None:
+    # materialise the idprop table when it was decoded from colors.
+    # ALL THREE attrs, like _reconcile_container and _refresh_container:
+    # with the face ids alive but co/orig deleted the one-attribute test
+    # skipped the unpack, the frame fit had nothing to fit against and
+    # every chunk fell back to the STORED matrix - after a container move
+    # plus Apply Transform the pieces came back tens of metres off, linking
+    # lost, with a green panel and only "правленых копий" as a hint.
+    if any(mesh.attributes.get(name) is None
+           for name in (ATTR_NAME, CO_ATTR, ORIG_ATTR)):
         _unpack_tracking_from_colors(mesh, table)
     if not isinstance(container.get(PROP_KEY), str):
         write_table(container, table)
 
     face_ids = _read_face_ids(mesh)
     if face_ids is None:
-        agr_report(op, 'ERROR', f"❌ AGR Link: на контейнере нет атрибута {ATTR_NAME}")
-        return None
+        # the reconcile / mesh copy / idprop write above already touched ID
+        # data: returning CANCELLED here would push NO undo step and melt
+        # them into the previous one, so the operator finishes (empty list
+        # = "nothing extracted") and the message carries the failure
+        agr_report(op, 'WARNING',
+                   f"❌ AGR Link: на контейнере нет атрибута {ATTR_NAME} — "
+                   f"разборка невозможна (сделанные изменения отменяются Ctrl+Z)")
+        return []
 
     # legacy container (no per-vertex co/orig): there is nothing to restore
     # from - HARD can only lean on an alive datablock from the file
@@ -2337,8 +2706,10 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
 
     target_ids = {int(i) for i in target_ids if str(i) in table["instances"]}
     if not target_ids:
-        agr_report(op, 'ERROR', "❌ AGR Link: нечего разбирать (экземпляры не найдены в таблице)")
-        return None
+        # same reasoning as above: the mutations are already in
+        agr_report(op, 'WARNING',
+                   "❌ AGR Link: нечего разбирать (экземпляры не найдены в таблице)")
+        return []
 
     available = set(np.unique(face_ids).tolist())
     missing = sorted(target_ids - available)
@@ -2346,6 +2717,9 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
 
     c_mat = container.matrix_world.copy()
     fallback_colls = list(container.users_collection)
+    # atlas/UDIM records of the CONTAINER, read while its mesh is whole
+    # (the prune at the end shreds the mirror - see _capture_aux_records)
+    aux_records, aux_flag = _capture_aux_records(container)
 
     # Free the container's name so a restored instance with the same name
     # does not get a ".001" suffix while the soon-to-die husk still holds it.
@@ -2399,6 +2773,11 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
                 new_mesh, extra_tol=float(table.get("co_quant", 0.0)),
                 snap_all=intact)
             _remove_tracking_attrs(new_mesh)
+            # the chunk is a COPY of the container mesh: it also inherited a
+            # meaningless slice of every OTHER namespace's mirror, invisible
+            # to link_strip (nothing decodes from it) and poison for a later
+            # re-join (see _remove_foreign_store_layers)
+            _remove_foreign_store_layers(new_mesh)
             fitted = frame is not None
             # a failed fit means the snap never ran: the chunk must not
             # pass as restored, vote, or serve as the group reference
@@ -2432,7 +2811,8 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
             _restore_materials(new_mesh)
 
             obj = bpy.data.objects.new(entry["name"], new_mesh)
-            _link_to_collections(obj, entry.get("collections", []), context, fallback_colls)
+            _link_to_collections(obj, entry.get("collections", []), context,
+                                 fallback_colls, create=create_collections)
             for key, value in entry.get("props", {}).items():
                 obj[key] = value
             created.append((obj, entry, frame, gid,
@@ -2509,8 +2889,13 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
             # the vote gets the SAME noise budget as the adoption loop
             # below - otherwise honest copies that differ only by the
             # quantisation step vote in separate buckets
-            rep = _vote_reference(members, extra_atol) if forced else None
+            # the plain disassembly votes too (require_intact=False - there
+            # is no intactness there): an edited FIRST member must not
+            # become the yardstick that leaves every healthy copy unique
+            rep = _vote_reference(members, extra_atol, require_intact=forced)
             probe = rep if rep is not None else members[0][0]
+            if not forced:
+                rep = None   # "vetted reference" stays a restore-only notion
 
             target = None
             ref_from_alive = False
@@ -2597,6 +2982,11 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
                 # a group that linked fine without a vote is not a failure
                 hard_no_ref += 1
 
+        # atlas/UDIM records that rode back in the instance props are idprop
+        # only at this point - give them their color mirror back now that
+        # every object owns its final datablock (after the re-link pass)
+        _rewrite_aux_mirrors([obj for obj, *_ in created])
+
         # --- shrink the container (keep untracked loose geometry, as the
         # join-time warning promises)
         done_set = set(done_ids)
@@ -2619,18 +3009,37 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
             except Exception:
                 _remove_color_mirror(mesh)
                 mirror_failed = True
-            if not mirror_failed:
-                write_table(container, table)
+            # unconditional (see the join path): _fit_instance_ids may have
+            # renumbered both the table and the face ids before the pack failed
+            write_table(container, table)
+            # the prune may have decapitated the atlas/UDIM mirror of the
+            # container itself (the record sits at loop 0, and the head group
+            # takes those loops with it).  On a colors-only carrier that blob
+            # is the ONLY copy, so put the pre-cut capture back over the
+            # shortened mesh - exactly what the autosync would do if it could
+            # still read the record.
+            _apply_aux_records(container, aux_records, aux_flag)
             container.name = original_container_name
             container_final_name = container.name
             container_renamed = container.name != original_container_name
         else:
-            if verts_left == 0:
+            replacement = created_by_name.get(original_container_name)
+            # atlas/UDIM records WRITTEN ON THE CONTAINER (the natural order
+            # "собрать Flora -> сделать атлас/UDIM -> позже разобрать") are
+            # not part of the link table: the instance props only hold what
+            # each object carried at JOIN time.  Deleting the container used
+            # to take them with it - and with the disk fallback gone
+            # (udim_mapping.json is no longer written) Revert/Unpack became
+            # impossible, silently.  Hand them to the restored namesake, and
+            # when there is none keep the container as a husk instead.
+            aux_moved = [label for label, _s, _r in aux_records]
+            if aux_records and replacement is not None:
+                _apply_aux_records(replacement, aux_records, aux_flag)
+            if verts_left == 0 and (replacement is not None or not aux_records):
                 husk_mesh = container.data
                 # hand the container's children over to the restored namesake
                 # instance (or unparent), preserving world transforms - else
                 # deleting the container would snap them to wrong positions
-                replacement = created_by_name.get(original_container_name)
                 for child in list(container.children):
                     world = child.matrix_world.copy()
                     child.parent = replacement
@@ -2640,23 +3049,37 @@ def _extract_instances(op, context, container, target_ids, restore='OFF'):
                     bpy.data.meshes.remove(husk_mesh)
                 container_deleted = True
             else:
-                # untracked leftovers (loose geometry / foreign Ctrl+J faces):
-                # never delete silently
+                # untracked leftovers (loose geometry / foreign Ctrl+J faces),
+                # or records with nowhere to go: never delete silently
                 container.name = original_container_name + "_leftover"
                 container_final_name = container.name
-                del container[PROP_KEY]
+                container.pop(PROP_KEY, None)
                 _remove_tracking_attrs(mesh)
-                agr_report(op, 'WARNING',
-                           f"⚠️ AGR Link: в '{container.name}' остались непомеченные "
-                           f"вершины ({verts_left}) — контейнер сохранён")
+                # a colors-only carrier lost its record with the prune -
+                # put the captured copy back on the husk
+                _apply_aux_records(container, aux_records, aux_flag)
+                if verts_left == 0:
+                    agr_report(op, 'WARNING',
+                               f"⚠️ AGR Link: на контейнере остались записи "
+                               f"({', '.join(aux_moved)}), а одноимённого объекта нет — "
+                               f"контейнер сохранён как '{container.name}'")
+                else:
+                    agr_report(op, 'WARNING',
+                               f"⚠️ AGR Link: в '{container.name}' остались непомеченные "
+                               f"вершины ({verts_left}) — контейнер сохранён")
     except Exception as exc:
         if not container_deleted:
             try:
                 container.name = original_container_name
             except ReferenceError:
                 pass
-        agr_report(op, 'ERROR', f"❌ AGR Link: сбой разборки: {exc}")
-        return None
+        # half-done disassembly: geometry, meshes and names have already
+        # been rewritten, so the operator must FINISH (empty list) and let
+        # the user undo one honest step - CANCELLED would push no undo step
+        # at all and weld the wreck into the previous one
+        agr_report(op, 'ERROR',
+                   f"❌ AGR Link: сбой разборки: {exc} (отмените Ctrl+Z)")
+        return []
 
     # selection: restored objects selected, first reachable one active
     for o in context.selected_objects:
@@ -2733,6 +3156,13 @@ class AGR_OT_link_extract_group(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     group_id: IntProperty(name="Group ID", default=0)
+    # a delivery FBX opened in a CLEAN file has no collections left, and
+    # without this every restored object lands in the Scene Collection
+    create_collections: BoolProperty(
+        name="Создавать коллекции",
+        description="Восстанавливать отсутствующие коллекции по именам из памяти "
+                    "контейнера (в корне сцены)",
+        default=True)
 
     @classmethod
     def poll(cls, context):
@@ -2749,7 +3179,8 @@ class AGR_OT_link_extract_group(Operator):
         if not ids:
             agr_report(self, 'ERROR', "❌ AGR Link: группа не найдена в контейнере")
             return {'CANCELLED'}
-        result = _extract_instances(self, context, container, ids)
+        result = _extract_instances(self, context, container, ids,
+                                    create_collections=self.create_collections)
         return {'FINISHED'} if result is not None else {'CANCELLED'}
 
 
@@ -2759,6 +3190,14 @@ class AGR_OT_link_separate_all(Operator):
     bl_idname = "agr.link_separate_all"
     bl_label = "Разобрать всё"
     bl_options = {'REGISTER', 'UNDO'}
+
+    # a delivery FBX opened in a CLEAN file has no collections left, and
+    # without this every restored object lands in the Scene Collection
+    create_collections: BoolProperty(
+        name="Создавать коллекции",
+        description="Восстанавливать отсутствующие коллекции по именам из памяти "
+                    "контейнера (в корне сцены)",
+        default=True)
 
     @classmethod
     def poll(cls, context):
@@ -2780,7 +3219,8 @@ class AGR_OT_link_separate_all(Operator):
                 return {'CANCELLED'}
         else:
             ids = [int(iid) for iid in table["instances"].keys()]
-        result = _extract_instances(self, context, container, ids)
+        result = _extract_instances(self, context, container, ids,
+                                    create_collections=self.create_collections)
         return {'FINISHED'} if result is not None else {'CANCELLED'}
 
 
@@ -2805,6 +3245,13 @@ class AGR_OT_link_restore(Operator):
         options={'HIDDEN', 'SKIP_SAVE'})
     group_id: IntProperty(name="Group ID", default=-1,   # -1 = the whole container
                           options={'HIDDEN', 'SKIP_SAVE'})
+    # a delivery FBX opened in a CLEAN file has no collections left, and
+    # without this every restored object lands in the Scene Collection
+    create_collections: BoolProperty(
+        name="Создавать коллекции",
+        description="Восстанавливать отсутствующие коллекции по именам из памяти "
+                    "контейнера (в корне сцены)",
+        default=True)
 
     @classmethod
     def poll(cls, context):
@@ -2869,7 +3316,8 @@ class AGR_OT_link_restore(Operator):
             if not ids:
                 agr_report(self, 'ERROR', "❌ AGR Link: группа не найдена в контейнере")
                 return {'CANCELLED'}
-        result = _extract_instances(self, context, container, ids, restore=self.mode)
+        result = _extract_instances(self, context, container, ids, restore=self.mode,
+                                    create_collections=self.create_collections)
         return {'FINISHED'} if result is not None else {'CANCELLED'}
 
 
@@ -2877,55 +3325,122 @@ class AGR_OT_link_restore(Operator):
 # Strip memory (clean delivery)
 # ----------------------------------------------------------------------------
 
+def _has_agr_traces(obj):
+    """Anything AGR on this object: service mesh layers, the link table,
+    an atlas/UDIM record, the atlas guard flag or the watcher's base name
+    on the mesh.  Deliberately by PRESENCE, never by "does the record still
+    decode" - the leftovers this must catch are exactly the ones that no
+    longer decode."""
+    if _agr_idprop_keys(obj):
+        return True
+    mesh = obj.data if getattr(obj, "type", None) == 'MESH' else None
+    if mesh is None:
+        return False
+    return bool(_agr_service_layers(mesh) or _agr_idprop_keys(mesh))
+
+
+def _shared_mesh_owner(obj, exempt=()):
+    """Another object sharing this mesh that still carries AGR memory of
+    its own.  An Alt+D twin of a container shares the datablock, and a
+    strip on the twin used to take agr_link_id/co/orig and the mirror off
+    the SHARED mesh: the real container kept its idprop table with no
+    carriers left, the panel said "зеркала нет", and the disassembly died
+    with "на контейнере нет атрибута agr_link_id".
+
+    ``exempt`` are the objects being stripped in this very pass - they are
+    losing their memory anyway, so they cannot be robbed of it.  Without
+    that, linked twins each holding their OWN record (the normal result of
+    a disassembly: the group shares one datablock and every member gets its
+    record back from the table props) blocked EACH OTHER and the delivery
+    file went out with the service color attributes still on it."""
+    mesh = obj.data if getattr(obj, "type", None) == 'MESH' else None
+    if mesh is None or mesh.users - (1 if mesh.use_fake_user else 0) <= 1:
+        return None
+    keys = [PROP_KEY] + [s.prop_key for _l, s in _AUX_STORES]
+    for other in bpy.data.objects:
+        if other is obj or other in exempt:
+            continue
+        if getattr(other, "data", None) is not mesh:
+            continue
+        if any(other.get(key) is not None for key in keys):
+            return other
+    return None
+
+
 class AGR_OT_link_strip(Operator):
     """Удалить память AGR с выделенных объектов (для полностью чистой
-сдачи): таблица AGR Link, служебные атрибуты и color attributes, а также
-записи атласов/UDIM.  Разборка/распаковка станет НЕВОЗМОЖНА"""
+сдачи): таблица AGR Link, служебные атрибуты и color attributes, записи
+атласов/UDIM и все служебные свойства.  Разборка/распаковка станет
+НЕВОЗМОЖНА"""
     bl_idname = "agr.link_strip"
     bl_label = "Удалить память (сдача)"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        return (context.mode == 'OBJECT'
-                and any(o.type == 'MESH'
-                        and (is_container(o)
-                             or ATLAS_STORE.peek(o) is not None
-                             or UDIM_STORE.peek(o) is not None)
-                        for o in context.selected_objects))
+        if context.mode != 'OBJECT':
+            return False
+        if not any(_has_agr_traces(o) for o in context.selected_objects):
+            cls.poll_message_set("У выделенных объектов нет служебных данных AGR")
+            return False
+        return True
 
     def invoke(self, context, event):
         return context.window_manager.invoke_confirm(self, event)
 
     def execute(self, context):
         count = 0
+        blocked_pairs = []   # (текст, obj) - checked again after the pass
+        # everything selected is being cleaned in this same pass, so a
+        # co-owner of the mesh among them is not a reason to refuse
+        selected = set(context.selected_objects)
         for obj in context.selected_objects:
-            if obj.type != 'MESH':
+            if not _has_agr_traces(obj):
+                continue
+            owner = _shared_mesh_owner(obj, exempt=selected)
+            if owner is not None:
+                blocked_pairs.append((f"{obj.name} (меш общий с '{owner.name}')", obj))
                 continue
             had = False
-            if read_table(obj) is not None:
-                # colors-only container (fresh FBX import) has no idprop - pop, not del
-                obj.pop(PROP_KEY, None)
-                _remove_tracking_attrs(obj.data)
-                _invalidate_caches(obj.name)
+            for key in _agr_idprop_keys(obj):
+                obj.pop(key, None)
                 had = True
-            # atlas/UDIM records are AGR service data too - the delivery
-            # file must not carry any of the color mirrors
-            if ATLAS_STORE.peek(obj) is not None:
-                ATLAS_STORE.strip(obj)
-                had = True
-            if 'agr_atlas_applied' in obj:
-                # stripping the record while leaving this guard set would
-                # block BOTH Apply (flag) and Unpack (no record) forever
-                del obj['agr_atlas_applied']
-                had = True
-            if UDIM_STORE.peek(obj) is not None:
-                UDIM_STORE.strip(obj)
-                had = True
+            mesh = obj.data if obj.type == 'MESH' else None
+            if mesh is not None:
+                for name in _agr_service_layers(mesh):
+                    attr = mesh.attributes.get(name)
+                    if attr is not None:
+                        mesh.attributes.remove(attr)
+                        had = True
+                # the watcher's base name (agr_instance_base) lives on the
+                # MESH and used to survive a "полностью чистая сдача"
+                for key in _agr_idprop_keys(mesh):
+                    mesh.pop(key, None)
+                    had = True
+            _invalidate_caches(obj.name)
+            for store in registered_stores():
+                store.invalidate(obj.name)
             if had:
                 count += 1
-        agr_report(self, 'INFO', f"✅ AGR Link: память удалена у {count} объектов — разборка невозможна")
-        return {'FINISHED'}
+        # a skipped object whose traces are gone anyway (a co-owner of the
+        # shared mesh cleaned them) is not a failure - do not raise an ERROR
+        # over a file that is in fact clean
+        blocked = [text for text, obj in blocked_pairs if _has_agr_traces(obj)]
+        left = [o.name for o in context.selected_objects if _has_agr_traces(o)]
+        msg = f"✅ AGR Link: память удалена у {count} объектов — разборка невозможна"
+        level = 'INFO'
+        if blocked:
+            level = 'ERROR'
+            msg = (f"❌ AGR Link: пропущены объекты с общим мешем "
+                   f"({len(blocked)}): " + ", ".join(blocked[:3])
+                   + " — снимите память с самого контейнера или сделайте меш "
+                     "уникальным | " + msg)
+        elif left:
+            level = 'WARNING'
+            msg += (f" | ⚠️ остались следы AGR у {len(left)}: "
+                    + ", ".join(sorted(left)[:5]))
+        agr_report(self, level, msg)
+        return {'FINISHED'} if count else {'CANCELLED'}
 
 
 # ----------------------------------------------------------------------------
@@ -3117,8 +3632,9 @@ class AGR_OT_link_rename_group(Operator):
             mirror_ok = _pack_tracking_to_colors(obj.data, table)
         except Exception:
             _remove_color_mirror(obj.data)
-        if mirror_ok:
-            write_table(obj, table)
+        # unconditional (see the join path): _fit_instance_ids may have
+        # renumbered both the table and the face ids before the pack failed
+        write_table(obj, table)
         _invalidate_caches(obj.name)
         _sync_group_list(scene, obj)
         msg = f"✅ AGR Link: группа переименована — «{base}» ({len(members)} шт.)"
@@ -3204,6 +3720,12 @@ class AGR_OT_link_select_by_faces(Operator):
 WATCH_BASE_KEY = "agr_instance_base"   # per-mesh idprop: user-chosen base
 
 _WATCH_LAST_FP = None
+# fingerprint the last apply STARTED from.  With undo=True the rename is a
+# real undo step, and a Ctrl+Z lands the scene back exactly here - without
+# this the next depsgraph tick would see "not the applied state" and rename
+# again, fighting the user's undo forever.  Any other change moves the
+# fingerprint off this value and the scheme is applied as usual.
+_WATCH_PRE_FP = None
 
 
 def _watch_members(scene):
@@ -3243,15 +3765,21 @@ def _watch_base(mesh, members):
     return _strip_copy_suffix(names[0]) or names[0]
 
 
-def _watch_apply(scene):
+def _watch_apply(scene, groups=None):
     """Enforce ``Base_###`` on every watched group.  Returns
     (renamed_count, conflict_names).  Objects already carrying a valid
     unique number keep it; the rest get the lowest free numbers in name
     order.  Renames go through a temp pass so in-group swaps cannot
     collide; a name held by a FOREIGN object is reported, Blender's own
-    dedup suffix stays on that member."""
+    dedup suffix stays on that member.
+
+    ``groups`` lets the caller pass the ONE collection scan of this tick
+    (the handler used to pay for two to four of them - 13.8 ms per tick on
+    2000 objects, five ticks a second)."""
     renamed, conflicts = 0, []
-    for mesh, members in _watch_members(scene).items():
+    if groups is None:
+        groups = _watch_members(scene)
+    for mesh, members in groups.items():
         base = _watch_base(mesh, members)
         pat = re.compile(re.escape(base) + r"_(\d{3,})$")
         by_num = {}
@@ -3278,40 +3806,76 @@ def _watch_apply(scene):
         for o, want in pending:
             o.name = want
             if o.name != want:
+                # the name belongs to a foreign object: Blender appended its
+                # own suffix, so this member was NOT renamed to the scheme
                 conflicts.append(want)
-            renamed += 1
+            else:
+                renamed += 1
     return renamed, conflicts
 
 
-def _watch_fp(scene):
+def _watch_fp(scene, groups=None):
     """Cheap fingerprint of the watched state - names, bases, membership."""
+    if groups is None:
+        groups = _watch_members(scene)
     parts = []
-    for mesh, members in _watch_members(scene).items():
+    for mesh, members in groups.items():
         parts.append((mesh.name, str(mesh.get(WATCH_BASE_KEY, "")),
                       tuple(sorted(o.name for o in members))))
     return tuple(sorted(parts))
 
 
-def _watch_tick(scene):
-    """Depsgraph-side auto-apply: only when the watched state changed."""
-    global _WATCH_LAST_FP
-    fp = _watch_fp(scene)
-    if fp == _WATCH_LAST_FP:
+_WATCH_PENDING = False
+
+
+def _watch_deferred_apply():
+    """Timer body: run the rename through its OPERATOR.  Renaming ID data
+    straight from depsgraph_update_post happens OUTSIDE undo - Ctrl+Z
+    rolled the names back and the very next tick renamed them again, so the
+    user could never undo anything else either.  A timer runs between
+    operators, where an operator call CAN push an undo step - but only when
+    it is asked to: the Python signature is
+    ``BPyOpFunction(context='EXEC_DEFAULT', undo=False, **kwargs)``, and
+    without ``undo=True`` WM_operator_call_py raises wm->op_undo_depth so
+    that wm_operator_finished never calls ED_undo_push_op ("Python never
+    triggers undo").  So the flag is the whole point of the deferral.
+    Headless cannot prove the step exists (ed.undo.poll() is False in
+    background) - the test only pins the flag down; verify in the GUI via
+    Edit -> Undo History."""
+    global _WATCH_PENDING
+    _WATCH_PENDING = False
+    try:
+        if bpy.ops.agr.link_watch_apply.poll():
+            # second positional argument = undo
+            bpy.ops.agr.link_watch_apply('INVOKE_DEFAULT', True)
+    except Exception:
+        pass   # a stale timer from a dev reload must not raise into the UI
+    return None   # one-shot
+
+
+def _watch_tick(scene, groups=None):
+    """Depsgraph-side auto-apply: only when the watched state changed, and
+    only as a DEFERRED operator call (see _watch_deferred_apply)."""
+    global _WATCH_LAST_FP, _WATCH_PENDING
+    fp = _watch_fp(scene, groups)
+    if fp == _WATCH_LAST_FP or fp == _WATCH_PRE_FP or _WATCH_PENDING:
         return
-    renamed, conflicts = _watch_apply(scene)
-    _WATCH_LAST_FP = _watch_fp(scene)
-    if conflicts:
-        agr_report(None, 'WARNING',
-                   "⚠️ AGR Link: имена заняты другими объектами: "
-                   + ", ".join(conflicts[:5]) + ("…" if len(conflicts) > 5 else ""))
+    _WATCH_LAST_FP = fp
+    _WATCH_PENDING = True
+    try:
+        bpy.app.timers.register(_watch_deferred_apply, first_interval=0.0)
+    except Exception:
+        _WATCH_PENDING = False
 
 
-def _sync_watch_groups(scene):
+def _sync_watch_groups(scene, groups=None):
     """Mirror the watched instance groups into Scene.agr_link_watch_groups
     (editable base name + count)."""
     global _LIST_SYNCING
+    if groups is None:
+        groups = _watch_members(scene)
     rows = [(mesh.name, _watch_base(mesh, members), len(members))
-            for mesh, members in _watch_members(scene).items()]
+            for mesh, members in groups.items()]
     rows.sort(key=lambda r: (r[1].lower(), r[0]))
     coll = scene.agr_link_watch_groups
     if (len(coll) == len(rows)
@@ -3403,7 +3967,7 @@ class AGR_OT_link_watch_add(Operator):
         return {'FINISHED'}
 
     def execute(self, context):
-        global _WATCH_LAST_FP
+        global _WATCH_LAST_FP, _WATCH_PRE_FP
         if self.collection == "__none__":
             return {'CANCELLED'}
         coll = bpy.data.collections.get(self.collection)
@@ -3414,7 +3978,7 @@ class AGR_OT_link_watch_add(Operator):
             return {'CANCELLED'}
         item = scene.agr_link_watch_colls.add()
         item.collection = coll
-        _WATCH_LAST_FP = None      # let the next tick re-apply
+        _WATCH_LAST_FP = _WATCH_PRE_FP = None   # let the next tick re-apply
         _sync_watch_groups(scene)
         return {'FINISHED'}
 
@@ -3430,7 +3994,7 @@ class AGR_OT_link_watch_remove(Operator):
         return len(context.scene.agr_link_watch_colls) > 0
 
     def execute(self, context):
-        global _WATCH_LAST_FP
+        global _WATCH_LAST_FP, _WATCH_PRE_FP
         scene = context.scene
         idx = scene.agr_link_watch_colls_index
         if not (0 <= idx < len(scene.agr_link_watch_colls)):
@@ -3438,7 +4002,7 @@ class AGR_OT_link_watch_remove(Operator):
         scene.agr_link_watch_colls.remove(idx)
         scene.agr_link_watch_colls_index = min(
             idx, len(scene.agr_link_watch_colls) - 1)
-        _WATCH_LAST_FP = None
+        _WATCH_LAST_FP = _WATCH_PRE_FP = None
         _sync_watch_groups(scene)
         return {'FINISHED'}
 
@@ -3456,11 +4020,15 @@ class AGR_OT_link_watch_apply(Operator):
                    for it in context.scene.agr_link_watch_colls)
 
     def execute(self, context):
-        global _WATCH_LAST_FP
+        global _WATCH_LAST_FP, _WATCH_PRE_FP
         scene = context.scene
-        renamed, conflicts = _watch_apply(scene)
-        _WATCH_LAST_FP = _watch_fp(scene)
-        _sync_watch_groups(scene)
+        # one scan for the rename, the fingerprint and the list mirror
+        # (the group objects are live, so their NEW names read back here)
+        groups = _watch_members(scene)
+        _WATCH_PRE_FP = _watch_fp(scene, groups)   # the state an undo returns to
+        renamed, conflicts = _watch_apply(scene, groups)
+        _WATCH_LAST_FP = _watch_fp(scene, groups)
+        _sync_watch_groups(scene, groups)
         msg = (f"✅ AGR Link: переименовано объектов: {renamed}" if renamed
                else "✅ AGR Link: все инстансы уже названы по схеме")
         if conflicts:
@@ -3483,7 +4051,7 @@ class AGR_OT_link_watch_rename(Operator):
     new_name: StringProperty(name="Имя")
 
     def execute(self, context):
-        global _WATCH_LAST_FP
+        global _WATCH_LAST_FP, _WATCH_PRE_FP
         scene = context.scene
         mesh = bpy.data.meshes.get(self.mesh_name)
         base = self.new_name.strip()
@@ -3491,9 +4059,11 @@ class AGR_OT_link_watch_rename(Operator):
             _sync_watch_groups(scene)   # revert the edited field
             return {'CANCELLED'}
         mesh[WATCH_BASE_KEY] = base
-        renamed, conflicts = _watch_apply(scene)
-        _WATCH_LAST_FP = _watch_fp(scene)
-        _sync_watch_groups(scene)
+        groups = _watch_members(scene)
+        _WATCH_PRE_FP = _watch_fp(scene, groups)   # the state an undo returns to
+        renamed, conflicts = _watch_apply(scene, groups)
+        _WATCH_LAST_FP = _watch_fp(scene, groups)
+        _sync_watch_groups(scene, groups)
         msg = f"✅ AGR Link: группа инстансов → «{base}» (переименовано: {renamed})"
         if conflicts:
             agr_report(self, 'WARNING', msg + " | ⚠️ имена заняты: "
@@ -3530,9 +4100,12 @@ def _link_ui_sync(scene, depsgraph=None):
         active = view_layer.objects.active if view_layer else None
         _sync_group_list(scn, active)
         if len(scn.agr_link_watch_colls):
+            # ONE collection scan per tick, shared by the fingerprint, the
+            # rename pass and the list mirror
+            groups = _watch_members(scn)
             if scn.agr_link_watch_enabled:
-                _watch_tick(scn)
-            _sync_watch_groups(scn)
+                _watch_tick(scn, groups)
+            _sync_watch_groups(scn, groups)
     except Exception:
         pass   # a broken tick must never take the depsgraph down
 
@@ -3727,6 +4300,20 @@ class AGR_PT_LinkPanel(Panel):
         op.scope = 'ALL'
         col.prop(context.scene, "agr_link_autosync")
 
+        # pre-delivery check: the scan walks every mesh, so the panel shows
+        # the LAST result instead of recomputing it in draw()
+        col = layout.column(align=True)
+        col.operator("agr.link_precheck", icon='CHECKMARK')
+        problems = _PRECHECK_LAST.get("problems") or []
+        if problems:
+            row = col.row()
+            row.alert = True
+            row.label(text=f"Проблем перед сдачей: {len(problems)} (см. статус)",
+                      icon='ERROR')
+            for name, reason in problems[:3]:
+                col.label(text=f"{name}: {reason}")
+        col.operator("agr.export_fbx_checked", icon='EXPORT')
+
     @staticmethod
     def _draw_mirror_state(layout, obj):
         """Warn when the memory will NOT survive an FBX export.  The rest
@@ -3825,16 +4412,6 @@ def _drop_stale_handlers(handler_list, func_name):
             handler_list.remove(h)
 
 
-# UDIM/atlas records share the dual-carrier design (idprop + color mirror,
-# core/attr_store.py) and BREAK the same way: a mesh edit decapitates the
-# mirror while the idprop keeps the .blend working - and the FBX ships
-# without the record.  The link machinery above only watched its own
-# namespace; these two used to go out dead in total silence (reproduced:
-# delete the first face of a UDIM/atlas carrier -> both records survive in
-# the .blend and are gone after a default FBX round trip).
-_AUX_STORES = (("UDIM", UDIM_STORE), ("атлас", ATLAS_STORE))
-
-
 def _sync_aux_records(obj):
     """Repack the UDIM/atlas record mirrors of one object when they no
     longer match the mesh.  Unlike the link container there is nothing to
@@ -3883,6 +4460,148 @@ def _sync_aux_records(obj):
     return fixed, failed
 
 
+# ----------------------------------------------------------------------------
+# Pre-delivery check ("проверить перед сдачей")
+# ----------------------------------------------------------------------------
+# Blender has no export hook, so nothing can stop an export that ships a
+# decapitated mirror: the only existing signal was one line in this panel,
+# on the ACTIVE container, in a panel the user has to open.  This is the
+# explicit checklist instead - and the first stone of the AGR Validate
+# operator the July audit asked for.
+
+# last result, for the panel line (the scan walks every mesh in the scene -
+# far too much for draw(), and a stale-but-labelled verdict is honest)
+_PRECHECK_LAST = {"problems": [], "checked": 0}
+
+
+def _precheck_problems(scene=None):
+    """[(object name, reason)] for everything that would travel broken:
+    mirrors that are not OK, frames that fail their CRC, a loop-index map
+    that is not the identity (a triangulating export would then lose the
+    memory), atlas/UDIM records in the same states, objects held in Edit
+    Mode (the save-time repack skips them) and service layers left on
+    objects that carry no record at all (the city checker rejects those).
+    Read-only: safe from an operator, too heavy for draw()."""
+    problems = []
+    objects = list(scene.objects) if scene is not None else list(bpy.data.objects)
+    for obj in objects:
+        if obj.type != 'MESH' or obj.library is not None:
+            continue
+        mesh = obj.data
+        if mesh is None or mesh.library is not None:
+            continue
+        link, aux = _has_link_data(obj), _has_aux_data(obj)
+        if mesh.is_editmode:
+            if link or aux:
+                problems.append((obj.name, "открыт Edit Mode — память не перепакуется"))
+            continue
+        if link:
+            state = _mirror_state(obj)
+            if state == MIRROR_BROKEN:
+                problems.append((obj.name, "зеркало разрушено — FBX уедет без памяти"))
+            elif state == MIRROR_STALE:
+                problems.append((obj.name, "память устарела (меш правился)"))
+            elif state == MIRROR_WINDOWS:
+                problems.append((obj.name, "память не закреплена (Ctrl+J / пересборка FBX)"))
+            elif state == MIRROR_NONE:
+                problems.append((obj.name, "зеркала нет — FBX не перенесёт память"))
+            elif _LINK_STORE.verify_frame(mesh) is False:
+                problems.append((obj.name, "зеркало не проходит CRC"))
+            elif not loop_index_is_canonical(mesh):
+                problems.append((obj.name, "карта лупов не канонична — "
+                                           "триангулированный FBX потеряет память"))
+        for label, store in _AUX_STORES:
+            if obj.get(store.prop_key) is None \
+                    and mesh.attributes.get(store.prefix + "0") is None:
+                continue
+            state = _store_mirror_state(obj, store)
+            if state == MIRROR_OK:
+                if store.verify_frame(mesh) is False:
+                    problems.append((obj.name, f"запись {label}: зеркало не проходит CRC"))
+            elif state == MIRROR_WINDOWS:
+                # "no frame at loop 0" is fine while a real window still
+                # decodes (a merged-in carrier); with nothing decodable it
+                # is the unreadable SLICE a disassembly used to leave behind,
+                # and the delivery checker rejects the layers all the same
+                wins, _ridx = store.scan_windows_ex(mesh)
+                if not wins:
+                    problems.append((obj.name,
+                                     f"остатки слоёв записи {label} — "
+                                     f"нужна кнопка «Удалить память»"))
+            else:
+                problems.append((obj.name, f"запись {label}: зеркало {state}"))
+        if not link and not aux:
+            leftovers = _agr_service_layers(mesh)
+            if leftovers:
+                problems.append((obj.name,
+                                 "остатки служебных слоёв (" + ", ".join(leftovers[:3])
+                                 + ") — нужна кнопка «Удалить память»"))
+    return problems
+
+
+def _precheck_message(problems, checked):
+    if not problems:
+        return 'INFO', f"✅ AGR: к сдаче готово — проверено объектов: {checked}"
+    bits = [f"{name}: {reason}" for name, reason in problems[:5]]
+    return 'WARNING', (f"⚠️ AGR: проблем перед сдачей: {len(problems)} — "
+                       + "; ".join(bits) + ("…" if len(problems) > 5 else ""))
+
+
+class AGR_OT_link_precheck(Operator):
+    """Проверить сцену перед сдачей: состояние памяти контейнеров,
+записей атласов/UDIM, объекты в Edit Mode и остатки служебных слоёв"""
+    bl_idname = "agr.link_precheck"
+    bl_label = "Проверить перед сдачей"
+    # read-only: no UNDO step for a check
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None
+
+    def execute(self, context):
+        problems = _precheck_problems(context.scene)
+        checked = sum(1 for o in context.scene.objects if o.type == 'MESH')
+        _PRECHECK_LAST["problems"] = problems
+        _PRECHECK_LAST["checked"] = checked
+        level, msg = _precheck_message(problems, checked)
+        agr_report(self, level, msg)
+        for name, reason in problems:
+            print(f"⚠️ AGR precheck | {name}: {reason}")
+        # nothing was mutated, so CANCELLED costs nothing and says
+        # "not ready" in the one place a script can read it
+        return {'CANCELLED'} if problems else {'FINISHED'}
+
+
+class AGR_OT_export_fbx_checked(Operator):
+    """Экспорт FBX с проверкой: сначала «Проверить перед сдачей», и только
+если проблем нет — обычный диалог экспорта"""
+    bl_idname = "agr.export_fbx_checked"
+    bl_label = "AGR: экспорт FBX (с проверкой)"
+    # opens a file dialog and writes a file - REGISTER without UNDO
+    bl_options = {'REGISTER'}
+
+    force: BoolProperty(
+        name="Экспортировать всё равно",
+        description="Не блокировать экспорт при найденных проблемах",
+        default=False, options={'SKIP_SAVE'})
+
+    def execute(self, context):
+        problems = _precheck_problems(context.scene)
+        _PRECHECK_LAST["problems"] = problems
+        _PRECHECK_LAST["checked"] = sum(1 for o in context.scene.objects
+                                        if o.type == 'MESH')
+        if problems and not self.force:
+            level, msg = _precheck_message(problems, _PRECHECK_LAST["checked"])
+            agr_report(self, 'ERROR', msg.replace("⚠️", "❌", 1)
+                       + " | экспорт отменён, исправьте или включите "
+                         "«Экспортировать всё равно»")
+            for name, reason in problems:
+                print(f"❌ AGR precheck | {name}: {reason}")
+            return {'CANCELLED'}
+        return bpy.ops.export_scene.fbx('INVOKE_DEFAULT')
+
+
 @bpy.app.handlers.persistent
 def _link_save_pre(_dummy):
     """Repack the mirrors of stale containers right before the file is
@@ -3897,7 +4616,7 @@ def _link_save_pre(_dummy):
         return   # nothing is remembered: switching it back on catches up
 
     done = 0
-    left, failed = [], []
+    left, failed, editing = [], [], []
     aux_done, aux_failed = 0, []
     for obj in bpy.data.objects:
         if obj.type != 'MESH' or obj.library is not None:
@@ -3906,7 +4625,14 @@ def _link_save_pre(_dummy):
         if mesh is None or mesh.library is not None:
             continue
         if mesh.is_editmode:
-            continue   # pre-edit snapshot - see _refresh_container
+            # pre-edit snapshot - see _refresh_container.  Silence here was
+            # its own trap: an export made straight from Edit Mode writes
+            # the EDITED geometry with the OLD layers, so the receiver gets
+            # a container whose memory describes a mesh that no longer
+            # exists - and the save that should have caught it said nothing.
+            if _has_link_data(obj) or _has_aux_data(obj):
+                editing.append(obj.name)
+            continue
         # UDIM/atlas records ride on ANY mesh, container or not - sync them
         # before the link-only filter below can skip the object
         try:
@@ -3980,6 +4706,12 @@ def _link_save_pre(_dummy):
                    f"⚠️ AGR: записи UDIM/атласов НЕ перепакованы ({len(aux_failed)}) — "
                    "FBX уедет без них: " + ", ".join(sorted(aux_failed)[:5])
                    + ("…" if len(aux_failed) > 5 else ""))
+    if editing:
+        agr_report(None, 'WARNING',
+                   f"⚠️ AGR: память НЕ обновлена у объектов в Edit Mode ({len(editing)}) — "
+                   "выйдите в Object Mode и сохраните ещё раз: "
+                   + ", ".join(sorted(editing)[:5])
+                   + ("…" if len(editing) > 5 else ""))
 
 
 def _clear_caches():
@@ -3987,12 +4719,28 @@ def _clear_caches():
     as unregister(): a dev reload keeps these dicts alive across the module
     swap while the datablocks they describe may already be gone, and
     enumerating them inline is exactly what let one be forgotten before."""
-    global _WATCH_LAST_FP, _UI_SYNC_LAST
+    global _WATCH_LAST_FP, _WATCH_PRE_FP, _UI_SYNC_LAST
     _NO_AUTOSYNC.clear()
     _TABLE_CACHE.clear()
     _MERGED_CACHE.clear()
+    _PRECHECK_LAST["problems"] = []
+    _PRECHECK_LAST["checked"] = 0
     _WATCH_LAST_FP = None
+    _WATCH_PRE_FP = None
     _UI_SYNC_LAST = 0.0
+    for store in registered_stores():
+        store.invalidate()
+
+
+@bpy.app.handlers.persistent
+def _link_load_post(_dummy):
+    """File > Open / New wipes the datablocks the caches describe, but the
+    caches are keyed on OBJECT NAMES - and names repeat constantly in this
+    pipeline (every project has its own "Flora").  A new file with a
+    same-named object used to be served the previous file's table, and a
+    cached None made link_strip skip an object that really did carry a
+    record.  Every store's peek cache goes with them."""
+    _clear_caches()
 
 
 classes = (
@@ -4014,6 +4762,8 @@ classes = (
     AGR_OT_link_watch_apply,
     AGR_OT_link_watch_rename,
     AGR_OT_link_refresh,
+    AGR_OT_link_precheck,
+    AGR_OT_export_fbx_checked,
     AGR_OT_link_strip,
     AGR_PT_LinkPanel,
     AGR_PT_LinkWatchPanel,
@@ -4053,10 +4803,13 @@ def register():
     bpy.app.handlers.depsgraph_update_post.append(_link_ui_sync)
     _drop_stale_handlers(bpy.app.handlers.save_pre, "_link_save_pre")
     bpy.app.handlers.save_pre.append(_link_save_pre)
+    _drop_stale_handlers(bpy.app.handlers.load_post, "_link_load_post")
+    bpy.app.handlers.load_post.append(_link_load_post)
     print("✅ AGR Link operators registered")
 
 
 def unregister():
+    _drop_stale_handlers(bpy.app.handlers.load_post, "_link_load_post")
     _drop_stale_handlers(bpy.app.handlers.save_pre, "_link_save_pre")
     _drop_stale_handlers(bpy.app.handlers.depsgraph_update_post, "_link_ui_sync")
     _drop_stale_handlers(bpy.app.handlers.depsgraph_update_post, "_link_depsgraph_post")
@@ -4067,5 +4820,4 @@ def unregister():
                  "agr_link_watch_groups_index", "agr_link_watch_enabled"):
         if hasattr(bpy.types.Scene, prop):
             delattr(bpy.types.Scene, prop)
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    unregister_classes(classes)  # idempotent: survives a half-registered module (R-glue-4)

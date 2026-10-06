@@ -171,30 +171,61 @@ def drop_orphan_loop_index(mesh):
         mesh.attributes.remove(attr)
 
 
-def _neighbors_raw_readable(mesh, exclude):
-    """True when every OTHER namespace's mirror on this mesh (if any) still
-    parses RAW from loop 0 for the current loop count.  The loop-index
-    layer is SHARED: while a neighbor's blob is permuted (triangulating
-    FBX import), rewriting the layer to identity would destroy the only
-    map that can still rescue it - reproduced on the real Salarevo file,
-    where the atlas repack ran first and beheaded the link rescue.  A
-    fresh blob never needs the map (it reads raw from loop 0), so packing
-    with a preserved permuted map is always safe.
+def registered_stores():
+    """Every namespace registered in this session, deduplicated by PREFIX
+    (a dev reload constructs new store objects over the same prefixes).
+    Callers that must touch layers of namespaces they do not import
+    themselves — the delivery strip, the container disassembly — go
+    through this instead of reaching into the registry list."""
+    out, seen = [], set()
+    for store in _STORE_REGISTRY:
+        if store.prefix in seen:
+            continue
+        seen.add(store.prefix)
+        out.append(store)
+    return out
+
+
+def map_still_needed(mesh, exclude=None):
+    """True when some OTHER namespace's mirror on this mesh can be read
+    ONLY through the CURRENT loop-index layer — then that layer must be
+    preserved exactly as it is, permutation and all.
+
+    The question is "does anybody still NEED the map", not "does every
+    neighbour read raw from loop 0" (the gate this replaces).  A
+    neighbour's blob that rides at a loop OFFSET — the UDIM/atlas record
+    of an object a plain Blender join merged in, or a second container
+    after Ctrl+J — never parses raw from loop 0, so the old gate never
+    opened: the shared layer stayed the concatenation of the members'
+    maps (plus the zero-fill of foreign geometry) FOREVER.  Inside the
+    .blend everything still read raw, the panel was green and the save
+    autosync reported success, while an FBX export with "Triangulate
+    Faces" scrambled the loops and the rescue then ran on that garbage map
+    and refused — table, coordinates and every record lost in silence
+    (reproduced on the Salarevo delivery).  A namespace the RAW window
+    scan can still find needs no map at all; only one readable exclusively
+    through the rescue does.
 
     A namespace is its PREFIX, not a store instance: dev reloads and test
-    doubles register several stores over one prefix, and any one of them
-    parsing the header proves the namespace readable."""
+    doubles register several stores over one prefix, and they all see the
+    same layers."""
     n_loops = len(mesh.loops)
-    by_prefix = {}
+    seen = set()
     for store in _STORE_REGISTRY:
-        if store.prefix == exclude.prefix:
+        if exclude is not None and store.prefix == exclude.prefix:
             continue
-        if not store.color_names(mesh):
+        if store.prefix in seen or not store.color_names(mesh):
             continue
+        seen.add(store.prefix)
         head = store.peek_frame_header(mesh)
-        ok = head is not None and (head[2] is None or head[2] == n_loops)
-        by_prefix[store.prefix] = by_prefix.get(store.prefix, False) or ok
-    return all(by_prefix.values())
+        if head is not None and (head[2] is None or head[2] == n_loops):
+            continue                    # parses raw from loop 0
+        if store.scan_windows(mesh):
+            continue                    # raw windows (plain join) — no map needed
+        wins, ridx = store.scan_windows_ex(mesh)
+        if wins and ridx is not None:
+            return True                 # readable ONLY through the current map
+    return False
 
 
 class ColorBlobStore:
@@ -386,6 +417,14 @@ class ColorBlobStore:
         k = -(-len(blob) // per_attr)
         if k > self.max_attrs:
             return False
+        if len(payload) > MAX_PAYLOAD:
+            # the READER refuses any frame whose length field exceeds this
+            # bound (_parse_header), so packing one would produce a mirror
+            # that is written "successfully" and can never be read back:
+            # peek_frame_header None, verify_frame False, panel BROKEN, the
+            # autosync repacking it in vain on every save.  Refuse BEFORE
+            # the old mirror is removed, exactly like the capacity guard.
+            return False
         with preserve_active_color(mesh):
             for name in self.color_names(mesh):
                 attr = mesh.attributes.get(name)
@@ -405,7 +444,7 @@ class ColorBlobStore:
             # namespace's mirror only reads through it, the identity write
             # would kill that rescue - our own fresh blob reads raw from
             # loop 0 and does not care what the layer holds.
-            if loop_index_array(mesh) is None or _neighbors_raw_readable(mesh, self):
+            if loop_index_array(mesh) is None or not map_still_needed(mesh, self):
                 write_loop_index(mesh)
         return True
 
@@ -721,15 +760,18 @@ class ColorBlobStore:
         """Fresh, mutation-safe parse of the record (or None).  Falls back
         to the color-encoded record (fresh FBX import with default
         settings — no idprop yet), and then to the first window found by
-        scan_windows() — a plain Blender join into a non-carrier active
+        scan_windows_ex() — a plain Blender join into a non-carrier active
         object keeps the mirror alive at a non-zero loop offset while the
-        idprop dies with the carrier.  Operators use this; poll/draw must
-        use the cached peek()."""
+        idprop dies with the carrier.  _ex, not the raw scan: after a
+        triangulating export that offset window is ALSO permuted, and the
+        raw scan then finds nothing while the loop-index rescue reads it
+        (decode_colors only rescues a blob that starts at loop 0).
+        Operators use this; poll/draw must use the cached peek()."""
         record = self.parse_idprop(obj.get(self.prop_key))
         if record is None and getattr(obj, "type", None) == 'MESH':
             record = self.decode_colors(obj.data)
             if record is None:
-                wins = self.scan_windows(obj.data)
+                wins, _ridx = self.scan_windows_ex(obj.data)
                 record = wins[0][2] if wins else None
         return record
 
@@ -780,8 +822,10 @@ class ColorBlobStore:
             return cached[1]
         record = self.decode_colors(data)
         if record is None:
-            # mirror buried at a loop offset by a plain Blender join
-            wins = self.scan_windows(data)
+            # mirror buried at a loop offset by a plain Blender join (and
+            # possibly permuted on top of that by a triangulating export -
+            # hence _ex, whose rescue is the only reader left there)
+            wins, _ridx = self.scan_windows_ex(data)
             record = wins[0][2] if wins else None
         self.cache[obj.name] = (fingerprint, record)
         return record

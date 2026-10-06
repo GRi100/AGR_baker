@@ -2751,6 +2751,689 @@ scene.agr_link_watch_colls.clear()
 scene.agr_link_groups.clear()
 
 # ---------------------------------------------------------------------------
+UDIM_REC = {"object_name": "Carrier", "address": "Addr", "obj_type": "Ground",
+            "udim_tiles": [{"udim_number": 1001, "material_index": 0,
+                            "material_name": "M_Addr_Ground_1",
+                            "set_name": "S_Wall"}]}
+
+
+def atlas_rec(name="A_Test", material="M_Addr_Ground_1"):
+    return {"version": 1,
+            "atlases": [{"atlas_name": name, "atlas_type": "HIGH",
+                         "atlas_size": 1024, "material_name": material,
+                         "bin": 0, "folder": "//AGR_BAKE/" + name,
+                         "created_atlases": {}, "layout": []}]}
+
+
+def fbx_tri_roundtrip(cont, tag):
+    """The DELIVERY export: default settings + «Triangulate Faces», which
+    permutes and duplicates loops."""
+    path = os.path.join(bpy.app.tempdir, f"agr_link_{tag}.fbx")
+    select_only([cont], cont)
+    bpy.ops.export_scene.fbx(filepath=path, use_selection=True, use_triangles=True)
+    reset_scene()
+    bpy.ops.import_scene.fbx(filepath=path)
+    return next((o for o in bpy.data.objects
+                 if o.type == 'MESH' and linkmod.is_container(o)), None)
+
+
+print("\n=== 85. Запись UDIM на ВЛИТОМ члене больше не убивает память в tri-FBX ===")
+# The shared AGR_LoopIdx map is rewritten to the identity only when nobody
+# needs it any more.  A merged-in member's UDIM record rides at a loop
+# OFFSET and never read raw from loop 0, so the old gate never opened: the
+# map stayed garbage, the .blend looked healthy (panel OK, autosync
+# "success") and the delivery FBX with Triangulate Faces arrived with NO
+# memory at all - table, coordinates and records gone (Salarevo).
+reset_scene()
+mesh_a = make_cube_mesh("MeshA")
+a1 = add_obj("A1", mesh_a, TRS((0, 0, 0)))
+a2 = add_obj("A2", mesh_a, TRS((4, 0, 0), rot=(0, 0, 30)))
+a3 = add_obj("A3", mesh_a, TRS((8, 1, 2), scale=(1, 2, 1)))
+u1 = add_obj("U1", make_cube_mesh("MeshU"), TRS((0, 6, 0)))
+orig = {o.name: o.matrix_world.copy() for o in (a1, a2, a3, u1)}
+check("member-rec: UDIM record on a NON-active member",
+      UDIM_STORE.write(a2, UDIM_REC) is True)
+check("member-rec: atlas record on the future container",
+      ATLAS_STORE.write(a1, atlas_rec("A_Cont")) is True)
+select_only([a1, a2, a3, u1], a1)
+check("member-rec: join FINISHED", bpy.ops.agr.link_join() == {'FINISHED'})
+cont = bpy.data.objects["A1"]
+check("member-rec: the member's UDIM mirror was dropped from the container",
+      cont.data.attributes.get("AGR_UDIM_T0") is None,
+      str([a.name for a in cont.data.attributes if a.name.startswith("AGR_UDIM")]))
+check("member-rec: the container's own atlas record survived",
+      ATLAS_STORE.read(cont) == atlas_rec("A_Cont"))
+check("member-rec: the shared map is canonical right after the join",
+      loop_index_is_canonical(cont.data))
+tbl85 = linkmod.read_table(cont)
+check("member-rec: the UDIM record travelled into the table props",
+      any("agr_udim_data" in inst.get("props", {})
+          for inst in tbl85["instances"].values()))
+bpy.ops.wm.save_as_mainfile(filepath=save_path, copy=True)
+check("member-rec: still canonical after the autosync",
+      loop_index_is_canonical(cont.data))
+cont85 = fbx_tri_roundtrip(cont, "member_rec")
+check("member-rec: container recognised after the triangulated FBX",
+      cont85 is not None)
+table85 = linkmod.read_table(cont85) if cont85 else None
+check("member-rec: the table survived",
+      table85 is not None and len(table85["instances"]) == 4,
+      str(None if table85 is None else len(table85["instances"])))
+check("member-rec: the atlas record survived too",
+      cont85 is not None and ATLAS_STORE.read(cont85) == atlas_rec("A_Cont"))
+if cont85 is not None:
+    select_only([cont85], cont85)
+    check("member-rec: separate FINISHED",
+          bpy.ops.agr.link_separate_all() == {'FINISHED'})
+restored85 = {o.name: o for o in bpy.data.objects if o.type == 'MESH'}
+check("member-rec: all four restored", set(restored85) >= {"A1", "A2", "A3", "U1"},
+      str(sorted(restored85)))
+for name in ("A1", "A2", "A3", "U1"):
+    check(f"member-rec: {name} matrix",
+          name in restored85 and mat_close(restored85[name].matrix_world,
+                                           orig[name], tol=1e-3))
+check("member-rec: the member's UDIM record came back with it",
+      "A2" in restored85 and UDIM_STORE.read(restored85["A2"]) == UDIM_REC)
+check("member-rec: and got a real color mirror, not an inherited slice",
+      "A2" in restored85
+      and UDIM_STORE.decode_colors(restored85["A2"].data) == UDIM_REC)
+
+print("\n--- 85b. Запись ВЛИТОГО КОНТЕЙНЕРА усыновляется, а не выбрасывается ---")
+# A plain member's record rides back in the table props; a merged-in
+# CONTAINER's own record lives on the object the join deletes, and the
+# table copies its INSTANCES, not its properties - so its window is the
+# only copy and must be adopted instead of dropped.
+reset_scene()
+mesh_p = make_cube_mesh("MeshP")
+mesh_q = make_cube_mesh("MeshQ")
+ps = [add_obj(f"P{i+1}", mesh_p, T(i * 3, 0, 0)) for i in range(2)]
+qs = [add_obj(f"Q{i+1}", mesh_q, T(i * 3, 8, 0)) for i in range(2)]
+select_only(ps, ps[0])
+bpy.ops.agr.link_join()
+select_only(qs, qs[0])
+bpy.ops.agr.link_join()
+cont_p, cont_q = bpy.data.objects["P1"], bpy.data.objects["Q1"]
+UDIM_STORE.write(cont_q, UDIM_REC)          # record on the container to be merged
+select_only([cont_q, cont_p], cont_p)
+check("merged-cont: join FINISHED", bpy.ops.agr.link_join() == {'FINISHED'})
+check("merged-cont: its record was adopted, not lost",
+      UDIM_STORE.read(cont_p) == UDIM_REC)
+check("merged-cont: and the shared map is still canonical",
+      loop_index_is_canonical(cont_p.data))
+
+print("\n--- 85c. Записи БЕЗ idprop (обычное состояние после FBX) не выбрасываются ---")
+# A default FBX import leaves the atlas/UDIM record in the color mirror ONLY -
+# no reader ever materialises the idprop.  _capture_props reads obj.keys(), so
+# such a record had no copy in the table, and the join dropped its mirror as an
+# "orphan window": the ACTIVE carrier lost its own record outright and a
+# member's never came back from a disassembly.
+def _colors_only(obj, store, rec):
+    """the state a default FBX import leaves behind"""
+    assert store.write(obj, rec) is True
+    obj.pop(store.prop_key, None)
+    store.invalidate(obj.name)
+
+
+reset_scene()
+co_a = add_obj("Ground", make_cube_mesh("MeshCoA"), T(0, 0, 0))
+co_b = add_obj("Bush", make_cube_mesh("MeshCoB"), T(3, 0, 0))
+_colors_only(co_a, ATLAS_STORE, atlas_rec("A_Ground"))
+_colors_only(co_b, UDIM_STORE, UDIM_REC)
+check("colors-only: precondition - no idprops, records read from colors",
+      co_a.get("agr_atlas_data") is None and co_b.get("agr_udim_data") is None
+      and ATLAS_STORE.read(co_a) == atlas_rec("A_Ground")
+      and UDIM_STORE.read(co_b) == UDIM_REC)
+select_only([co_a, co_b], co_a)
+check("colors-only: join FINISHED", bpy.ops.agr.link_join() == {'FINISHED'})
+cont85c = bpy.data.objects["Ground"]
+check("colors-only: the ACTIVE's own atlas record survived the join",
+      ATLAS_STORE.read(cont85c) == atlas_rec("A_Ground"),
+      str(ATLAS_STORE.read(cont85c)))
+tbl85c = linkmod.read_table(cont85c)
+check("colors-only: the MEMBER's UDIM record travelled into the table props",
+      any("agr_udim_data" in inst.get("props", {})
+          for inst in tbl85c["instances"].values()))
+for _me in list(bpy.data.meshes):
+    if _me.users == 0:
+        bpy.data.meshes.remove(_me)      # = save/reload: the originals are gone
+select_only([cont85c], cont85c)
+check("colors-only: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+b85c = bpy.data.objects.get("Bush")
+check("colors-only: the member got its UDIM record back",
+      b85c is not None and UDIM_STORE.read(b85c) == UDIM_REC,
+      str(None if b85c is None else UDIM_STORE.read(b85c)))
+
+print("\n--- 85d. То же через РЕАЛЬНЫЙ FBX-раундтрип (без Custom Properties) ---")
+reset_scene()
+fa = add_obj("Ground", make_cube_mesh("MeshFbxA"), T(0, 0, 0))
+fb = add_obj("Bush", make_cube_mesh("MeshFbxB"), T(3, 0, 0))
+ATLAS_STORE.write(fa, atlas_rec("A_Ground"))
+UDIM_STORE.write(fb, UDIM_REC)
+_fbx85 = os.path.join(bpy.app.tempdir, "agr_link_colors_only.fbx")
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.export_scene.fbx(filepath=_fbx85, use_selection=True)
+reset_scene()
+bpy.ops.import_scene.fbx(filepath=_fbx85)
+fa = bpy.data.objects.get("Ground")
+fb = bpy.data.objects.get("Bush")
+check("fbx colors-only: imported without idprops, records still read",
+      fa is not None and fb is not None
+      and fa.get("agr_atlas_data") is None and fb.get("agr_udim_data") is None
+      and ATLAS_STORE.read(fa) == atlas_rec("A_Ground")
+      and UDIM_STORE.read(fb) == UDIM_REC)
+if fa is not None and fb is not None:
+    select_only([fa, fb], fa)
+    check("fbx colors-only: join FINISHED", bpy.ops.agr.link_join() == {'FINISHED'})
+    cont85d = bpy.data.objects["Ground"]
+    check("fbx colors-only: the active's atlas record survived",
+          ATLAS_STORE.read(cont85d) == atlas_rec("A_Ground"),
+          str(ATLAS_STORE.read(cont85d)))
+    for _me in list(bpy.data.meshes):
+        if _me.users == 0:
+            bpy.data.meshes.remove(_me)
+    select_only([cont85d], cont85d)
+    check("fbx colors-only: separate FINISHED",
+          bpy.ops.agr.link_separate_all() == {'FINISHED'})
+    b85d = bpy.data.objects.get("Bush")
+    check("fbx colors-only: the member's UDIM record came back",
+          b85d is not None and UDIM_STORE.read(b85d) == UDIM_REC,
+          str(None if b85d is None else UDIM_STORE.read(b85d)))
+
+print("\n--- 85e. Запись линкованного твина не копируется на соседа по мешу ---")
+# the mirror lives on the MESH, so linked twins share it: materialising a
+# colors-only record must not copy a twin's record onto the object next to it
+reset_scene()
+mesh85e = make_cube_mesh("MeshTwin85")
+tw1 = add_obj("Tw1", mesh85e, T(0, 0, 0))
+tw2 = add_obj("Tw2", mesh85e, T(3, 0, 0))
+UDIM_STORE.write(tw2, UDIM_REC)        # idprop on tw2, mirror on the SHARED mesh
+select_only([tw1, tw2], tw1)
+check("twin-rec: join FINISHED", bpy.ops.agr.link_join() == {'FINISHED'})
+cont85e = bpy.data.objects["Tw1"]
+check("twin-rec: the container did NOT adopt the twin's record",
+      cont85e.get("agr_udim_data") is None
+      and cont85e.data.attributes.get("AGR_UDIM_T0") is None,
+      str(linkmod._agr_service_layers(cont85e.data)))
+tbl85e = linkmod.read_table(cont85e)
+check("twin-rec: it rode into the props of ITS OWN instance",
+      [inst.get("name") for inst in tbl85e["instances"].values()
+       if "agr_udim_data" in inst.get("props", {})] == ["Tw2"],
+      str([(i.get("name"), sorted(i.get("props", {})))
+           for i in tbl85e["instances"].values()]))
+
+print("\n=== 86. Обычный Ctrl+J двух контейнеров с записями + tri-FBX ===")
+reset_scene()
+mesh_c = make_cube_mesh("MeshC")
+mesh_d = make_cube_mesh("MeshD")
+ca_objs = [add_obj(f"C{i+1}", mesh_c, TRS((i * 4, 0, 0), rot=(0, 0, 20 * i)))
+           for i in range(3)]
+cb_objs = [add_obj(f"D{i+1}", mesh_d, TRS((i * 4, 30, 0))) for i in range(2)]
+orig86 = {o.name: o.matrix_world.copy() for o in ca_objs + cb_objs}
+select_only(ca_objs, ca_objs[0])
+bpy.ops.agr.link_join()
+select_only(cb_objs, cb_objs[0])
+bpy.ops.agr.link_join()
+ca, cb = bpy.data.objects["C1"], bpy.data.objects["D1"]
+ATLAS_STORE.write(ca, atlas_rec("A_CA"))
+UDIM_STORE.write(cb, UDIM_REC)
+select_only([cb, ca], ca)                      # plain Blender join
+bpy.ops.object.join()
+select_only([ca], ca)
+check("ctrlj-rec: «Закрепить память» FINISHED",
+      bpy.ops.agr.link_refresh(scope='ACTIVE') == {'FINISHED'})
+check("ctrlj-rec: the map is canonical after the refresh",
+      loop_index_is_canonical(ca.data))
+check("ctrlj-rec: the container's own atlas record reads",
+      ATLAS_STORE.read(ca) == atlas_rec("A_CA"))
+check("ctrlj-rec: the orphaned UDIM window was adopted, not lost",
+      UDIM_STORE.read(ca) == UDIM_REC)
+cont86 = fbx_tri_roundtrip(ca, "ctrlj_rec")
+check("ctrlj-rec: container recognised after the triangulated FBX",
+      cont86 is not None)
+table86 = linkmod.read_table(cont86) if cont86 else None
+check("ctrlj-rec: all five instances survived",
+      table86 is not None and len(table86["instances"]) == 5,
+      str(None if table86 is None else len(table86["instances"])))
+if cont86 is not None:
+    select_only([cont86], cont86)
+    check("ctrlj-rec: separate FINISHED",
+          bpy.ops.agr.link_separate_all() == {'FINISHED'})
+names86 = {o.name for o in bpy.data.objects if o.type == 'MESH'}
+check("ctrlj-rec: 5 of 5 restored", names86 >= set(orig86), str(sorted(names86)))
+
+print("\n=== 87. Эталон группы при ОБЫЧНОЙ разборке — большинство, не первый ===")
+# Instance #1 is the container's own object: its faces sit at the head of
+# the mesh and are exactly the ones a user edits.  Comparing every member
+# against that single edited chunk left all the HEALTHY copies unique.
+reset_scene()
+mesh_v = make_cube_mesh("MeshV")
+vs = [add_obj(f"V{i+1}", mesh_v, T(i * 3, 0, 0)) for i in range(4)]
+select_only(vs, vs[0])
+bpy.ops.agr.link_join()
+cont = bpy.data.objects["V1"]
+ids87 = linkmod._read_face_ids(cont.data)
+edited_id = int(ids87[0])
+delete_face(cont, 0)                       # user edits the FIRST instance
+select_only([cont], cont)
+check("vote-off: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+rest87 = [o for o in bpy.data.objects if o.type == 'MESH']
+check("vote-off: four objects back", len(rest87) == 4, str(len(rest87)))
+datas87 = {}
+for o in rest87:
+    datas87.setdefault(o.data, []).append(o.name)
+check("vote-off: 3 healthy copies share ONE datablock, the edited one is unique",
+      sorted(len(v) for v in datas87.values()) == [1, 3],
+      str({k.name: v for k, v in datas87.items()}))
+check("vote-off: the edited chunk really is the odd one",
+      any(len(v) == 1 and len(bpy.data.objects[v[0]].data.polygons) == 5
+          for v in datas87.values()), str(edited_id))
+
+print("\n=== 88. Разборка распаковывает зеркало и при удалённых co/orig ===")
+# The neighbouring paths test all THREE tracking attributes; this one
+# tested only agr_link_id, so a container with co/orig deleted fell back to
+# the STORED matrix: after a move + Apply Transform the pieces came back
+# tens of metres off, linking lost, panel green.
+reset_scene()
+mesh_w = make_cube_mesh("MeshW")
+ws = [add_obj("W1", mesh_w, TRS((0, 0, 0))),
+      add_obj("W2", mesh_w, TRS((3, 0, 0), rot=(0, 0, 45))),
+      add_obj("W3", mesh_w, TRS((6, 1, 0), scale=(2, 2, 2)))]
+orig88 = {o.name: o.matrix_world.copy() for o in ws}
+select_only(ws, ws[0])
+bpy.ops.agr.link_join()
+cont = bpy.data.objects["W1"]
+for name in (linkmod.CO_ATTR, linkmod.ORIG_ATTR):
+    cont.data.attributes.remove(cont.data.attributes[name])
+cont.matrix_world = T(10, 0, 0) @ cont.matrix_world
+select_only([cont], cont)
+bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+check("nocoords-extract: separate FINISHED",
+      bpy.ops.agr.link_separate_all() == {'FINISHED'})
+rest88 = {o.name: o for o in bpy.data.objects if o.type == 'MESH'}
+for name in ("W1", "W2", "W3"):
+    check(f"nocoords-extract: {name} lands at the moved place",
+          name in rest88 and mat_close(rest88[name].matrix_world,
+                                       T(10, 0, 0) @ orig88[name], tol=1e-3),
+          "" if name not in rest88 else str(rest88[name].matrix_world.translation))
+check("nocoords-extract: linking kept",
+      len({o.data for o in rest88.values()}) == 1,
+      str(len({o.data for o in rest88.values()})))
+
+print("\n=== 89. Разборка не оставляет обрезков чужих слоёв; strip чистит по наличию ===")
+reset_scene()
+cont = build_trio()
+UDIM_STORE.write(cont, UDIM_REC)
+ATLAS_STORE.write(cont, atlas_rec("A_Trio"))
+cont89 = fbx_roundtrip(cont, "leftovers")     # colors are the only carrier
+check("leftovers: container recognised", cont89 is not None)
+if cont89 is None:                            # keep the suite reporting
+    cont89 = add_obj("A1", make_cube_mesh("MeshFallback89"))
+# the guard flag is an idprop: a default FBX leaves it behind, so it is set
+# here the way the atlas operators set it on a re-imported delivery object
+cont89["agr_atlas_applied"] = "A_Trio"
+select_only([cont89], cont89)
+check("leftovers: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+rest89 = {o.name: o for o in bpy.data.objects if o.type == 'MESH'}
+check("leftovers: three objects back", set(rest89) == {"A1", "A2", "B1"},
+      str(sorted(rest89)))
+check("leftovers: a chunk of ANOTHER group carries no AGR layers at all",
+      "B1" in rest89 and linkmod._agr_service_layers(rest89["B1"].data) == [],
+      str([] if "B1" not in rest89 else linkmod._agr_service_layers(rest89["B1"].data)))
+# F3: records written ON THE CONTAINER move to the restored namesake
+check("leftovers: the UDIM record moved to the namesake instance",
+      "A1" in rest89 and UDIM_STORE.read(rest89["A1"]) == UDIM_REC)
+check("leftovers: the atlas record moved too (mirror repacked)",
+      "A1" in rest89 and ATLAS_STORE.decode_colors(rest89["A1"].data)
+      == atlas_rec("A_Trio"))
+check("leftovers: the atlas guard flag moved with it",
+      "A1" in rest89 and rest89["A1"].get("agr_atlas_applied") == "A_Trio")
+select_only(list(rest89.values()), rest89["A1"])
+check("leftovers: strip FINISHED", bpy.ops.agr.link_strip() == {'FINISHED'})
+left89 = {o.name: linkmod._agr_service_layers(o.data) for o in rest89.values()}
+check("leftovers: not one AGR layer left anywhere",
+      all(not v for v in left89.values()), str(left89))
+check("leftovers: not one AGR idprop left anywhere",
+      all(not linkmod._agr_idprop_keys(o) and not linkmod._agr_idprop_keys(o.data)
+          for o in rest89.values()))
+fbx89 = os.path.join(bpy.app.tempdir, "agr_link_clean.fbx")
+bpy.ops.export_scene.fbx(filepath=fbx89, use_selection=True, use_triangles=True)
+reset_scene()
+bpy.ops.import_scene.fbx(filepath=fbx89)
+check("leftovers: the delivery FBX carries no AGR color attributes",
+      all(not any(a.name.startswith("AGR_") for a in o.data.attributes)
+          for o in bpy.data.objects if o.type == 'MESH'))
+
+print("\n--- 89b. Частичная разборка: prune обезглавливает зеркало записи ---")
+# The aux mirror is one run from loop 0, so extracting the group whose faces
+# sit at the HEAD of the mesh cuts the frame header off.  On a colors-only
+# carrier (default FBX import) that blob is the only copy: the captured
+# pre-cut record has to be written back over the shortened mesh.
+reset_scene()
+mesh89b = make_cube_mesh("MeshHead89")
+h1 = add_obj("H1", mesh89b, T(0, 0, 0))
+h2 = add_obj("H2", mesh89b, T(3, 0, 0))
+g1 = add_obj("G1", make_cube_mesh("MeshTail89"), T(0, 5, 0))
+select_only([h1, h2, g1], h1)
+bpy.ops.agr.link_join()
+cont89b = bpy.data.objects["H1"]
+ATLAS_STORE.write(cont89b, atlas_rec("A_Head"))
+cont89b = fbx_roundtrip(cont89b, "head_group")     # colors are the only carrier
+check("head-extract: container recognised after the FBX", cont89b is not None)
+if cont89b is not None:
+    check("head-extract: precondition - the record is colors-only",
+          cont89b.get("agr_atlas_data") is None
+          and ATLAS_STORE.read(cont89b) == atlas_rec("A_Head"))
+    tbl89b = linkmod.read_table(cont89b)
+    gid89b = next(int(inst["group"]) for inst in tbl89b["instances"].values()
+                  if inst.get("name") == "H2")
+    select_only([cont89b], cont89b)
+    check("head-extract: extract FINISHED",
+          bpy.ops.agr.link_extract_group(group_id=gid89b) == {'FINISHED'})
+    check("head-extract: the container KEPT its atlas record",
+          ATLAS_STORE.read(cont89b) == atlas_rec("A_Head"),
+          str(ATLAS_STORE.read(cont89b)))
+    check("head-extract: and it reads raw from the repacked mirror",
+          ATLAS_STORE.decode_colors(cont89b.data) == atlas_rec("A_Head"))
+
+print("\n=== 90. Записи с удаляемого контейнера: некуда перенести — остаётся husk ===")
+reset_scene()
+cont = build_trio()
+ATLAS_STORE.write(cont, atlas_rec("A_Husk"))
+cont.name = "Zzz"                     # no instance is named like the container
+select_only([cont], cont)
+check("husk: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+husk = bpy.data.objects.get("Zzz_leftover")
+check("husk: the container is kept, not deleted", husk is not None)
+check("husk: with its atlas record intact",
+      husk is not None and ATLAS_STORE.read(husk) == atlas_rec("A_Husk"))
+check("husk: and without the link table",
+      husk is not None and husk.get(linkmod.PROP_KEY) is None)
+
+print("\n=== 91. strip на Alt+D-твине не убивает память общего меша ===")
+reset_scene()
+cont = build_trio()
+twin = bpy.data.objects.new("Twin", cont.data)     # Alt+D: shared datablock
+bpy.context.scene.collection.objects.link(twin)
+select_only([twin], twin)
+check("twin-strip: refused (CANCELLED)", expect_cancel(lambda: bpy.ops.agr.link_strip()))
+check("twin-strip: the container keeps its tracking attribute",
+      cont.data.attributes.get(linkmod.ATTR_NAME) is not None)
+check("twin-strip: and its table still reads", linkmod.read_table(cont) is not None)
+select_only([cont], cont)
+check("twin-strip: stripping the CONTAINER itself works",
+      bpy.ops.agr.link_strip() == {'FINISHED'})
+
+print("\n--- 91b. Линкованные твины с записями не блокируют друг друга ---")
+# The normal result of a disassembly: one shared datablock, and EVERY member
+# gets its record back from the table props.  The guard used to see a co-owner
+# with a record and refuse - so the group could not be stripped at all and the
+# delivery file went out with the service color attributes still on it.
+reset_scene()
+mesh91b = make_cube_mesh("MeshTwins91")
+rocks = [add_obj(f"Rock{i}", mesh91b, T(3 * i, 0, 0)) for i in range(3)]
+ATLAS_STORE.write(rocks[0], atlas_rec("A_Rock"))     # mirror on the SHARED mesh
+for _o in rocks[1:]:
+    _o["agr_atlas_data"] = rocks[0]["agr_atlas_data"]
+select_only(rocks, rocks[0])
+check("twins-strip: strip of the whole group FINISHED",
+      bpy.ops.agr.link_strip() == {'FINISHED'},
+      bpy.context.window_manager.agr_last_status)
+check("twins-strip: no AGR layers left on the shared mesh",
+      linkmod._agr_service_layers(mesh91b) == [],
+      str(linkmod._agr_service_layers(mesh91b)))
+check("twins-strip: no AGR idprops left on any twin",
+      all(not linkmod._agr_idprop_keys(o) for o in rocks),
+      str([linkmod._agr_idprop_keys(o) for o in rocks]))
+
+print("\n--- 91c. Твин + контейнер вместе: чисто и БЕЗ ERROR в любом порядке ---")
+for _order in ("container_last", "container_first"):
+    reset_scene()
+    cont91 = build_trio()
+    cont91.name = "ZZ_Container"
+    twin91 = bpy.data.objects.new("AA_Twin", cont91.data)
+    bpy.context.scene.collection.objects.link(twin91)
+    if _order == "container_last":
+        # selected_objects follows the view layer, not the selection order:
+        # relinking pushes the container behind the twin
+        bpy.context.scene.collection.objects.unlink(cont91)
+        bpy.context.scene.collection.objects.link(cont91)
+    select_only([cont91, twin91], cont91)
+    check(f"twin+cont ({_order}): strip FINISHED",
+          bpy.ops.agr.link_strip() == {'FINISHED'},
+          str([o.name for o in bpy.context.selected_objects]))
+    check(f"twin+cont ({_order}): everything is clean",
+          not linkmod._has_agr_traces(cont91) and not linkmod._has_agr_traces(twin91))
+    check(f"twin+cont ({_order}): a clean result is not reported as an ERROR",
+          bpy.context.window_manager.agr_last_status_level != 'ERROR',
+          bpy.context.window_manager.agr_last_status)
+
+print("\n=== 92. strip уносит и idprop'ы меша (слежка за инстансами) ===")
+reset_scene()
+cont = build_trio()
+cont.data[linkmod.WATCH_BASE_KEY] = "Куст"
+UDIM_STORE.write(cont, UDIM_REC)
+select_only([cont], cont)
+check("strip-props: FINISHED", bpy.ops.agr.link_strip() == {'FINISHED'})
+check("strip-props: agr_instance_base gone from the mesh",
+      cont.data.get(linkmod.WATCH_BASE_KEY) is None)
+check("strip-props: no AGR idprops on the object",
+      linkmod._agr_idprop_keys(cont) == [], str(linkmod._agr_idprop_keys(cont)))
+check("strip-props: no AGR layers", linkmod._agr_service_layers(cont.data) == [])
+check("strip-props: poll now says there is nothing to strip",
+      not bpy.ops.agr.link_strip.poll())
+
+print("\n=== 93. Номер инстанса не помещается в 15 бит — честная перенумерация ===")
+# COL_ID carries the id in 15 bits and the writer used to np.clip it, so
+# everything above 32767 silently collapsed onto one instance after an FBX
+# roundtrip; next_instance only ever grows.
+reset_scene()
+cont = build_trio()
+tbl93 = linkmod.read_table(cont)
+old93 = sorted(int(k) for k in tbl93["instances"])
+check("bigid: the boundary itself is left alone",
+      linkmod._fit_instance_ids(cont.data, linkmod.read_table(cont)) is True)
+id_map93 = {old: new for old, new in zip(old93, (32766, 32767, 32768))}
+linkmod._stamp_remap(cont.data, id_map93)
+tbl93["instances"] = {str(id_map93[o]): tbl93["instances"][str(o)] for o in old93}
+tbl93["next_instance"] = 32769
+linkmod.write_table(cont, tbl93)
+check("bigid: pack still succeeds", linkmod._pack_tracking_to_colors(cont.data, tbl93))
+check("bigid: the table was renumbered into 1..N",
+      sorted(int(k) for k in tbl93["instances"]) == [1, 2, 3],
+      str(sorted(int(k) for k in tbl93["instances"])))
+linkmod.write_table(cont, tbl93)
+check("bigid: the face stamps followed",
+      sorted(set(linkmod._read_face_ids(cont.data).tolist())) == [1, 2, 3],
+      str(sorted(set(linkmod._read_face_ids(cont.data).tolist()))))
+cont93 = fbx_roundtrip(cont, "bigid")
+check("bigid: memory crosses FBX with the compacted ids", cont93 is not None)
+if cont93 is not None:
+    select_only([cont93], cont93)
+    check("bigid: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+check("bigid: all three back",
+      {o.name for o in bpy.data.objects if o.type == 'MESH'} == {"A1", "A2", "B1"})
+
+print("\n--- 93b. Перенумерация доезжает до idprop даже при провале пака ---")
+# _fit_instance_ids renumbers the table AND the face attribute INSIDE the
+# pack; when the pack then fails (capacity), an idprop left with the old
+# numbers describes instances no face carries - the container disassembles
+# into nothing, in exactly the scenario the renumbering was written for.
+reset_scene()
+cont93b = build_trio()
+tbl93b = linkmod.read_table(cont93b)
+map93b = {int(k): 40000 + i for i, k in enumerate(sorted(tbl93b["instances"], key=int), 1)}
+linkmod._stamp_remap(cont93b.data, map93b)
+tbl93b["instances"] = {str(map93b[int(k)]): v for k, v in tbl93b["instances"].items()}
+tbl93b["next_instance"] = 40004
+linkmod.write_table(cont93b, tbl93b)
+linkmod._invalidate_caches(cont93b.name)
+check("bigid-fail: ids above the ceiling in both carriers",
+      set(linkmod.read_table(cont93b)["instances"]) == {"40001", "40002", "40003"}
+      and set(np.unique(linkmod._read_face_ids(cont93b.data)).tolist())
+      == {40001, 40002, 40003})
+_max93 = linkmod._LINK_STORE.max_attrs
+linkmod._LINK_STORE.max_attrs = 0        # imitate "the blob does not fit"
+select_only([cont93b], cont93b)
+bpy.ops.agr.link_refresh(scope='ACTIVE')
+linkmod._LINK_STORE.max_attrs = _max93
+_idp93 = {int(i) for i in linkmod._parse_table(cont93b.get(linkmod.PROP_KEY))["instances"]}
+_face93 = set(np.unique(linkmod._read_face_ids(cont93b.data)).tolist())
+check("bigid-fail: idprop ids and face ids still agree", _idp93 == _face93,
+      f"{sorted(_idp93)} vs {sorted(_face93)}")
+select_only([cont93b], cont93b)
+check("bigid-fail: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+check("bigid-fail: all three objects are back",
+      {o.name for o in bpy.data.objects if o.type == 'MESH'} == {"A1", "A2", "B1"},
+      str(sorted(o.name for o in bpy.data.objects if o.type == 'MESH')))
+
+print("\n=== 94. «Проверить перед сдачей» ===")
+reset_scene()
+cont = build_trio()
+check("precheck: a healthy scene passes",
+      bpy.ops.agr.link_precheck() == {'FINISHED'},
+      str(linkmod._PRECHECK_LAST["problems"]))
+delete_face(cont, 0)                       # decapitates the mirror
+check("precheck: a broken container is reported",
+      expect_cancel(lambda: bpy.ops.agr.link_precheck()))
+check("precheck: and named in the result",
+      any(name == cont.name for name, _r in linkmod._PRECHECK_LAST["problems"]),
+      str(linkmod._PRECHECK_LAST["problems"]))
+check("precheck: the checked export refuses to run",
+      expect_cancel(lambda: bpy.ops.agr.export_fbx_checked()))
+select_only([cont], cont)
+bpy.ops.agr.link_refresh(scope='ACTIVE')
+check("precheck: clean again after «Закрепить память»",
+      bpy.ops.agr.link_precheck() == {'FINISHED'},
+      str(linkmod._PRECHECK_LAST["problems"]))
+# leftovers on an object that carries no record at all
+plain94 = add_obj("Plain94", make_cube_mesh("MeshPlain94"), T(0, -9, 0))
+with_ = plain94.data.color_attributes.new(name="AGR_UDIM_T0", type='FLOAT_COLOR',
+                                          domain='CORNER')
+check("precheck: service-layer leftovers are reported too",
+      expect_cancel(lambda: bpy.ops.agr.link_precheck())
+      and any(name == "Plain94" for name, _r in linkmod._PRECHECK_LAST["problems"]),
+      str(linkmod._PRECHECK_LAST["problems"]))
+
+print("\n=== 95. Слежка: авто-прогон уходит в таймер и зовётся с undo=True ===")
+# The undo STEP itself cannot be observed in background (ed.undo.poll()
+# is False there), so the test pins down what the code controls: the
+# rename goes through a deferred OPERATOR call and that call passes the
+# undo flag - without it WM_operator_call_py suppresses ED_undo_push_op
+# and the rename stays outside undo exactly as the depsgraph handler did.
+# GUI checklist: Alt+D a copy into a watched collection -> Edit > Undo
+# History shows "Применить схему имён", and Ctrl+Z on it is NOT undone
+# again by the next tick (see _WATCH_PRE_FP).
+reset_scene()
+scene = bpy.context.scene
+coll95 = bpy.data.collections.new("Watch95")
+scene.collection.children.link(coll95)
+mesh95 = make_cube_mesh("MeshWatch95")
+w1 = add_obj("Ель", mesh95, T(0, 0, 0), coll=coll95)
+w2 = add_obj("Ель.001", mesh95, T(3, 0, 0), coll=coll95)
+item = scene.agr_link_watch_colls.add()
+item.collection = coll95
+scene.agr_link_watch_enabled = True
+linkmod._WATCH_LAST_FP = None
+linkmod._WATCH_PENDING = False
+linkmod._watch_tick(scene)
+check("watch-timer: the tick did NOT rename from the depsgraph handler",
+      {w1.name, w2.name} == {"Ель", "Ель.001"}, str({w1.name, w2.name}))
+check("watch-timer: it scheduled the operator instead", linkmod._WATCH_PENDING)
+linkmod._watch_deferred_apply()
+check("watch-timer: the deferred operator applied the scheme",
+      {w1.name, w2.name} == {"Ель_001", "Ель_002"}, str({w1.name, w2.name}))
+check("watch-timer: the pending flag is cleared", not linkmod._WATCH_PENDING)
+# the operator call itself: 'INVOKE_DEFAULT' + undo=True as positionals
+import types as _types  # noqa: E402
+
+
+class _OpsRecorder:
+    def __init__(self):
+        self.calls = []
+
+    def poll(self):
+        return True
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return {'FINISHED'}
+
+
+_rec95 = _OpsRecorder()
+_bpy95 = linkmod.bpy
+linkmod.bpy = _types.SimpleNamespace(
+    ops=_types.SimpleNamespace(agr=_types.SimpleNamespace(link_watch_apply=_rec95)))
+try:
+    linkmod._watch_deferred_apply()
+finally:
+    linkmod.bpy = _bpy95
+check("watch-timer: the deferred call asks for an undo step",
+      _rec95.calls == [(('INVOKE_DEFAULT', True), {})], str(_rec95.calls))
+# a Ctrl+Z lands back on the state the apply started from: the next tick must
+# NOT rename again (that is what made undo unusable before)
+_pre95 = linkmod._WATCH_PRE_FP
+check("watch-timer: the pre-apply state was remembered", _pre95 is not None)
+w1.name, w2.name = "Ель", "Ель.001"          # = the undo
+linkmod._WATCH_PENDING = False
+linkmod._watch_tick(scene)
+check("watch-timer: an undo of the rename is not immediately re-applied",
+      not linkmod._WATCH_PENDING and {w1.name, w2.name} == {"Ель", "Ель.001"},
+      f"{linkmod._WATCH_PENDING} {w1.name} {w2.name}")
+# any OTHER change moves the fingerprint off the remembered one and the
+# scheme is applied again as usual
+mesh95[linkmod.WATCH_BASE_KEY] = "Ель"   # pin the base: the rename below
+w2.name = "Ёлка"                         # would otherwise re-derive it
+linkmod._watch_tick(scene)
+check("watch-timer: a real change still schedules the apply", linkmod._WATCH_PENDING)
+linkmod._watch_deferred_apply()
+check("watch-timer: and the scheme is applied again",
+      {w1.name, w2.name} == {"Ель_001", "Ель_002"}, str({w1.name, w2.name}))
+# renamed is counted only for members that really got the wanted name
+foreign95 = add_obj("Сосна_001", make_cube_mesh("MeshForeign95"), T(0, 9, 0))
+mesh95[linkmod.WATCH_BASE_KEY] = "Сосна"
+renamed95, conflicts95 = linkmod._watch_apply(scene)
+check("watch-timer: a name held by a foreign object is a conflict, not a rename",
+      len(conflicts95) == 1 and renamed95 == 1, f"{renamed95}, {conflicts95}")
+check("watch-timer: the foreign object is untouched", foreign95.name == "Сосна_001")
+scene.agr_link_watch_colls.clear()
+scene.agr_link_watch_enabled = False
+
+print("\n=== 96. Разборка воссоздаёт коллекции из памяти (сдача в чистом файле) ===")
+reset_scene()
+coll_a = bpy.data.collections.new("Флора")
+bpy.context.scene.collection.children.link(coll_a)
+mesh_f = make_cube_mesh("MeshF")
+fs = [add_obj(f"F{i+1}", mesh_f, T(i * 3, 0, 0), coll=coll_a) for i in range(2)]
+select_only(fs, fs[0])
+bpy.ops.agr.link_join()
+cont96 = fbx_roundtrip(bpy.data.objects["F1"], "colls")   # clean file, no collections
+check("colls: container recognised", cont96 is not None)
+check("colls: the collection really is gone", bpy.data.collections.get("Флора") is None)
+if cont96 is not None:
+    select_only([cont96], cont96)
+    check("colls: separate FINISHED", bpy.ops.agr.link_separate_all() == {'FINISHED'})
+coll96 = bpy.data.collections.get("Флора")
+check("colls: the collection was re-created", coll96 is not None)
+check("colls: and the restored objects live in it",
+      coll96 is not None and {o.name for o in coll96.objects} == {"F1", "F2"},
+      str([] if coll96 is None else sorted(o.name for o in coll96.objects)))
+
+print("\n=== 97. File → Open сбрасывает кеши (одноимённый объект в новом файле) ===")
+reset_scene()
+ghost = add_obj("Ghost", make_cube_mesh("MeshGhost"))
+rec_old = atlas_rec("A_Old")
+ATLAS_STORE.write(ghost, rec_old)
+ghost.pop("agr_atlas_data", None)          # colors-only carrier: peek keys on the mesh
+check("loadpost: the old record is cached", ATLAS_STORE.peek(ghost) == rec_old)
+bpy.ops.wm.read_homefile(use_empty=True)
+ghost2 = add_obj("Ghost", make_cube_mesh("MeshGhost"))
+rec_new = atlas_rec("A_New")
+ATLAS_STORE.write(ghost2, rec_new)
+ghost2.pop("agr_atlas_data", None)
+check("loadpost: the NEW file's record is served, not the cached one",
+      ATLAS_STORE.peek(ghost2) == rec_new, str(ATLAS_STORE.peek(ghost2)))
+
+# ---------------------------------------------------------------------------
 print("\n" + "=" * 60)
 if FAILS:
     print(f"❌ {len(FAILS)} FAILED:")
