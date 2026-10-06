@@ -128,11 +128,15 @@ def unregister_classes(classes):
     module's unregister(), whose bare loop hit the FIRST never-registered
     class and raised — so the classes that WERE registered stayed, and the
     next enable died with "already registered".  `is_registered` makes the
-    unwind idempotent; the default True keeps a stub class without the
-    attribute behaving exactly as before.
+    unwind idempotent.  Types without the _RNAMeta metaclass (Macro, Gizmo)
+    lack that property — for them the same test is spelled out:
+    `"bl_rna" in cls.__dict__` is exactly what _RNAMeta.is_registered checks.
     """
     for cls in reversed(classes):
-        if not getattr(cls, "is_registered", True):
+        registered = getattr(cls, "is_registered", None)
+        if registered is None:
+            registered = "bl_rna" in vars(cls) if isinstance(cls, type) else True
+        if not registered:
             continue
         try:
             bpy.utils.unregister_class(cls)

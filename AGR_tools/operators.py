@@ -7,6 +7,7 @@ from . import operators_sets
 from . import operators_utils
 from . import operators_udim
 from . import operators_uv
+from . import operators_uv_extrude
 from . import operators_link
 from . import operators_convert
 from . import operators_atlas
@@ -28,6 +29,7 @@ _MODULES = (
     operators_utils,
     operators_udim,
     operators_uv,
+    operators_uv_extrude,  # after operators_uv: its panel is a child of AGR_PT_uv_panel
     operators_link,
     operators_convert,
     operators_atlas,

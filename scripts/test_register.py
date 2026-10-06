@@ -41,6 +41,7 @@ def addon_handler_names(handler_list):
         "_sync_handlers_on_load", "_bump_geo_version", "_resubscribe_on_load",
         "_library_on_load_pre", "_quick_on_load_pre", "_autofill_address_on_load",
         "_uv_overlay_depsgraph", "_uv_sync_handlers_on_load",
+        "_uv_extrude_live_update", "_uv_extrude_on_load_pre",
     }
     return [n for n in handler_names(handler_list) if n in ours]
 
@@ -78,9 +79,10 @@ scene_props, wm_props = live_props()
 check("1.3 unregister removes every Scene/WindowManager property",
       not scene_props and not wm_props, f"left: {scene_props} {wm_props}")
 check("1.4 operator class gone", not hasattr(bpy.types, "AGR_OT_replace_with_light"))
-check("1.5 no addon handlers left in load_post/load_pre/depsgraph_update_post/save_pre",
+check("1.5 no addon handlers left in load_post/load_pre/depsgraph_update_pre+post/save_pre",
       not addon_handler_names(bpy.app.handlers.load_post)
       and not addon_handler_names(bpy.app.handlers.load_pre)
+      and not addon_handler_names(bpy.app.handlers.depsgraph_update_pre)
       and not addon_handler_names(bpy.app.handlers.depsgraph_update_post),
       f"post={addon_handler_names(bpy.app.handlers.load_post)} "
       f"pre={addon_handler_names(bpy.app.handlers.load_pre)}")
@@ -109,7 +111,8 @@ quick.register()
 
 names_post = addon_handler_names(bpy.app.handlers.load_post)
 names_pre = addon_handler_names(bpy.app.handlers.load_pre)
-names_deps = addon_handler_names(bpy.app.handlers.depsgraph_update_post)
+names_deps = (addon_handler_names(bpy.app.handlers.depsgraph_update_pre)
+              + addon_handler_names(bpy.app.handlers.depsgraph_update_post))
 check("2.1 no duplicate load_post handlers", len(names_post) == len(set(names_post)), str(names_post))
 check("2.2 no duplicate load_pre handlers", len(names_pre) == len(set(names_pre)), str(names_pre))
 check("2.3 no duplicate depsgraph handlers", len(names_deps) == len(set(names_deps)), str(names_deps))
