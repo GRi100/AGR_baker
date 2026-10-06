@@ -1,8 +1,9 @@
 materials/
 CLAUDE.md
+AGENTS.md
 .claude/
 __pycache__/
 make_zip.py
 AGR_baker_v2.zip
-AGR_tools.zip
+AGR_tools*.zip
 .vscode/
