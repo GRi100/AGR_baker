@@ -492,8 +492,8 @@ print("\n=== TEST 11: sys.path / msgbus owner hygiene ===")
 check("11.1 msgbus owner is a stable string across reloads",
       isinstance(sync._MSGBUS_OWNER, str))
 
-check("11.2 bl_info version matches the documented 2.8 line",
-      AGR_tools.bl_info["version"][:2] == (2, 8), str(AGR_tools.bl_info["version"]))
+check("11.2 bl_info version matches the documented 2.9 line",
+      AGR_tools.bl_info["version"][:2] == (2, 9), str(AGR_tools.bl_info["version"]))
 
 # ===================================================================
 print("\n=== TEST 12: library previews never carry a texture filepath ===")
